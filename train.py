@@ -952,9 +952,9 @@ def parse_args() -> TrainConfig:
     add("--prediction-horizon", type=int, default=None)
     add("--model-size", type=int, default=None)
     add("--d-model", type=int, default=None)
-    add("--temporal-backend", choices=["gru", "tcn"], default=None)
+    add("--frame-spatial-pool", type=int, default=None)
+    add("--frame-spatial-channels", type=int, default=None)
     add("--temporal-layers", type=int, default=None)
-    add("--temporal-kernel-size", type=int, default=None)
     add("--dropout", type=float, default=None)
     add("--encode-chunk-size", type=int, default=None)
     add("--train-seq-stride", type=int, default=None)
@@ -1023,9 +1023,9 @@ def parse_args() -> TrainConfig:
         "prediction_horizon",
         "model_size",
         "d_model",
-        "temporal_backend",
+        "frame_spatial_pool",
+        "frame_spatial_channels",
         "temporal_layers",
-        "temporal_kernel_size",
         "dropout",
         "encode_chunk_size",
         "train_seq_stride",

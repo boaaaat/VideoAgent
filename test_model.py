@@ -132,11 +132,6 @@ def load_model_checkpoint(
 
     config_dict = dict(state["config"])
     model_state = state["model_state"]
-    if "temporal_backend" not in config_dict:
-        if any(str(key).startswith("temporal.blocks.") for key in model_state):
-            config_dict["temporal_backend"] = "tcn"
-        elif any(str(key).startswith("temporal.gru.") for key in model_state):
-            config_dict["temporal_backend"] = "gru"
     valid_keys = {field.name for field in fields(ModelConfig)}
     cfg_kwargs = {key: value for key, value in config_dict.items() if key in valid_keys}
     if not use_checkpoint_thresholds:
@@ -651,7 +646,7 @@ def main() -> None:
         f"checkpoint={checkpoint_path}",
         f"video={video_path}",
         f"game={cfg.selected_game}",
-        f"temporal={cfg.temporal_backend}",
+        "temporal=gru",
         f"seq={cfg.seq_len}",
         f"horizon={cfg.prediction_horizon}",
         f"command_horizon={args.command_horizon}",

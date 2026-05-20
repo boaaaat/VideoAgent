@@ -197,11 +197,12 @@ def _coerce_config_types(cfg: RuntimeConfig) -> RuntimeConfig:
     cfg.prediction_horizon = int(cfg.prediction_horizon)
     cfg.command_horizon = max(1, min(int(cfg.command_horizon), int(cfg.prediction_horizon)))
     cfg.d_model = int(cfg.d_model)
-    cfg.temporal_backend = str(getattr(cfg, "temporal_backend", "gru")).strip().lower()
-    if cfg.temporal_backend not in {"gru", "tcn"}:
-        raise ValueError(f"temporal_backend must be 'gru' or 'tcn', got {cfg.temporal_backend!r}.")
+    cfg.frame_spatial_pool = max(1, int(getattr(cfg, "frame_spatial_pool", 4)))
+    cfg.frame_spatial_channels = int(getattr(cfg, "frame_spatial_channels", 0))
+    if cfg.frame_spatial_channels <= 0:
+        cfg.frame_spatial_channels = max(16, cfg.d_model // 4)
+    cfg.frame_spatial_channels = max(8, min(int(cfg.frame_spatial_channels), int(cfg.d_model)))
     cfg.temporal_layers = int(cfg.temporal_layers)
-    cfg.temporal_kernel_size = int(cfg.temporal_kernel_size)
     cfg.encode_chunk_size = int(cfg.encode_chunk_size)
     cfg.prediction_dt = float(cfg.prediction_dt)
     cfg.mouse_buttons_enabled = bool(cfg.mouse_buttons_enabled)
@@ -313,11 +314,6 @@ def load_checkpoint(
 
     checkpoint_config = dict(state["config"])
     model_state = state["model_state"]
-    if "temporal_backend" not in checkpoint_config:
-        if any(str(key).startswith("temporal.blocks.") for key in model_state):
-            checkpoint_config["temporal_backend"] = "tcn"
-        elif any(str(key).startswith("temporal.gru.") for key in model_state):
-            checkpoint_config["temporal_backend"] = "gru"
 
     cfg = _apply_checkpoint_config(cfg, checkpoint_config)
     cfg = _coerce_config_types(cfg)
@@ -429,9 +425,9 @@ def main() -> None:
         f"horizon={cfg.prediction_horizon}",
         f"command_horizon={cfg.command_horizon}",
         f"d_model={cfg.d_model}",
-        f"temporal={cfg.temporal_backend}",
+        "temporal=gru",
         f"layers={cfg.temporal_layers}",
-        f"kernel={cfg.temporal_kernel_size}",
+        f"spatial={cfg.frame_spatial_pool}x{cfg.frame_spatial_pool}x{cfg.frame_spatial_channels}",
     )
     print(
         "Button thresholds:",

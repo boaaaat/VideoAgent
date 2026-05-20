@@ -32,9 +32,9 @@ class ModelConfig:
     mouse_button_names: Optional[List[str]] = None
 
     d_model: int = 128
-    temporal_backend: str = "gru"
+    frame_spatial_pool: int = 4
+    frame_spatial_channels: int = 0
     temporal_layers: int = 3
-    temporal_kernel_size: int = 5
     dropout: float = 0.20
     encode_chunk_size: int = 16
     max_context: int = 100
@@ -56,11 +56,12 @@ class ModelConfig:
         self.prediction_horizon = max(1, int(self.prediction_horizon))
 
         self.d_model = max(64, int(self.d_model))
-        self.temporal_backend = str(self.temporal_backend).strip().lower()
-        if self.temporal_backend not in {"gru", "tcn"}:
-            raise ValueError(f"temporal_backend must be 'gru' or 'tcn', got {self.temporal_backend!r}.")
+        self.frame_spatial_pool = max(1, int(self.frame_spatial_pool))
+        self.frame_spatial_channels = int(self.frame_spatial_channels)
+        if self.frame_spatial_channels <= 0:
+            self.frame_spatial_channels = max(16, self.d_model // 4)
+        self.frame_spatial_channels = max(8, min(int(self.frame_spatial_channels), int(self.d_model)))
         self.temporal_layers = max(1, int(self.temporal_layers))
-        self.temporal_kernel_size = max(2, int(self.temporal_kernel_size))
         self.dropout = float(min(max(self.dropout, 0.0), 0.9))
         self.encode_chunk_size = max(1, int(self.encode_chunk_size))
         self.max_context = max(self.seq_len, int(self.max_context))
@@ -98,7 +99,6 @@ class PolicyOutput:
 
 @dataclass
 class TemporalState:
-    cached_summaries: Optional[torch.Tensor] = None
     prev_frame: Optional[torch.Tensor] = None
     hidden_state: Optional[torch.Tensor] = None
     steps: int = 0
@@ -155,89 +155,30 @@ class FrameCNN(nn.Module):
             if idx >= 1:
                 layers.append(ResidualConvBlock(out_channels, dropout=cfg.dropout * 0.2))
         self.net = nn.Sequential(*layers)
-        self.proj = nn.Sequential(
-            nn.Flatten(1),
-            nn.LayerNorm(cfg.d_model),
-            nn.Linear(cfg.d_model, cfg.d_model),
-            nn.GELU(),
-            nn.Dropout(cfg.dropout),
+        self.pool_size = int(cfg.frame_spatial_pool)
+        spatial_channels = int(cfg.frame_spatial_channels)
+        self.spatial_proj = nn.Sequential(
+            nn.Conv2d(cfg.d_model, cfg.d_model, kernel_size=3, padding=1, groups=cfg.d_model, bias=False),
+            nn.GroupNorm(_group_count(cfg.d_model), cfg.d_model),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(cfg.d_model, spatial_channels, kernel_size=1, bias=False),
+            nn.GroupNorm(_group_count(spatial_channels), spatial_channels),
+            nn.SiLU(inplace=True),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.net(x)
-        x = F.adaptive_avg_pool2d(x, output_size=1)
-        return self.proj(x)
-
-
-class CausalTCNBlock(nn.Module):
-    def __init__(self, dim: int, *, kernel_size: int, dilation: int, dropout: float):
-        super().__init__()
-        self.kernel_size = int(kernel_size)
-        self.dilation = int(dilation)
-        self.norm = nn.LayerNorm(dim)
-        self.depthwise = nn.Conv1d(
-            dim,
-            dim * 2,
-            kernel_size=self.kernel_size,
-            dilation=self.dilation,
-            groups=dim,
-        )
-        self.mix = nn.Sequential(
-            nn.Conv1d(dim, dim * 2, kernel_size=1),
-            nn.GELU(),
-            nn.Dropout(float(dropout)),
-            nn.Conv1d(dim * 2, dim, kernel_size=1),
-        )
-        self.gamma = nn.Parameter(torch.ones(dim) * 1e-3)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        dtype = x.dtype
-        y = self.norm(x).transpose(1, 2)
-        y = F.pad(y, ((self.kernel_size - 1) * self.dilation, 0))
-        y = self.depthwise(y)
-        a, b = y.chunk(2, dim=1)
-        y = a * torch.sigmoid(b)
-        y = self.mix(y).transpose(1, 2)
-        return x + y * self.gamma.to(device=x.device, dtype=dtype).view(1, 1, -1)
-
-
-class CausalTCN(nn.Module):
-    def __init__(self, cfg: ModelConfig):
-        super().__init__()
-        self.blocks = nn.ModuleList(
-            [
-                CausalTCNBlock(
-                    cfg.d_model,
-                    kernel_size=cfg.temporal_kernel_size,
-                    dilation=2 ** idx,
-                    dropout=cfg.dropout,
-                )
-                for idx in range(cfg.temporal_layers)
-            ]
-        )
-        self.out = nn.Sequential(
-            nn.LayerNorm(cfg.d_model),
-            nn.Linear(cfg.d_model, cfg.d_model * 2),
-            nn.GELU(),
-            nn.Dropout(cfg.dropout),
-            nn.Linear(cfg.d_model * 2, cfg.d_model),
-        )
-        self.out_gamma = nn.Parameter(torch.ones(cfg.d_model) * 1e-3)
-        self.norm = nn.LayerNorm(cfg.d_model)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        for block in self.blocks:
-            x = block(x)
-        x = x + self.out(x) * self.out_gamma.to(device=x.device, dtype=x.dtype).view(1, 1, -1)
-        return self.norm(x)
+        x = self.spatial_proj(x)
+        x = F.adaptive_avg_pool2d(x, output_size=(self.pool_size, self.pool_size))
+        return x.flatten(2).transpose(1, 2).contiguous()
 
 
 class CausalGRU(nn.Module):
-    def __init__(self, cfg: ModelConfig):
+    def __init__(self, cfg: ModelConfig, *, input_dim: int):
         super().__init__()
-        self.in_norm = nn.LayerNorm(cfg.d_model)
+        self.in_norm = nn.LayerNorm(input_dim)
         self.gru = nn.GRU(
-            input_size=cfg.d_model,
+            input_size=input_dim,
             hidden_size=cfg.d_model,
             num_layers=cfg.temporal_layers,
             dropout=cfg.dropout if cfg.temporal_layers > 1 else 0.0,
@@ -260,32 +201,31 @@ class CausalGRU(nn.Module):
         if hidden is not None:
             hidden = hidden.to(device=x.device, dtype=x.dtype)
         y, hidden = self.gru(self.in_norm(x), hidden)
-        x = x + self.out(y) * self.out_gamma.to(device=x.device, dtype=x.dtype).view(1, 1, -1)
-        return self.norm(x), hidden
+        y = y + self.out(y) * self.out_gamma.to(device=x.device, dtype=x.dtype).view(1, 1, -1)
+        return self.norm(y), hidden
 
 
 class ActionConditionedVideoPolicy(nn.Module):
     def __init__(self, cfg: Optional[ModelConfig] = None):
         super().__init__()
         self.cfg = cfg if cfg is not None else ModelConfig()
+        self.frame_tokens = int(self.cfg.frame_spatial_pool) * int(self.cfg.frame_spatial_pool)
+        self.frame_feature_dim = self.frame_tokens * int(self.cfg.frame_spatial_channels)
 
         self.frame_encoder = FrameCNN(self.cfg)
         self.dt_embed = nn.Sequential(
             nn.Linear(3, self.cfg.d_model),
             nn.GELU(),
-            nn.Linear(self.cfg.d_model, self.cfg.d_model),
+            nn.Linear(self.cfg.d_model, self.frame_feature_dim),
         )
         self.fuse = nn.Sequential(
-            nn.LayerNorm(self.cfg.d_model * 2),
-            nn.Linear(self.cfg.d_model * 2, self.cfg.d_model),
+            nn.LayerNorm(self.frame_feature_dim),
+            nn.Linear(self.frame_feature_dim, self.cfg.d_model),
             nn.GELU(),
             nn.Dropout(self.cfg.dropout),
-            nn.Linear(self.cfg.d_model, self.cfg.d_model),
+            nn.Linear(self.cfg.d_model, self.frame_feature_dim),
         )
-        if self.cfg.temporal_backend == "gru":
-            self.temporal = CausalGRU(self.cfg)
-        else:
-            self.temporal = CausalTCN(self.cfg)
+        self.temporal = CausalGRU(self.cfg, input_dim=self.frame_feature_dim)
         self.head = nn.Sequential(
             nn.LayerNorm(self.cfg.d_model),
             nn.Linear(self.cfg.d_model, self.cfg.d_model),
@@ -313,7 +253,6 @@ class ActionConditionedVideoPolicy(nn.Module):
         device = device if device is not None else next(self.parameters()).device
         dtype = dtype if dtype is not None else next(self.parameters()).dtype
         return TemporalState(
-            cached_summaries=None,
             prev_frame=None,
             hidden_state=None,
             steps=0,
@@ -368,23 +307,24 @@ class ActionConditionedVideoPolicy(nn.Module):
         chunks: List[torch.Tensor] = []
         for start in range(0, x.size(0), int(self.cfg.encode_chunk_size)):
             chunks.append(self.frame_encoder(x[start : start + int(self.cfg.encode_chunk_size)]))
-        visual = torch.cat(chunks, dim=0).view(b, t, self.cfg.d_model)
+        visual = torch.cat(chunks, dim=0).view(b, t, self.frame_tokens, self.cfg.frame_spatial_channels)
         return visual, frames[:, -1].detach()
 
     def _build_inputs(self, visual: torch.Tensor, dt: torch.Tensor) -> torch.Tensor:
+        if visual.dim() == 4:
+            visual = visual.flatten(2)
         if dt.dim() == 1:
             dt = dt.unsqueeze(1).expand(visual.shape[0], visual.shape[1])
         dt_emb = self._dt_features(dt).to(dtype=visual.dtype)
-        return visual + self.fuse(torch.cat([visual, dt_emb], dim=-1)).to(dtype=visual.dtype)
+        x = visual + dt_emb
+        return x + self.fuse(x).to(dtype=visual.dtype)
 
     def _run_temporal(
         self,
         x: torch.Tensor,
         hidden: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        if self.cfg.temporal_backend == "gru":
-            return self.temporal(x, hidden)
-        return self.temporal(x), None
+        return self.temporal(x, hidden)
 
     def _pack_output(self, temporal: torch.Tensor) -> PolicyOutput:
         b, t, d = temporal.shape
@@ -424,24 +364,10 @@ class ActionConditionedVideoPolicy(nn.Module):
         visual, last_frame = self._encode_frames(frame.unsqueeze(1), previous_frame=state.prev_frame)
         step_input = self._build_inputs(visual, dt.reshape(frame.size(0), 1))
 
-        if self.cfg.temporal_backend == "gru":
-            temporal, hidden = self._run_temporal(step_input, state.hidden_state)
-            cache = None
-            output = self._pack_output(temporal)
-        else:
-            hidden = None
-            if state.cached_summaries is None:
-                cache = step_input
-            else:
-                cache = torch.cat([state.cached_summaries.to(step_input.device, step_input.dtype), step_input], dim=1)
-            if cache.size(1) > int(self.cfg.max_context):
-                cache = cache[:, -int(self.cfg.max_context) :]
-
-            temporal, _ = self._run_temporal(cache)
-            output = self._pack_output(temporal[:, -1:])
+        temporal, hidden = self._run_temporal(step_input, state.hidden_state)
+        output = self._pack_output(temporal)
 
         new_state = TemporalState(
-            cached_summaries=None if cache is None else cache.detach(),
             prev_frame=last_frame.detach(),
             hidden_state=None if hidden is None else hidden.detach(),
             steps=int(state.steps) + 1,
