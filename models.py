@@ -147,7 +147,7 @@ class FrameCNN(nn.Module):
             cfg.d_model,
         ]
         layers: List[nn.Module] = []
-        in_channels = 6
+        in_channels = 8
         for idx, out_channels in enumerate(widths):
             layers.append(ConvBlock(in_channels, out_channels, stride=2, dropout=cfg.dropout * 0.2))
             layers.append(ResidualConvBlock(out_channels, dropout=cfg.dropout * 0.2))
@@ -276,6 +276,22 @@ class ActionConditionedVideoPolicy(nn.Module):
             return torch.full((self.cfg.num_bin,), float(self.cfg.button_state_threshold), device=device, dtype=dtype)
         return torch.tensor(list(thresholds), device=device, dtype=dtype)
 
+    def _coord_channels(
+        self,
+        *,
+        batch: int,
+        steps: int,
+        height: int,
+        width: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        y = torch.linspace(-1.0, 1.0, height, device=device, dtype=dtype).view(1, 1, 1, height, 1)
+        x = torch.linspace(-1.0, 1.0, width, device=device, dtype=dtype).view(1, 1, 1, 1, width)
+        x = x.expand(batch, steps, 1, height, width)
+        y = y.expand(batch, steps, 1, height, width)
+        return torch.cat([x, y], dim=2)
+
     def _encode_frames(
         self,
         frames: torch.Tensor,
@@ -300,7 +316,15 @@ class ActionConditionedVideoPolicy(nn.Module):
             prev = torch.cat([prev0, frames[:, :-1]], dim=1)
             motion = frames - prev
 
-        x = torch.cat([frames, motion], dim=2).reshape(b * t, 6, h, w)
+        coords = self._coord_channels(
+            batch=b,
+            steps=t,
+            height=h,
+            width=w,
+            device=frames.device,
+            dtype=frames.dtype,
+        )
+        x = torch.cat([frames, motion, coords], dim=2).reshape(b * t, 8, h, w)
         if x.is_cuda:
             x = x.contiguous(memory_format=torch.channels_last)
 
