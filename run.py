@@ -202,6 +202,10 @@ def _coerce_config_types(cfg: RuntimeConfig) -> RuntimeConfig:
         cfg.frame_spatial_channels = max(16, cfg.d_model // 4)
     cfg.frame_spatial_channels = max(8, min(int(cfg.frame_spatial_channels), int(cfg.d_model)))
     cfg.temporal_layers = int(cfg.temporal_layers)
+    cfg.temporal_heads = max(1, int(getattr(cfg, "temporal_heads", 4)))
+    while cfg.d_model % cfg.temporal_heads != 0 and cfg.temporal_heads > 1:
+        cfg.temporal_heads -= 1
+    cfg.temporal_mlp_ratio = float(getattr(cfg, "temporal_mlp_ratio", 2.0))
     cfg.encode_chunk_size = int(cfg.encode_chunk_size)
     cfg.prediction_dt = float(cfg.prediction_dt)
     cfg.mouse_buttons_enabled = bool(cfg.mouse_buttons_enabled)
@@ -424,8 +428,9 @@ def main() -> None:
         f"horizon={cfg.prediction_horizon}",
         f"command_horizon={cfg.command_horizon}",
         f"d_model={cfg.d_model}",
-        "temporal=gru",
+        "temporal=attention",
         f"layers={cfg.temporal_layers}",
+        f"heads={cfg.temporal_heads}",
         f"spatial={cfg.frame_spatial_pool}x{cfg.frame_spatial_pool}x{cfg.frame_spatial_channels}",
     )
     print(

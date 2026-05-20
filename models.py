@@ -22,9 +22,9 @@ class ModelConfig:
     csv_ext: str = ".csv"
 
     model_size: int = 256
-    seq_len: int = 16
-    train_seq_stride: int = 10
-    val_seq_stride: int = 16
+    seq_len: int = 80
+    train_seq_stride: int = 40
+    val_seq_stride: int = 80
     prediction_dt: float = 1.0 / 20.0
     prediction_horizon: int = 5
 
@@ -32,14 +32,16 @@ class ModelConfig:
     mouse_button_names: Optional[List[str]] = None
 
     d_model: int = 128
-    frame_spatial_pool: int = 4
-    frame_spatial_channels: int = 0
-    temporal_layers: int = 3
-    dropout: float = 0.20
+    frame_spatial_pool: int = 8
+    frame_spatial_channels: int = 32
+    temporal_layers: int = 2
+    temporal_heads: int = 4
+    temporal_mlp_ratio: float = 2.0
+    dropout: float = 0.10
     coord_scale: float = 1.0
     coord_dropout: float = 0.1
     encode_chunk_size: int = 16
-    max_context: int = 100
+    max_context: int = 64
 
     button_state_threshold: float = 0.5
     button_state_thresholds: Optional[Sequence[float]] = None
@@ -64,6 +66,10 @@ class ModelConfig:
             self.frame_spatial_channels = max(16, self.d_model // 4)
         self.frame_spatial_channels = max(8, min(int(self.frame_spatial_channels), int(self.d_model)))
         self.temporal_layers = max(1, int(self.temporal_layers))
+        self.temporal_heads = max(1, int(self.temporal_heads))
+        while self.d_model % self.temporal_heads != 0 and self.temporal_heads > 1:
+            self.temporal_heads -= 1
+        self.temporal_mlp_ratio = float(min(max(self.temporal_mlp_ratio, 1.0), 8.0))
         self.dropout = float(min(max(self.dropout, 0.0), 0.9))
         self.coord_scale = float(min(max(self.coord_scale, 0.0), 2.0))
         self.coord_dropout = float(min(max(self.coord_dropout, 0.0), 1.0))
@@ -177,36 +183,79 @@ class FrameCNN(nn.Module):
         return x.flatten(2).transpose(1, 2).contiguous()
 
 
-class CausalGRU(nn.Module):
-    def __init__(self, cfg: ModelConfig, *, input_dim: int):
+class CausalAttentionBlock(nn.Module):
+    def __init__(self, cfg: ModelConfig):
         super().__init__()
-        self.in_norm = nn.LayerNorm(input_dim)
-        self.gru = nn.GRU(
-            input_size=input_dim,
-            hidden_size=cfg.d_model,
-            num_layers=cfg.temporal_layers,
-            dropout=cfg.dropout if cfg.temporal_layers > 1 else 0.0,
+        self.attn_norm = nn.LayerNorm(cfg.d_model)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=cfg.d_model,
+            num_heads=cfg.temporal_heads,
+            dropout=cfg.dropout,
             batch_first=True,
         )
-        self.out = nn.Sequential(
-            nn.Linear(cfg.d_model, cfg.d_model * 2),
+        self.attn_drop = nn.Dropout(cfg.dropout)
+        self.mlp_norm = nn.LayerNorm(cfg.d_model)
+        hidden_dim = max(cfg.d_model, int(round(cfg.d_model * float(cfg.temporal_mlp_ratio))))
+        self.mlp = nn.Sequential(
+            nn.Linear(cfg.d_model, hidden_dim),
             nn.GELU(),
             nn.Dropout(cfg.dropout),
-            nn.Linear(cfg.d_model * 2, cfg.d_model),
+            nn.Linear(hidden_dim, cfg.d_model),
+            nn.Dropout(cfg.dropout),
         )
-        self.out_gamma = nn.Parameter(torch.ones(cfg.d_model) * 1e-3)
+
+    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor) -> torch.Tensor:
+        y = self.attn_norm(x)
+        y, _ = self.attn(y, y, y, attn_mask=attn_mask, need_weights=False)
+        x = x + self.attn_drop(y)
+        return x + self.mlp(self.mlp_norm(x))
+
+
+class CausalAttentionTemporal(nn.Module):
+    def __init__(self, cfg: ModelConfig, *, input_dim: int):
+        super().__init__()
+        self.cfg = cfg
+        self.max_context = int(cfg.max_context)
+        self.in_norm = nn.LayerNorm(input_dim)
+        self.in_proj = nn.Linear(input_dim, cfg.d_model)
+        self.pos_embed = nn.Parameter(torch.zeros(self.max_context, cfg.d_model))
+        self.blocks = nn.ModuleList(CausalAttentionBlock(cfg) for _ in range(cfg.temporal_layers))
         self.norm = nn.LayerNorm(cfg.d_model)
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+
+    def _encode_context(self, x: torch.Tensor) -> torch.Tensor:
+        length = int(x.size(1))
+        if length > self.max_context:
+            raise ValueError(f"Temporal context length {length} exceeds max_context={self.max_context}.")
+        y = self.in_proj(self.in_norm(x))
+        pos = self.pos_embed[:length].to(device=y.device, dtype=y.dtype).unsqueeze(0)
+        y = y + pos
+        attn_mask = torch.ones((length, length), device=y.device, dtype=torch.bool).triu(1)
+        for block in self.blocks:
+            y = block(y, attn_mask)
+        return self.norm(y)
 
     def forward(
         self,
         x: torch.Tensor,
         hidden: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        *,
+        update_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if update_cache:
+            context = x if hidden is None else torch.cat([hidden.to(device=x.device, dtype=x.dtype), x], dim=1)
+            if context.size(1) > self.max_context:
+                context = context[:, -self.max_context :].contiguous()
+            y = self._encode_context(context)
+            return y[:, -x.size(1) :].contiguous(), context.detach()
         if hidden is not None:
             hidden = hidden.to(device=x.device, dtype=x.dtype)
-        y, hidden = self.gru(self.in_norm(x), hidden)
-        y = y + self.out(y) * self.out_gamma.to(device=x.device, dtype=x.dtype).view(1, 1, -1)
-        return self.norm(y), hidden
+            context = torch.cat([hidden, x], dim=1)
+            if context.size(1) > self.max_context:
+                context = context[:, -self.max_context :].contiguous()
+            y = self._encode_context(context)
+            return y[:, -x.size(1) :].contiguous(), context.detach()
+        return self._encode_context(x), None
 
 
 class ActionConditionedVideoPolicy(nn.Module):
@@ -229,7 +278,7 @@ class ActionConditionedVideoPolicy(nn.Module):
             nn.Dropout(self.cfg.dropout),
             nn.Linear(self.cfg.d_model, self.frame_feature_dim),
         )
-        self.temporal = CausalGRU(self.cfg, input_dim=self.frame_feature_dim)
+        self.temporal = CausalAttentionTemporal(self.cfg, input_dim=self.frame_feature_dim)
         self.head = nn.Sequential(
             nn.LayerNorm(self.cfg.d_model),
             nn.Linear(self.cfg.d_model, self.cfg.d_model),
@@ -357,8 +406,10 @@ class ActionConditionedVideoPolicy(nn.Module):
         self,
         x: torch.Tensor,
         hidden: Optional[torch.Tensor] = None,
+        *,
+        update_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        return self.temporal(x, hidden)
+        return self.temporal(x, hidden, update_cache=update_cache)
 
     def _pack_output(self, temporal: torch.Tensor) -> PolicyOutput:
         b, t, d = temporal.shape
@@ -398,7 +449,7 @@ class ActionConditionedVideoPolicy(nn.Module):
         visual, last_frame = self._encode_frames(frame.unsqueeze(1), previous_frame=state.prev_frame)
         step_input = self._build_inputs(visual, dt.reshape(frame.size(0), 1))
 
-        temporal, hidden = self._run_temporal(step_input, state.hidden_state)
+        temporal, hidden = self._run_temporal(step_input, state.hidden_state, update_cache=True)
         output = self._pack_output(temporal)
 
         new_state = TemporalState(

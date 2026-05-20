@@ -40,10 +40,10 @@ class TrainConfig(ModelConfig):
     grad_accum: int = 8
     num_epochs: int = 40
 
-    lr: float = 2e-4
+    lr: float = 1e-4
     min_lr: float = 1e-5
     warmup_steps: int = 300
-    weight_decay: float = 0.12
+    weight_decay: float = 0.08
     grad_clip: float = 1.0
 
     amp_dtype: str = "bf16"
@@ -67,8 +67,8 @@ class TrainConfig(ModelConfig):
     aug_contrast: float = 0.10
     aug_noise_std: float = 0.006
     aug_gray_prob: float = 0.03
-    aug_translate_frac: float = 0.03
-    aug_scale_frac: float = 0.04
+    aug_translate_frac: float = 0.0
+    aug_scale_frac: float = 0.0
 
     early_stop_patience: int = 5
 
@@ -923,6 +923,8 @@ def parse_args() -> TrainConfig:
     add("--frame-spatial-pool", type=int, default=None)
     add("--frame-spatial-channels", type=int, default=None)
     add("--temporal-layers", type=int, default=None)
+    add("--temporal-heads", type=int, default=None)
+    add("--temporal-mlp-ratio", type=float, default=None)
     add("--dropout", type=float, default=None)
     add("--coord-scale", type=float, default=None)
     add("--coord-dropout", type=float, default=None)
@@ -998,6 +1000,8 @@ def parse_args() -> TrainConfig:
         "frame_spatial_pool",
         "frame_spatial_channels",
         "temporal_layers",
+        "temporal_heads",
+        "temporal_mlp_ratio",
         "dropout",
         "coord_scale",
         "coord_dropout",
