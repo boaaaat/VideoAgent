@@ -22,8 +22,8 @@ class ModelConfig:
     csv_ext: str = ".csv"
 
     model_size: int = 256
-    seq_len: int = 100
-    train_seq_stride: int = 50
+    seq_len: int = 16
+    train_seq_stride: int = 10
     val_seq_stride: int = 100
     prediction_dt: float = 1.0 / 20.0
     prediction_horizon: int = 5
@@ -41,10 +41,6 @@ class ModelConfig:
 
     button_state_threshold: float = 0.5
     button_state_thresholds: Optional[Sequence[float]] = None
-    transition_threshold: float = 0.5
-    mouse_active_threshold: float = 0.5
-    mouse_velocity_scales: Optional[Sequence[float]] = None
-
     num_bin: int = 0
 
     def __post_init__(self) -> None:
@@ -81,17 +77,7 @@ class ModelConfig:
 
         self.num_bin = len(self.key_names) + len(self.mouse_button_names)
 
-        if self.mouse_velocity_scales is None:
-            self.mouse_velocity_scales = (1.0, 1.0)
-        else:
-            scales = tuple(float(x) for x in self.mouse_velocity_scales)
-            if len(scales) != 2:
-                raise ValueError("mouse_velocity_scales must contain exactly 2 values.")
-            self.mouse_velocity_scales = scales
-
         self.button_state_threshold = float(min(max(self.button_state_threshold, 0.0), 1.0))
-        self.transition_threshold = float(min(max(self.transition_threshold, 0.0), 1.0))
-        self.mouse_active_threshold = float(min(max(self.mouse_active_threshold, 0.0), 1.0))
         if self.button_state_thresholds is None:
             self.button_state_thresholds = tuple(float(self.button_state_threshold) for _ in range(self.num_bin))
         else:
@@ -106,23 +92,8 @@ class ModelConfig:
 @dataclass
 class PolicyOutput:
     button_logits: torch.Tensor
-    press_logits: torch.Tensor
-    release_logits: torch.Tensor
-    mouse_active_logits: torch.Tensor
-    mouse_delta: torch.Tensor
     horizon_button_logits: torch.Tensor
-    horizon_press_logits: torch.Tensor
-    horizon_release_logits: torch.Tensor
-    horizon_mouse_active_logits: torch.Tensor
-    horizon_mouse_delta: torch.Tensor
     future_button_logits: Dict[int, torch.Tensor] = field(default_factory=dict)
-    future_press_logits: Dict[int, torch.Tensor] = field(default_factory=dict)
-    future_release_logits: Dict[int, torch.Tensor] = field(default_factory=dict)
-    future_mouse_active_logits: Dict[int, torch.Tensor] = field(default_factory=dict)
-    future_mouse_mu: Dict[int, torch.Tensor] = field(default_factory=dict)
-    future_mouse_log_b: Dict[int, torch.Tensor] = field(default_factory=dict)
-    mouse_mu: Optional[torch.Tensor] = None
-    mouse_log_b: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -322,24 +293,8 @@ class ActionConditionedVideoPolicy(nn.Module):
             nn.Dropout(self.cfg.dropout),
         )
         self.button_head = nn.Linear(self.cfg.d_model, self.cfg.prediction_horizon * self.cfg.num_bin)
-        self.press_head = nn.Linear(self.cfg.d_model, self.cfg.prediction_horizon * self.cfg.num_bin)
-        self.release_head = nn.Linear(self.cfg.d_model, self.cfg.prediction_horizon * self.cfg.num_bin)
-        # Mouse heads are disabled for the current Greenville keyboard-only setup.
-        # Re-enable these lines and the matching _pack_output lines when training mouse actions again.
-        # self.mouse_active_head = nn.Linear(self.cfg.d_model, self.cfg.prediction_horizon)
-        # self.mouse_delta_head = nn.Linear(self.cfg.d_model, self.cfg.prediction_horizon * 2)
 
         nn.init.constant_(self.button_head.bias, -1.0)
-        nn.init.constant_(self.press_head.bias, -2.0)
-        nn.init.constant_(self.release_head.bias, -2.0)
-        # nn.init.constant_(self.mouse_active_head.bias, -1.0)
-        # nn.init.zeros_(self.mouse_delta_head.bias)
-
-        self.register_buffer(
-            "mouse_velocity_scale",
-            torch.tensor(list(self.cfg.mouse_velocity_scales), dtype=torch.float32),
-            persistent=True,
-        )
 
     @property
     def num_buttons(self) -> int:
@@ -375,12 +330,6 @@ class ActionConditionedVideoPolicy(nn.Module):
         dt = dt.clamp(min=1.0 / 240.0, max=0.5)
         features = torch.stack([dt, torch.log(dt), 1.0 / dt], dim=-1)
         return self.dt_embed(features.to(dtype=next(self.dt_embed.parameters()).dtype))
-
-    def _scale_mouse(self, mouse_delta_norm: torch.Tensor) -> torch.Tensor:
-        scale = self.mouse_velocity_scale.to(device=mouse_delta_norm.device, dtype=mouse_delta_norm.dtype)
-        while scale.dim() < mouse_delta_norm.dim():
-            scale = scale.unsqueeze(0)
-        return mouse_delta_norm * scale
 
     def _button_thresholds(self, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         thresholds = self.cfg.button_state_thresholds
@@ -441,37 +390,12 @@ class ActionConditionedVideoPolicy(nn.Module):
         b, t, d = temporal.shape
         h = self.head(temporal)
         button = self.button_head(h).view(b, t, self.cfg.prediction_horizon, self.cfg.num_bin)
-        press = self.press_head(h).view(b, t, self.cfg.prediction_horizon, self.cfg.num_bin)
-        release = self.release_head(h).view(b, t, self.cfg.prediction_horizon, self.cfg.num_bin)
-        # active = self.mouse_active_head(h).view(b, t, self.cfg.prediction_horizon, 1)
-        # mouse = self._scale_mouse(self.mouse_delta_head(h).view(b, t, self.cfg.prediction_horizon, 2))
-        active = h.new_zeros((b, t, self.cfg.prediction_horizon, 1))
-        mouse = h.new_zeros((b, t, self.cfg.prediction_horizon, 2))
 
         step_button = button[:, :, 0]
-        step_press = press[:, :, 0]
-        step_release = release[:, :, 0]
-        step_active = active[:, :, 0]
-        step_mouse = mouse[:, :, 0]
         return PolicyOutput(
             button_logits=step_button,
-            press_logits=step_press,
-            release_logits=step_release,
-            mouse_active_logits=step_active,
-            mouse_delta=step_mouse,
             horizon_button_logits=button,
-            horizon_press_logits=press,
-            horizon_release_logits=release,
-            horizon_mouse_active_logits=active,
-            horizon_mouse_delta=mouse,
             future_button_logits={idx + 1: button[:, :, idx] for idx in range(self.cfg.prediction_horizon)},
-            future_press_logits={idx + 1: press[:, :, idx] for idx in range(self.cfg.prediction_horizon)},
-            future_release_logits={idx + 1: release[:, :, idx] for idx in range(self.cfg.prediction_horizon)},
-            future_mouse_active_logits={idx + 1: active[:, :, idx] for idx in range(self.cfg.prediction_horizon)},
-            future_mouse_mu={idx + 1: mouse[:, :, idx] for idx in range(self.cfg.prediction_horizon)},
-            future_mouse_log_b={idx + 1: torch.zeros_like(mouse[:, :, idx]) for idx in range(self.cfg.prediction_horizon)},
-            mouse_mu=step_mouse,
-            mouse_log_b=torch.zeros_like(step_mouse),
         )
 
     def forward(
@@ -524,23 +448,8 @@ class ActionConditionedVideoPolicy(nn.Module):
         )
         squeezed = PolicyOutput(
             button_logits=output.button_logits[:, 0],
-            press_logits=output.press_logits[:, 0],
-            release_logits=output.release_logits[:, 0],
-            mouse_active_logits=output.mouse_active_logits[:, 0],
-            mouse_delta=output.mouse_delta[:, 0],
             horizon_button_logits=output.horizon_button_logits[:, 0],
-            horizon_press_logits=output.horizon_press_logits[:, 0],
-            horizon_release_logits=output.horizon_release_logits[:, 0],
-            horizon_mouse_active_logits=output.horizon_mouse_active_logits[:, 0],
-            horizon_mouse_delta=output.horizon_mouse_delta[:, 0],
             future_button_logits={k: v[:, 0] for k, v in output.future_button_logits.items()},
-            future_press_logits={k: v[:, 0] for k, v in output.future_press_logits.items()},
-            future_release_logits={k: v[:, 0] for k, v in output.future_release_logits.items()},
-            future_mouse_active_logits={k: v[:, 0] for k, v in output.future_mouse_active_logits.items()},
-            future_mouse_mu={k: v[:, 0] for k, v in output.future_mouse_mu.items()},
-            future_mouse_log_b={k: v[:, 0] for k, v in output.future_mouse_log_b.items()},
-            mouse_mu=output.mouse_delta[:, 0],
-            mouse_log_b=torch.zeros_like(output.mouse_delta[:, 0]),
         )
         return squeezed, new_state
 
@@ -555,4 +464,4 @@ if __name__ == "__main__":
     x = torch.rand(1, cfg.seq_len, 3, cfg.model_size, cfg.model_size)
     dt = torch.full((1, cfg.seq_len), cfg.prediction_dt)
     out = model(x, dt=dt)
-    print(tuple(out.horizon_button_logits.shape), tuple(out.horizon_mouse_delta.shape))
+    print(tuple(out.horizon_button_logits.shape))
