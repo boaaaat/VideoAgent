@@ -35,7 +35,6 @@ size = pdi.size()
 class RuntimeConfig(ModelConfig):
     ckpt_dir: str = "./checkpoints_rt"
     ckpt_path: Optional[str] = None
-
     pos_weight_power: float = 0.5
     pos_weight_clamp: float = 8.0
     button_threshold_from_pos_weight: bool = True

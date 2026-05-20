@@ -1,5 +1,6 @@
 checkpoints_idm/
 checkpoints_rt/
+checkpoints_good/
 data/
 data_pseudo/
 dataset/

@@ -24,7 +24,7 @@ class ModelConfig:
     model_size: int = 256
     seq_len: int = 16
     train_seq_stride: int = 10
-    val_seq_stride: int = 100
+    val_seq_stride: int = 16
     prediction_dt: float = 1.0 / 20.0
     prediction_horizon: int = 5
 
@@ -36,6 +36,8 @@ class ModelConfig:
     frame_spatial_channels: int = 0
     temporal_layers: int = 3
     dropout: float = 0.20
+    coord_scale: float = 1.0
+    coord_dropout: float = 0.1
     encode_chunk_size: int = 16
     max_context: int = 100
 
@@ -63,6 +65,8 @@ class ModelConfig:
         self.frame_spatial_channels = max(8, min(int(self.frame_spatial_channels), int(self.d_model)))
         self.temporal_layers = max(1, int(self.temporal_layers))
         self.dropout = float(min(max(self.dropout, 0.0), 0.9))
+        self.coord_scale = float(min(max(self.coord_scale, 0.0), 2.0))
+        self.coord_dropout = float(min(max(self.coord_dropout, 0.0), 1.0))
         self.encode_chunk_size = max(1, int(self.encode_chunk_size))
         self.max_context = max(self.seq_len, int(self.max_context))
 
@@ -290,7 +294,13 @@ class ActionConditionedVideoPolicy(nn.Module):
         x = torch.linspace(-1.0, 1.0, width, device=device, dtype=dtype).view(1, 1, 1, 1, width)
         x = x.expand(batch, steps, 1, height, width)
         y = y.expand(batch, steps, 1, height, width)
-        return torch.cat([x, y], dim=2)
+        coords = torch.cat([x, y], dim=2)
+        if float(self.cfg.coord_scale) != 1.0:
+            coords = coords * float(self.cfg.coord_scale)
+        if self.training and float(self.cfg.coord_dropout) > 0.0:
+            keep = torch.rand((batch, 1, 1, 1, 1), device=device) >= float(self.cfg.coord_dropout)
+            coords = coords * keep.to(dtype=dtype)
+        return coords
 
     def _encode_frames(
         self,

@@ -24,6 +24,7 @@ import nvidia.dali.fn as fn
 from nvidia.dali.plugin.pytorch import DALIGenericIterator, LastBatchPolicy
 
 from action_space import game_data_root
+from augmentations import augment_frames
 from dataset_wsl_sync import sync_dataset_for_training
 from models import (
     ActionConditionedVideoPolicy,
@@ -43,7 +44,7 @@ class TrainConfig(ModelConfig):
     min_lr: float = 1e-5
     warmup_steps: int = 300
     weight_decay: float = 0.12
-    grad_clip: float = 0.7
+    grad_clip: float = 1.0
 
     amp_dtype: str = "bf16"
     compile_model: bool = True
@@ -55,7 +56,7 @@ class TrainConfig(ModelConfig):
     pos_weight_clamp: float = 8.0
     button_threshold_from_pos_weight: bool = True
     button_threshold_min: float = 0.5
-    button_threshold_max: float = 0.90
+    button_threshold_max: float = 0.80
 
     button_loss_weight: float = 1.0
     action_label_offset: int = 0
@@ -66,8 +67,10 @@ class TrainConfig(ModelConfig):
     aug_contrast: float = 0.10
     aug_noise_std: float = 0.006
     aug_gray_prob: float = 0.03
+    aug_translate_frac: float = 0.03
+    aug_scale_frac: float = 0.04
 
-    early_stop_patience: int = 6
+    early_stop_patience: int = 5
 
     dali_num_threads: int = 6
     dali_prefetch_queue_depth: int = 4
@@ -84,7 +87,7 @@ class TrainConfig(ModelConfig):
     dataset_sync_delete_stale: Optional[bool] = None
     dataset_sync_hash_same_size: bool = True
 
-    resume: bool = True
+    resume: bool = False
     resume_path: Optional[str] = None
     ckpt_dir: str = "./checkpoints_rt"
     save_every: int = 1
@@ -129,6 +132,8 @@ class TrainConfig(ModelConfig):
         self.aug_contrast = float(min(max(self.aug_contrast, 0.0), 0.5))
         self.aug_noise_std = float(min(max(self.aug_noise_std, 0.0), 0.1))
         self.aug_gray_prob = float(min(max(self.aug_gray_prob, 0.0), 1.0))
+        self.aug_translate_frac = float(min(max(self.aug_translate_frac, 0.0), 0.25))
+        self.aug_scale_frac = float(min(max(self.aug_scale_frac, 0.0), 0.50))
         self.early_stop_patience = max(0, int(self.early_stop_patience))
         self.dali_resize_mode = str(self.dali_resize_mode).strip().lower()
         if self.dali_resize_mode not in {"video_resize", "video_then_resize", "none"}:
@@ -737,43 +742,6 @@ def load_batch(iterator, targets: WindowTargets, device: torch.device, cfg: Trai
 
 
 
-def augment_frames(frames: torch.Tensor, cfg: TrainConfig) -> torch.Tensor:
-    """Cheap video-safe augmentation. No horizontal flips: that would require swapping A/D and mouse-x labels."""
-    if not frames.is_floating_point():
-        return frames
-    b = frames.size(0)
-    device = frames.device
-    out = frames
-
-    if cfg.aug_contrast > 0.0:
-        contrast = torch.empty((b, 1, 1, 1, 1), device=device, dtype=torch.float32).uniform_(
-            1.0 - float(cfg.aug_contrast), 1.0 + float(cfg.aug_contrast)
-        ).to(dtype=out.dtype)
-        mean = out.mean(dim=(-1, -2), keepdim=True)
-        out = (out - mean) * contrast + mean
-
-    if cfg.aug_brightness > 0.0:
-        gain = torch.empty((b, 1, 1, 1, 1), device=device, dtype=torch.float32).uniform_(
-            1.0 - float(cfg.aug_brightness), 1.0 + float(cfg.aug_brightness)
-        ).to(dtype=out.dtype)
-        bias = torch.empty((b, 1, 1, 1, 1), device=device, dtype=torch.float32).uniform_(
-            -float(cfg.aug_brightness), float(cfg.aug_brightness)
-        ).to(dtype=out.dtype)
-        out = out * gain + bias
-
-    if cfg.aug_gray_prob > 0.0:
-        mask = (torch.rand((b, 1, 1, 1, 1), device=device) < float(cfg.aug_gray_prob)).to(dtype=torch.bool)
-        if bool(mask.any().item()):
-            gray = out.mean(dim=2, keepdim=True).expand_as(out)
-            out = torch.where(mask, gray, out)
-
-    if cfg.aug_noise_std > 0.0:
-        noise = torch.randn_like(out, dtype=torch.float32) * float(cfg.aug_noise_std)
-        out = out + noise.to(dtype=out.dtype)
-
-    return out.clamp_(0.0, 1.0)
-
-
 def run_epoch(
     *,
     desc: str,
@@ -956,6 +924,8 @@ def parse_args() -> TrainConfig:
     add("--frame-spatial-channels", type=int, default=None)
     add("--temporal-layers", type=int, default=None)
     add("--dropout", type=float, default=None)
+    add("--coord-scale", type=float, default=None)
+    add("--coord-dropout", type=float, default=None)
     add("--encode-chunk-size", type=int, default=None)
     add("--train-seq-stride", type=int, default=None)
     add("--val-seq-stride", type=int, default=None)
@@ -979,6 +949,8 @@ def parse_args() -> TrainConfig:
     add("--aug-contrast", type=float, default=None)
     add("--aug-noise-std", type=float, default=None)
     add("--aug-gray-prob", type=float, default=None)
+    add("--aug-translate-frac", type=float, default=None)
+    add("--aug-scale-frac", type=float, default=None)
     add("--early-stop-patience", type=int, default=None)
     add("--max-train-batches", type=int, default=None)
     add("--max-val-batches", type=int, default=None)
@@ -1027,6 +999,8 @@ def parse_args() -> TrainConfig:
         "frame_spatial_channels",
         "temporal_layers",
         "dropout",
+        "coord_scale",
+        "coord_dropout",
         "encode_chunk_size",
         "train_seq_stride",
         "val_seq_stride",
@@ -1047,6 +1021,8 @@ def parse_args() -> TrainConfig:
         "aug_contrast",
         "aug_noise_std",
         "aug_gray_prob",
+        "aug_translate_frac",
+        "aug_scale_frac",
         "early_stop_patience",
         "max_train_batches",
         "max_val_batches",
@@ -1187,7 +1163,7 @@ def train() -> None:
     base_model: torch.nn.Module = ActionConditionedVideoPolicy(cfg).to(device)
     base_model = base_model.to(memory_format=torch.channels_last)
     optimizer = torch.optim.AdamW(base_model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay, fused=True)
-    print(f"Parameters: {sum(p.numel() for p in base_model.parameters()) / 1e6:.2f}M")
+    print(f"Parameters: {sum(p.numel() for p in base_model.parameters()) / 1e6:.4f}M")
     start_epoch, global_step, best_score = maybe_resume(base_model, optimizer, cfg, device)
 
     if cfg.compile_model:
