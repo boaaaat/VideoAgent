@@ -87,7 +87,7 @@ class TrainConfig(ModelConfig):
     dataset_sync_delete_stale: Optional[bool] = None
     dataset_sync_hash_same_size: bool = True
 
-    resume: bool = False
+    resume: bool = True
     resume_path: Optional[str] = None
     ckpt_dir: str = "./checkpoints_rt"
     save_every: int = 1
@@ -493,11 +493,20 @@ def normalize_dali_labels(labels: torch.Tensor) -> torch.Tensor:
     return labels.reshape(-1).long()
 
 
-def compute_pos_weight(labels: torch.Tensor, power: float, clamp: float) -> torch.Tensor:
+def compute_pos_weight(
+    labels: torch.Tensor,
+    power: float,
+    clamp: float,
+    valid: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
     labels = labels.float()
-    pos = labels.sum(dim=tuple(range(labels.dim() - 1)))
-    total = labels.numel() / max(1, labels.shape[-1])
-    neg = torch.full_like(pos, float(total)) - pos
+    if valid is None:
+        mask = torch.ones_like(labels[..., :1])
+    else:
+        mask = valid.float().unsqueeze(-1)
+    pos = (labels * mask).sum(dim=tuple(range(labels.dim() - 1)))
+    total = mask.sum(dim=tuple(range(mask.dim() - 1))).clamp(min=1.0).to(device=pos.device, dtype=pos.dtype)
+    neg = total.expand_as(pos) - pos
     weight = (neg / pos.clamp(min=1.0)).pow(float(power))
     return weight.clamp(min=1.0, max=float(clamp)).float()
 
@@ -922,6 +931,9 @@ def parse_args() -> TrainConfig:
     add("--d-model", type=int, default=None)
     add("--frame-spatial-pool", type=int, default=None)
     add("--frame-spatial-channels", type=int, default=None)
+    add("--spatial-attention-tokens", type=int, default=None)
+    add("--spatial-attention-heads", type=int, default=None)
+    add("--spatial-temporal-grid", type=int, default=None)
     add("--temporal-layers", type=int, default=None)
     add("--temporal-heads", type=int, default=None)
     add("--temporal-mlp-ratio", type=float, default=None)
@@ -999,6 +1011,9 @@ def parse_args() -> TrainConfig:
         "d_model",
         "frame_spatial_pool",
         "frame_spatial_channels",
+        "spatial_attention_tokens",
+        "spatial_attention_heads",
+        "spatial_temporal_grid",
         "temporal_layers",
         "temporal_heads",
         "temporal_mlp_ratio",
@@ -1113,14 +1128,19 @@ def train() -> None:
             raise RuntimeError("Validation window metadata is required for DALI file list generation.")
         write_window_file_list(val_targets.meta, val_file_list)
 
-    button_pos_weight = compute_pos_weight(train_targets.button_horizon.reshape(-1, cfg.num_bin), cfg.pos_weight_power, cfg.pos_weight_clamp).to(device)
+    button_pos_weight = compute_pos_weight(
+        train_targets.button_horizon,
+        cfg.pos_weight_power,
+        cfg.pos_weight_clamp,
+        valid=train_targets.horizon_valid,
+    ).to(device)
     button_thresholds = decision_thresholds_from_pos_weight(button_pos_weight, cfg).detach().cpu()
-    cfg.button_state_thresholds = tuple(float(x) for x in button_thresholds.tolist())
+    cfg.button_state_thresholds = tuple(float(x) for x in list(button_thresholds.tolist()))
+    button_names = list(cfg.key_names) + list(cfg.mouse_button_names)
     print(
         "Class weighting:",
-        f"button_mean={float(button_pos_weight.mean().item()):.3f}",
+        '   '.join([f"{name}={float(weight):.3f}" for name, weight in zip(button_names, button_pos_weight.tolist())]),
     )
-    button_names = list(cfg.key_names) + list(cfg.mouse_button_names)
     threshold_parts = [
         f"{name}={float(threshold):.3f}"
         for name, threshold in zip(button_names, cfg.button_state_thresholds)

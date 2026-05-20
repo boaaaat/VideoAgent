@@ -34,7 +34,10 @@ class ModelConfig:
     d_model: int = 128
     frame_spatial_pool: int = 8
     frame_spatial_channels: int = 32
-    temporal_layers: int = 2
+    spatial_attention_tokens: int = 8
+    spatial_attention_heads: int = 4
+    spatial_temporal_grid: int = 3
+    temporal_layers: int = 3
     temporal_heads: int = 4
     temporal_mlp_ratio: float = 2.0
     dropout: float = 0.10
@@ -65,6 +68,11 @@ class ModelConfig:
         if self.frame_spatial_channels <= 0:
             self.frame_spatial_channels = max(16, self.d_model // 4)
         self.frame_spatial_channels = max(8, min(int(self.frame_spatial_channels), int(self.d_model)))
+        self.spatial_attention_tokens = max(1, int(self.spatial_attention_tokens))
+        self.spatial_attention_heads = max(1, int(self.spatial_attention_heads))
+        while self.d_model % self.spatial_attention_heads != 0 and self.spatial_attention_heads > 1:
+            self.spatial_attention_heads -= 1
+        self.spatial_temporal_grid = max(1, int(self.spatial_temporal_grid))
         self.temporal_layers = max(1, int(self.temporal_layers))
         self.temporal_heads = max(1, int(self.temporal_heads))
         while self.d_model % self.temporal_heads != 0 and self.temporal_heads > 1:
@@ -183,6 +191,51 @@ class FrameCNN(nn.Module):
         return x.flatten(2).transpose(1, 2).contiguous()
 
 
+class SpatialAttentionPool(nn.Module):
+    def __init__(self, cfg: ModelConfig, *, num_source_tokens: int):
+        super().__init__()
+        self.num_queries = int(cfg.spatial_attention_tokens)
+        self.grid_tokens = int(cfg.spatial_temporal_grid) * int(cfg.spatial_temporal_grid)
+        self.token_norm = nn.LayerNorm(cfg.frame_spatial_channels)
+        self.token_proj = nn.Linear(cfg.frame_spatial_channels, cfg.d_model)
+        self.pos_embed = nn.Parameter(torch.zeros(num_source_tokens, cfg.d_model))
+        self.query_embed = nn.Parameter(torch.zeros(self.num_queries, cfg.d_model))
+        self.attn = nn.MultiheadAttention(
+            embed_dim=cfg.d_model,
+            num_heads=cfg.spatial_attention_heads,
+            dropout=cfg.dropout,
+            batch_first=True,
+        )
+        self.attn_drop = nn.Dropout(cfg.dropout)
+        self.mlp_norm = nn.LayerNorm(cfg.d_model)
+        hidden_dim = max(cfg.d_model, int(round(cfg.d_model * float(cfg.temporal_mlp_ratio))))
+        self.mlp = nn.Sequential(
+            nn.Linear(cfg.d_model, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(cfg.dropout),
+            nn.Linear(hidden_dim, cfg.d_model),
+            nn.Dropout(cfg.dropout),
+        )
+        self.out_norm = nn.LayerNorm(cfg.d_model)
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        nn.init.trunc_normal_(self.query_embed, std=0.02)
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        x = self.token_proj(self.token_norm(tokens))
+        pos = self.pos_embed.to(device=x.device, dtype=x.dtype).unsqueeze(0)
+        x = x + pos
+        query = self.query_embed.to(device=x.device, dtype=x.dtype).unsqueeze(0).expand(x.size(0), -1, -1)
+        pooled, _ = self.attn(query, x, x, need_weights=False)
+        pooled = query + self.attn_drop(pooled)
+        pooled = pooled + self.mlp(self.mlp_norm(pooled))
+        pooled = self.out_norm(pooled)
+        if pooled.size(1) == self.grid_tokens:
+            return pooled.contiguous()
+        pooled = pooled.transpose(1, 2)
+        pooled = F.adaptive_avg_pool1d(pooled, self.grid_tokens)
+        return pooled.transpose(1, 2).contiguous()
+
+
 class CausalAttentionBlock(nn.Module):
     def __init__(self, cfg: ModelConfig):
         super().__init__()
@@ -212,25 +265,33 @@ class CausalAttentionBlock(nn.Module):
 
 
 class CausalAttentionTemporal(nn.Module):
-    def __init__(self, cfg: ModelConfig, *, input_dim: int):
+    def __init__(self, cfg: ModelConfig, *, input_dim: int, tokens_per_step: int = 1):
         super().__init__()
         self.cfg = cfg
-        self.max_context = int(cfg.max_context)
+        self.tokens_per_step = max(1, int(tokens_per_step))
+        self.max_steps = int(cfg.max_context)
+        self.max_context = self.max_steps * self.tokens_per_step
         self.in_norm = nn.LayerNorm(input_dim)
         self.in_proj = nn.Linear(input_dim, cfg.d_model)
-        self.pos_embed = nn.Parameter(torch.zeros(self.max_context, cfg.d_model))
+        self.pos_embed = nn.Parameter(torch.zeros(self.max_steps, cfg.d_model))
+        self.spatial_pos_embed = nn.Parameter(torch.zeros(self.tokens_per_step, cfg.d_model))
         self.blocks = nn.ModuleList(CausalAttentionBlock(cfg) for _ in range(cfg.temporal_layers))
         self.norm = nn.LayerNorm(cfg.d_model)
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        nn.init.trunc_normal_(self.spatial_pos_embed, std=0.02)
 
     def _encode_context(self, x: torch.Tensor) -> torch.Tensor:
         length = int(x.size(1))
         if length > self.max_context:
             raise ValueError(f"Temporal context length {length} exceeds max_context={self.max_context}.")
         y = self.in_proj(self.in_norm(x))
-        pos = self.pos_embed[:length].to(device=y.device, dtype=y.dtype).unsqueeze(0)
-        y = y + pos
-        attn_mask = torch.ones((length, length), device=y.device, dtype=torch.bool).triu(1)
+        flat_idx = torch.arange(length, device=y.device)
+        frame_idx = flat_idx // self.tokens_per_step
+        pos = self.pos_embed[frame_idx].to(device=y.device, dtype=y.dtype).unsqueeze(0)
+        spatial_idx = flat_idx % self.tokens_per_step
+        spatial_pos = self.spatial_pos_embed[spatial_idx].to(device=y.device, dtype=y.dtype).unsqueeze(0)
+        y = y + pos + spatial_pos
+        attn_mask = frame_idx.view(1, length) > frame_idx.view(length, 1)
         for block in self.blocks:
             y = block(y, attn_mask)
         return self.norm(y)
@@ -263,9 +324,11 @@ class ActionConditionedVideoPolicy(nn.Module):
         super().__init__()
         self.cfg = cfg if cfg is not None else ModelConfig()
         self.frame_tokens = int(self.cfg.frame_spatial_pool) * int(self.cfg.frame_spatial_pool)
-        self.frame_feature_dim = self.frame_tokens * int(self.cfg.frame_spatial_channels)
+        self.spatial_grid_tokens = int(self.cfg.spatial_temporal_grid) * int(self.cfg.spatial_temporal_grid)
+        self.frame_feature_dim = int(self.cfg.d_model)
 
         self.frame_encoder = FrameCNN(self.cfg)
+        self.spatial_pool = SpatialAttentionPool(self.cfg, num_source_tokens=self.frame_tokens)
         self.dt_embed = nn.Sequential(
             nn.Linear(3, self.cfg.d_model),
             nn.GELU(),
@@ -278,7 +341,11 @@ class ActionConditionedVideoPolicy(nn.Module):
             nn.Dropout(self.cfg.dropout),
             nn.Linear(self.cfg.d_model, self.frame_feature_dim),
         )
-        self.temporal = CausalAttentionTemporal(self.cfg, input_dim=self.frame_feature_dim)
+        self.temporal = CausalAttentionTemporal(
+            self.cfg,
+            input_dim=self.frame_feature_dim,
+            tokens_per_step=self.spatial_grid_tokens,
+        )
         self.head = nn.Sequential(
             nn.LayerNorm(self.cfg.d_model),
             nn.Linear(self.cfg.d_model, self.cfg.d_model),
@@ -390,15 +457,16 @@ class ActionConditionedVideoPolicy(nn.Module):
         chunks: List[torch.Tensor] = []
         for start in range(0, x.size(0), int(self.cfg.encode_chunk_size)):
             chunks.append(self.frame_encoder(x[start : start + int(self.cfg.encode_chunk_size)]))
-        visual = torch.cat(chunks, dim=0).view(b, t, self.frame_tokens, self.cfg.frame_spatial_channels)
+        spatial_tokens = torch.cat(chunks, dim=0)
+        visual = self.spatial_pool(spatial_tokens).view(b, t, self.spatial_grid_tokens, self.frame_feature_dim)
         return visual, frames[:, -1].detach()
 
     def _build_inputs(self, visual: torch.Tensor, dt: torch.Tensor) -> torch.Tensor:
-        if visual.dim() == 4:
-            visual = visual.flatten(2)
+        if visual.dim() == 3:
+            visual = visual.unsqueeze(2)
         if dt.dim() == 1:
             dt = dt.unsqueeze(1).expand(visual.shape[0], visual.shape[1])
-        dt_emb = self._dt_features(dt).to(dtype=visual.dtype)
+        dt_emb = self._dt_features(dt).to(dtype=visual.dtype).unsqueeze(2)
         x = visual + dt_emb
         return x + self.fuse(x).to(dtype=visual.dtype)
 
@@ -409,9 +477,19 @@ class ActionConditionedVideoPolicy(nn.Module):
         *,
         update_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if x.dim() == 4:
+            b, t, s, d = x.shape
+            temporal, cache = self.temporal(
+                x.reshape(b, t * s, d),
+                hidden,
+                update_cache=update_cache,
+            )
+            return temporal.view(b, t, s, -1).contiguous(), cache
         return self.temporal(x, hidden, update_cache=update_cache)
 
     def _pack_output(self, temporal: torch.Tensor) -> PolicyOutput:
+        if temporal.dim() == 4:
+            temporal = temporal.mean(dim=2)
         b, t, d = temporal.shape
         h = self.head(temporal)
         button = self.button_head(h).view(b, t, self.cfg.prediction_horizon, self.cfg.num_bin)
