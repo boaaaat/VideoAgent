@@ -223,12 +223,16 @@ MOUSE_BUTTON_TO_VK = {
     for button_name in configured_mouse_buttons
     if button_name in ALL_MOUSE_BUTTON_TO_VK
 }
-VK_OEM_PLUS = getattr(win32con, "VK_OEM_PLUS", 0xBB)
-VK_OEM_MINUS = getattr(win32con, "VK_OEM_MINUS", 0xBD)
 VK_OEM_4 = getattr(win32con, "VK_OEM_4", 0xDB)
+DATA_COLLECTION_CONTROLS = {
+    "start": "1",
+    "stop": "2",
+}
+START_COLLECTION_VKS = (ord(DATA_COLLECTION_CONTROLS["start"]), getattr(win32con, "VK_NUMPAD1", 0x61))
+STOP_COLLECTION_VKS = (ord(DATA_COLLECTION_CONTROLS["stop"]), getattr(win32con, "VK_NUMPAD2", 0x62))
 HOTKEY_VKS = {
-    "start": (VK_OEM_PLUS, win32con.VK_ADD),
-    "stop": (VK_OEM_MINUS, win32con.VK_SUBTRACT),
+    "start": START_COLLECTION_VKS,
+    "stop": STOP_COLLECTION_VKS,
     "print_mouse": (VK_OEM_4,),
 }
 hotkey_prev_down = {name: False for name in HOTKEY_VKS}
@@ -273,18 +277,22 @@ frame_size = (512, 512)
 size = (1, 1)
 scale = (1.0, 1.0)
 
-# FFmpegWriter Class (Kept exactly as you had it)
+# FFmpegWriter Class
 class FFmpegWriter:
-    def __init__(self, out_path, fps, width, height, ffmpeg_path=None, use_nvenc_codec="hevc_nvenc",
-                 container_ext="mp4", cq=20, preset="p4", pix_fmt_in="bgr24", stderr_path=None):
+    def __init__(self, out_path, fps, width, height, ffmpeg_path=None, use_nvenc_codec="h264_nvenc",
+                 container_ext="mp4", cq=23, preset="p5", pix_fmt_in="bgr24", stderr_path=None,
+                 gop_size=16):
         self.width = width
         self.height = height
         self.fps = fps
         self.pix_fmt_in = pix_fmt_in
         self.container_ext = container_ext
+        self.gop_size = int(gop_size)
         self.stderr_file = None
 
-        self.out_file = out_path if out_path.endswith(f".{container_ext}") else f"{out_path}.{container_ext}"
+        self.final_file = out_path if out_path.endswith(f".{container_ext}") else f"{out_path}.{container_ext}"
+        base_path, ext = os.path.splitext(self.final_file)
+        self.out_file = f"{base_path}_temp{ext}"
 
         self.ffmpeg_path = ffmpeg_path or shutil.which("ffmpeg")
         if not self.ffmpeg_path:
@@ -294,7 +302,9 @@ class FFmpegWriter:
             self.ffmpeg_path, "-y", "-f", "rawvideo", "-pix_fmt", self.pix_fmt_in,
             "-s", f"{self.width}x{self.height}", "-r", str(self.fps),
             "-i", "pipe:0", "-an", "-c:v", use_nvenc_codec,
-            "-cq", str(cq), "-preset", preset, "-pix_fmt", "yuv420p", self.out_file
+            "-preset", preset, "-rc", "vbr", "-cq", str(cq), "-pix_fmt", "yuv420p",
+            "-g", str(self.gop_size), "-keyint_min", str(self.gop_size),
+            "-bf", "0", "-forced-idr", "1", "-movflags", "+faststart", self.out_file
         ]
 
         stderr_target = subprocess.DEVNULL
@@ -327,10 +337,15 @@ class FFmpegWriter:
             except subprocess.TimeoutExpired:
                 self.proc.kill()
                 self.proc.wait(timeout=5)
+            return_code = self.proc.returncode
             self.proc = None
             if self.stderr_file is not None:
                 self.stderr_file.close()
                 self.stderr_file = None
+            if return_code == 0:
+                os.replace(self.out_file, self.final_file)
+            else:
+                print(f"FFmpeg failed with exit code {return_code}; leaving temp video: {self.out_file}")
 
 ffmpeg_writer = None
 FFMPEG_PATH = None # Set this if ffmpeg isn't in system PATH
@@ -506,7 +521,10 @@ def initialize_capture_runtime():
             track_rare_keys = False
             print("Rare-key tracking disabled because tracked_rare_keys is empty.")
     else:
-        print("Press '=' to start data collection and '-' to stop.")
+        print(
+            f"Press '{DATA_COLLECTION_CONTROLS['start']}' to start data collection "
+            f"and '{DATA_COLLECTION_CONTROLS['stop']}' to stop."
+        )
 
 
 def stop_recording():
@@ -761,12 +779,13 @@ def start_recording(prebuffer_entries=None, clip_reason=None, reset_mouse_accumu
                 width=frame_size[0],
                 height=frame_size[1],
                 ffmpeg_path=FFMPEG_PATH,
-                use_nvenc_codec="hevc_nvenc",
+                use_nvenc_codec="h264_nvenc",
                 container_ext="mp4",
-                cq=20,
-                preset="p4",
+                cq=23,
+                preset="p5",
                 pix_fmt_in="bgr24",
-                stderr_path=None
+                stderr_path=None,
+                gop_size=16,
             )
         except Exception as exc:
             collecting_data = False

@@ -29,7 +29,6 @@ from models import (
     ActionConditionedVideoPolicy,
     ModelConfig,
     PolicyOutput,
-    policy_checkpoint_family_mismatch_reason,
 )
 
 
@@ -40,34 +39,47 @@ class TrainConfig(ModelConfig):
     grad_accum: int = 8
     num_epochs: int = 40
 
-    lr: float = 3e-4
-    min_lr: float = 3e-6
-    warmup_steps: int = 500
-    weight_decay: float = 0.05
-    grad_clip: float = 1.0
+    lr: float = 2e-4
+    min_lr: float = 1e-5
+    warmup_steps: int = 300
+    weight_decay: float = 0.12
+    grad_clip: float = 0.7
 
     amp_dtype: str = "bf16"
     compile_model: bool = True
     compile_mode: str = "default"
-    attention_backend: str = "flash"
 
-    train_split: float = 0.9
+    train_split: float = 0.8
     split_seed: int = 1337
     pos_weight_power: float = 0.5
-    pos_weight_clamp: float = 12.0
+    pos_weight_clamp: float = 8.0
+    button_threshold_from_pos_weight: bool = False
+    button_threshold_min: float = 0.5
+    button_threshold_max: float = 0.90
 
     button_loss_weight: float = 1.0
-    transition_loss_weight: float = 0.20
-    mouse_active_loss_weight: float = 0.10
-    mouse_delta_loss_weight: float = 0.35
+    transition_loss_weight: float = 1.0
+    action_label_offset: int = 0
+    mouse_active_loss_weight: float = 0 #0.10
+    mouse_delta_loss_weight: float = 0 #0.35
+    mouse_actions_enabled: bool = False
+    skipped_key_names: Optional[Sequence[str]] = ("e", "q", "c", "z")
     active_mouse_loss_mult: float = 4.0
     mouse_active_epsilon: float = 2.0
     mouse_scale_percentile: float = 95.0
+    button_label_smoothing: float = 0.02
 
-    dali_num_threads: int = 8
-    dali_prefetch_queue_depth: int = 8
+    aug_brightness: float = 0.08
+    aug_contrast: float = 0.10
+    aug_noise_std: float = 0.006
+    aug_gray_prob: float = 0.03
+
+    early_stop_patience: int = 6
+
+    dali_num_threads: int = 6
+    dali_prefetch_queue_depth: int = 4
     dali_reader_prefetch_queue_depth: int = 4
-    dali_read_ahead: bool = True
+    dali_read_ahead: bool = False
     dali_dont_use_mmap: bool = True
     dali_resize_mode: str = "video_then_resize"
     dali_prepare_first_batch: bool = True
@@ -89,6 +101,16 @@ class TrainConfig(ModelConfig):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        skipped = tuple(str(name) for name in (self.skipped_key_names or ()))
+        if skipped:
+            skip_set = set(skipped)
+            self.key_names = [name for name in self.key_names if name not in skip_set]
+            self.num_bin = len(self.key_names) + len(self.mouse_button_names)
+            if self.num_bin <= 0:
+                raise ValueError("At least one action key/button must remain after skipped_key_names filtering.")
+            if self.button_state_thresholds is None or len(tuple(self.button_state_thresholds)) != self.num_bin:
+                self.button_state_thresholds = tuple(float(self.button_state_threshold) for _ in range(self.num_bin))
+        self.skipped_key_names = skipped
         self.max_context = max(int(self.max_context), int(self.seq_len))
         self.batch_size = max(1, int(self.batch_size))
         self.target_effective_batch = max(1, int(self.target_effective_batch))
@@ -104,16 +126,21 @@ class TrainConfig(ModelConfig):
         self.dali_shuffle_seed = int(self.dali_shuffle_seed)
         self.pos_weight_power = max(0.0, float(self.pos_weight_power))
         self.pos_weight_clamp = max(1.0, float(self.pos_weight_clamp))
+        self.button_threshold_from_pos_weight = bool(self.button_threshold_from_pos_weight)
+        self.button_threshold_min = float(min(max(self.button_threshold_min, 0.0), 1.0))
+        self.button_threshold_max = float(min(max(self.button_threshold_max, self.button_threshold_min), 1.0))
         self.grad_clip = max(0.0, float(self.grad_clip))
+        self.action_label_offset = int(self.action_label_offset)
+        self.mouse_actions_enabled = bool(self.mouse_actions_enabled)
         self.active_mouse_loss_mult = max(1.0, float(self.active_mouse_loss_mult))
         self.mouse_active_epsilon = max(0.0, float(self.mouse_active_epsilon))
         self.mouse_scale_percentile = float(min(max(self.mouse_scale_percentile, 50.0), 99.9))
-        self.attention_backend = str(self.attention_backend).strip().lower()
-        if self.attention_backend not in {"auto", "flash", "mem_efficient", "math"}:
-            raise ValueError(
-                "attention_backend must be one of: auto, flash, mem_efficient, math; "
-                f"got {self.attention_backend!r}."
-            )
+        self.button_label_smoothing = float(min(max(self.button_label_smoothing, 0.0), 0.2))
+        self.aug_brightness = float(min(max(self.aug_brightness, 0.0), 0.5))
+        self.aug_contrast = float(min(max(self.aug_contrast, 0.0), 0.5))
+        self.aug_noise_std = float(min(max(self.aug_noise_std, 0.0), 0.1))
+        self.aug_gray_prob = float(min(max(self.aug_gray_prob, 0.0), 1.0))
+        self.early_stop_patience = max(0, int(self.early_stop_patience))
         self.dali_resize_mode = str(self.dali_resize_mode).strip().lower()
         if self.dali_resize_mode not in {"video_resize", "video_then_resize", "none"}:
             raise ValueError(
@@ -130,7 +157,6 @@ class TrainConfig(ModelConfig):
 
 @dataclass
 class WindowTargets:
-    prev_actions: torch.Tensor
     dt: torch.Tensor
     button_horizon: torch.Tensor
     mouse_active_horizon: torch.Tensor
@@ -357,62 +383,67 @@ def build_window_targets(
     mouse_active_windows: List[np.ndarray] = []
     mouse_delta_windows: List[np.ndarray] = []
     valid_windows: List[np.ndarray] = []
-    prev_action_windows: List[np.ndarray] = []
     dt_windows: List[np.ndarray] = []
     press_windows: List[np.ndarray] = []
     release_windows: List[np.ndarray] = []
     meta: List[Tuple[str, int, int]] = []
 
     horizon = int(cfg.prediction_horizon)
-    scale_np = np.asarray(cfg.mouse_velocity_scales, dtype=np.float32).reshape(1, 2)
-
     for video_path, csv_path in pairs:
         run = load_run_arrays(csv_path, cfg)
         buttons = run["buttons"]
         mouse_delta = run["mouse_delta"].astype(np.float32)
+        if not bool(cfg.mouse_actions_enabled):
+            buttons = buttons.copy()
+            if cfg.mouse_button_names:
+                buttons[:, len(cfg.key_names) :] = 0.0
+            mouse_delta = np.zeros_like(mouse_delta, dtype=np.float32)
         dt = run["dt"].astype(np.float32)
         if buttons.shape[0] < cfg.seq_len:
             continue
 
-        prev_buttons = np.concatenate([np.zeros((1, cfg.num_bin), dtype=np.float32), buttons[:-1]], axis=0)
-        prev_mouse = np.concatenate([np.zeros((1, 2), dtype=np.float32), mouse_delta[:-1] / scale_np], axis=0)
-        prev_actions = np.concatenate([prev_buttons, prev_mouse], axis=-1).astype(np.float32)
         mouse_active = (np.linalg.norm(mouse_delta, axis=-1, keepdims=True) >= float(cfg.mouse_active_epsilon)).astype(np.float32)
 
         max_start = buttons.shape[0] - cfg.seq_len
         for start in range(0, max_start + 1, max(1, int(stride))):
             end = start + cfg.seq_len
             button_target = np.zeros((cfg.seq_len, horizon, cfg.num_bin), dtype=np.float32)
+            press_target = np.zeros((cfg.seq_len, horizon, cfg.num_bin), dtype=np.float32)
+            release_target = np.zeros((cfg.seq_len, horizon, cfg.num_bin), dtype=np.float32)
             active_target = np.zeros((cfg.seq_len, horizon, 1), dtype=np.float32)
             mouse_target = np.zeros((cfg.seq_len, horizon, 2), dtype=np.float32)
             valid_target = np.zeros((cfg.seq_len, horizon), dtype=np.float32)
 
             frame_indices = np.arange(start, end)
             for h in range(1, horizon + 1):
-                target_indices = frame_indices + h
-                valid = target_indices < buttons.shape[0]
+                target_indices = frame_indices + h + int(cfg.action_label_offset)
+                prev_indices = target_indices - 1
+                valid = (target_indices >= 0) & (target_indices < buttons.shape[0]) & (prev_indices >= 0)
                 if np.any(valid):
-                    button_target[valid, h - 1] = buttons[target_indices[valid]]
-                    active_target[valid, h - 1] = mouse_active[target_indices[valid]]
-                    mouse_target[valid, h - 1] = mouse_delta[target_indices[valid]]
+                    valid_target_indices = target_indices[valid]
+                    valid_prev_indices = prev_indices[valid]
+                    button_target[valid, h - 1] = buttons[valid_target_indices]
+                    press_target[valid, h - 1] = np.clip(
+                        buttons[valid_target_indices] - buttons[valid_prev_indices],
+                        0.0,
+                        1.0,
+                    )
+                    release_target[valid, h - 1] = np.clip(
+                        buttons[valid_prev_indices] - buttons[valid_target_indices],
+                        0.0,
+                        1.0,
+                    )
+                    active_target[valid, h - 1] = mouse_active[valid_target_indices]
+                    mouse_target[valid, h - 1] = mouse_delta[valid_target_indices]
                     valid_target[valid, h - 1] = 1.0
-
-            next_idx = frame_indices + 1
-            next_valid = next_idx < buttons.shape[0]
-            current_buttons = buttons[frame_indices]
-            next_buttons = np.zeros_like(current_buttons)
-            next_buttons[next_valid] = buttons[next_idx[next_valid]]
-            press = np.clip(next_buttons - current_buttons, 0.0, 1.0)
-            release = np.clip(current_buttons - next_buttons, 0.0, 1.0)
 
             button_windows.append(button_target)
             mouse_active_windows.append(active_target)
             mouse_delta_windows.append(mouse_target)
             valid_windows.append(valid_target)
-            prev_action_windows.append(prev_actions[start:end])
             dt_windows.append(dt[start:end])
-            press_windows.append(press.astype(np.float32))
-            release_windows.append(release.astype(np.float32))
+            press_windows.append(press_target)
+            release_windows.append(release_target)
             if return_meta:
                 meta.append((video_path, start, end))
 
@@ -423,7 +454,6 @@ def build_window_targets(
         return torch.from_numpy(np.stack(items, axis=0)).float()
 
     return WindowTargets(
-        prev_actions=stack(prev_action_windows),
         dt=stack(dt_windows),
         button_horizon=stack(button_windows),
         mouse_active_horizon=stack(mouse_active_windows),
@@ -584,6 +614,21 @@ def compute_pos_weight(labels: torch.Tensor, power: float, clamp: float) -> torc
     return weight.clamp(min=1.0, max=float(clamp)).float()
 
 
+def decision_thresholds_from_pos_weight(pos_weight: torch.Tensor, cfg: TrainConfig) -> torch.Tensor:
+    """Undo the logit prior introduced by weighted BCE when making binary decisions."""
+    if not bool(cfg.button_threshold_from_pos_weight):
+        return torch.full_like(pos_weight.float(), float(cfg.button_state_threshold))
+    thresholds = pos_weight.float() / (pos_weight.float() + 1.0)
+    return thresholds.clamp(min=float(cfg.button_threshold_min), max=float(cfg.button_threshold_max))
+
+
+def button_threshold_tensor(cfg: TrainConfig, *, device: torch.device, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    thresholds = getattr(cfg, "button_state_thresholds", None)
+    if thresholds is None:
+        return torch.full((int(cfg.num_bin),), float(cfg.button_state_threshold), device=device, dtype=dtype)
+    return torch.tensor(list(thresholds), device=device, dtype=dtype)
+
+
 def warmup_cosine_lr(step: int, *, total_steps: int, base_lr: float, min_lr: float, warmup_steps: int) -> float:
     step = int(step)
     total_steps = max(1, int(total_steps))
@@ -605,43 +650,8 @@ def resolve_amp_settings(amp: str) -> Tuple[torch.dtype, bool, bool]:
     raise ValueError("Only bf16 and fp32 are supported by this trainer.")
 
 
-def configure_attention_backend(backend: str, *, device: torch.device) -> None:
-    backend = str(backend).strip().lower()
-    if backend not in {"auto", "flash", "mem_efficient", "math"}:
-        raise ValueError(f"Unsupported attention backend {backend!r}.")
-    if device.type != "cuda":
-        print(f"Attention backend: {backend} requested, CUDA unavailable; using PyTorch defaults.")
-        return
-    cuda_backends = torch.backends.cuda
-
-    # Keep math SDP enabled as a fallback. Some PyTorch transformer fast paths can
-    # reject flash-only or mem-efficient-only global settings with "Invalid backend".
-    if backend == "auto":
-        flash, mem_efficient, math_sdp = True, True, True
-    elif backend == "flash":
-        flash, mem_efficient, math_sdp = True, False, True
-    elif backend == "mem_efficient":
-        flash, mem_efficient, math_sdp = False, True, True
-    else:
-        flash, mem_efficient, math_sdp = False, False, True
-
-    cuda_backends.enable_flash_sdp(bool(flash))
-    cuda_backends.enable_mem_efficient_sdp(bool(mem_efficient))
-    cuda_backends.enable_math_sdp(bool(math_sdp))
-    flash_available = cuda_backends.is_flash_attention_available()
-    print(
-        "Attention backend:",
-        f"requested={backend}",
-        f"flash_enabled={bool(cuda_backends.flash_sdp_enabled())}",
-        f"mem_efficient_enabled={bool(cuda_backends.mem_efficient_sdp_enabled())}",
-        f"math_enabled={bool(cuda_backends.math_sdp_enabled())}",
-        f"flash_available={flash_available}",
-    )
-
-
 def bundle_index(bundle: WindowTargets, indices: torch.Tensor) -> WindowTargets:
     return WindowTargets(
-        prev_actions=bundle.prev_actions[indices],
         dt=bundle.dt[indices],
         button_horizon=bundle.button_horizon[indices],
         mouse_active_horizon=bundle.mouse_active_horizon[indices],
@@ -655,7 +665,6 @@ def bundle_index(bundle: WindowTargets, indices: torch.Tensor) -> WindowTargets:
 
 def move_bundle_to_device(bundle: WindowTargets, device: torch.device) -> WindowTargets:
     return WindowTargets(
-        prev_actions=bundle.prev_actions.to(device, non_blocking=True),
         dt=bundle.dt.to(device, non_blocking=True),
         button_horizon=bundle.button_horizon.to(device, non_blocking=True),
         mouse_active_horizon=bundle.mouse_active_horizon.to(device, non_blocking=True),
@@ -669,7 +678,6 @@ def move_bundle_to_device(bundle: WindowTargets, device: torch.device) -> Window
 
 def pin_bundle(bundle: WindowTargets) -> WindowTargets:
     return WindowTargets(
-        prev_actions=bundle.prev_actions.pin_memory(),
         dt=bundle.dt.pin_memory(),
         button_horizon=bundle.button_horizon.pin_memory(),
         mouse_active_horizon=bundle.mouse_active_horizon.pin_memory(),
@@ -687,13 +695,18 @@ def compute_losses(
     cfg: TrainConfig,
     *,
     button_pos_weight: torch.Tensor,
+    transition_pos_weight: torch.Tensor,
     mouse_active_pos_weight: torch.Tensor,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     valid = targets.horizon_valid.float()
     valid_4d = valid.unsqueeze(-1)
+    button_target = targets.button_horizon.float()
+    if float(cfg.button_label_smoothing) > 0.0:
+        eps = float(cfg.button_label_smoothing)
+        button_target = button_target * (1.0 - eps) + 0.5 * eps
     button_loss_raw = F.binary_cross_entropy_with_logits(
         output.horizon_button_logits.float(),
-        targets.button_horizon.float(),
+        button_target,
         pos_weight=button_pos_weight.view(1, 1, 1, -1).float(),
         reduction="none",
     )
@@ -715,19 +728,29 @@ def compute_losses(
     mouse_loss_raw = F.smooth_l1_loss(pred_mouse_norm, true_mouse_norm, reduction="none").mean(dim=-1, keepdim=True)
     mouse_loss = (mouse_loss_raw * mouse_weight * valid_4d).sum() / (mouse_weight * valid_4d).sum().clamp(min=1.0)
 
-    first_valid = valid[:, :, 0]
-    transition_mask = first_valid.unsqueeze(-1)
-    press_loss_raw = F.binary_cross_entropy_with_logits(output.press_logits.float(), targets.press.float(), reduction="none")
-    release_loss_raw = F.binary_cross_entropy_with_logits(output.release_logits.float(), targets.release.float(), reduction="none")
-    transition_loss = ((press_loss_raw + release_loss_raw) * transition_mask).sum() / (
-        transition_mask.sum() * cfg.num_bin
-    ).clamp(min=1.0)
+    transition_loss = button_loss.new_zeros(())
+    if float(cfg.transition_loss_weight) > 0.0:
+        press_loss_raw = F.binary_cross_entropy_with_logits(
+            output.horizon_press_logits.float(),
+            targets.press.float(),
+            pos_weight=transition_pos_weight.view(1, 1, 1, -1).float(),
+            reduction="none",
+        )
+        release_loss_raw = F.binary_cross_entropy_with_logits(
+            output.horizon_release_logits.float(),
+            targets.release.float(),
+            pos_weight=transition_pos_weight.view(1, 1, 1, -1).float(),
+            reduction="none",
+        )
+        transition_loss = ((press_loss_raw + release_loss_raw) * valid_4d).sum() / (
+            valid_4d.sum() * cfg.num_bin * 2.0
+        ).clamp(min=1.0)
 
     total = (
         (cfg.button_loss_weight * button_loss)
+        + (cfg.transition_loss_weight * transition_loss)
         + (cfg.mouse_active_loss_weight * active_loss)
         + (cfg.mouse_delta_loss_weight * mouse_loss)
-        + (cfg.transition_loss_weight * transition_loss)
     )
     return total, {
         "button": button_loss.detach(),
@@ -744,15 +767,29 @@ def update_metrics(
     cfg: TrainConfig,
     step1_stats: BinaryStats,
     final_stats: BinaryStats,
+    step1_press_stats: BinaryStats,
+    step1_release_stats: BinaryStats,
+    final_press_stats: BinaryStats,
+    final_release_stats: BinaryStats,
     mouse_stats: MouseStats,
 ) -> None:
     step1_valid = targets.horizon_valid[:, :, 0] > 0.5
     final_idx = int(cfg.prediction_horizon) - 1
     final_valid = targets.horizon_valid[:, :, final_idx] > 0.5
-    step1_pred = torch.sigmoid(output.horizon_button_logits[:, :, 0].float()) >= float(cfg.button_state_threshold)
-    final_pred = torch.sigmoid(output.horizon_button_logits[:, :, final_idx].float()) >= float(cfg.button_state_threshold)
+    thresholds = button_threshold_tensor(cfg, device=output.horizon_button_logits.device).view(1, 1, -1)
+    step1_pred = torch.sigmoid(output.horizon_button_logits[:, :, 0].float()) >= thresholds
+    final_pred = torch.sigmoid(output.horizon_button_logits[:, :, final_idx].float()) >= thresholds
     step1_stats.update(step1_pred, targets.button_horizon[:, :, 0] > 0.5, step1_valid)
     final_stats.update(final_pred, targets.button_horizon[:, :, final_idx] > 0.5, final_valid)
+    transition_threshold = float(cfg.transition_threshold)
+    step1_press_pred = torch.sigmoid(output.horizon_press_logits[:, :, 0].float()) >= transition_threshold
+    step1_release_pred = torch.sigmoid(output.horizon_release_logits[:, :, 0].float()) >= transition_threshold
+    final_press_pred = torch.sigmoid(output.horizon_press_logits[:, :, final_idx].float()) >= transition_threshold
+    final_release_pred = torch.sigmoid(output.horizon_release_logits[:, :, final_idx].float()) >= transition_threshold
+    step1_press_stats.update(step1_press_pred, targets.press[:, :, 0] > 0.5, step1_valid)
+    step1_release_stats.update(step1_release_pred, targets.release[:, :, 0] > 0.5, step1_valid)
+    final_press_stats.update(final_press_pred, targets.press[:, :, final_idx] > 0.5, final_valid)
+    final_release_stats.update(final_release_pred, targets.release[:, :, final_idx] > 0.5, final_valid)
     mouse_stats.update(
         output.horizon_mouse_delta[:, :, 0].float(),
         targets.mouse_delta_horizon[:, :, 0].float(),
@@ -792,6 +829,47 @@ def binary_stats_rows(stats: BinaryStats, names: Sequence[str]) -> List[Dict[str
             }
         )
     return rows
+
+
+def persistence_baseline_metrics(targets: WindowTargets, cfg: TrainConfig) -> Dict[str, float]:
+    stats = BinaryStats(cfg.num_bin, torch.device("cpu"))
+    current = targets.button_horizon[:, :, 0].new_zeros(targets.button_horizon[:, :, 0].shape)
+    current[:, 1:] = targets.button_horizon[:, :-1, 0]
+    valid = targets.horizon_valid[:, :, 0] > 0.5
+    valid[:, 0] = False
+    stats.update(current > 0.5, targets.button_horizon[:, :, 0] > 0.5, valid)
+    result = stats.compute()
+    result["per_class_summary"] = per_class_f1_summary(stats, list(cfg.key_names) + list(cfg.mouse_button_names))
+    return result
+
+
+def driving_score(metrics: Dict[str, float], cfg: TrainConfig) -> float:
+    rows = metrics.get("step1_button_rows", [])
+    press_rows = metrics.get("step1_press_rows", [])
+    release_rows = metrics.get("step1_release_rows", [])
+    if not isinstance(rows, list):
+        return metrics["step1_button_macro_f1"] - 0.001 * metrics["step1_mouse_mae"]
+    by_name = {str(row.get("name")): row for row in rows if isinstance(row, dict)}
+    by_press_name = {str(row.get("name")): row for row in press_rows if isinstance(row, dict)}
+    by_release_name = {str(row.get("name")): row for row in release_rows if isinstance(row, dict)}
+    weights = {"w": 3.0, "a": 1.5, "d": 1.5, "s": 0.75}
+    state_total = 0.0
+    command_total = 0.0
+    total_weight = 0.0
+    for name, weight in weights.items():
+        row = by_name.get(name)
+        press_row = by_press_name.get(name)
+        release_row = by_release_name.get(name)
+        state_total += float((row or {}).get("f1", 0.0)) * float(weight)
+        command_f1 = 0.5 * (
+            float((press_row or {}).get("f1", 0.0)) + float((release_row or {}).get("f1", 0.0))
+        )
+        command_total += command_f1 * float(weight)
+        total_weight += float(weight)
+    button_score = state_total / max(total_weight, 1.0)
+    command_score = command_total / max(total_weight, 1.0)
+    button_score = (0.6 * button_score) + (0.4 * command_score)
+    return button_score - 0.001 * metrics["step1_mouse_mae"]
 
 
 def print_button_stats_table(title: str, rows: Sequence[Dict[str, float | int | str]]) -> None:
@@ -853,11 +931,54 @@ def load_batch(iterator, targets: WindowTargets, device: torch.device, cfg: Trai
     frames = ensure_fchw_layout(batch["frames"])
     if frames.device != device:
         frames = frames.to(device, non_blocking=True)
+    amp_name = str(cfg.amp_dtype).strip().lower()
+    if amp_name == "bf16" and frames.dtype != torch.bfloat16:
+        frames = frames.to(dtype=torch.bfloat16)
+    elif amp_name in {"fp32", "float32", "none"} and frames.dtype != torch.float32:
+        frames = frames.float()
     if frames.is_cuda:
         frames = maybe_channels_last_seq(frames)
     labels = normalize_dali_labels(batch["labels"]).cpu()
     target = move_bundle_to_device(bundle_index(targets, labels), device)
     return frames, target
+
+
+
+def augment_frames(frames: torch.Tensor, cfg: TrainConfig) -> torch.Tensor:
+    """Cheap video-safe augmentation. No horizontal flips: that would require swapping A/D and mouse-x labels."""
+    if not frames.is_floating_point():
+        return frames
+    b = frames.size(0)
+    device = frames.device
+    out = frames
+
+    if cfg.aug_contrast > 0.0:
+        contrast = torch.empty((b, 1, 1, 1, 1), device=device, dtype=torch.float32).uniform_(
+            1.0 - float(cfg.aug_contrast), 1.0 + float(cfg.aug_contrast)
+        ).to(dtype=out.dtype)
+        mean = out.mean(dim=(-1, -2), keepdim=True)
+        out = (out - mean) * contrast + mean
+
+    if cfg.aug_brightness > 0.0:
+        gain = torch.empty((b, 1, 1, 1, 1), device=device, dtype=torch.float32).uniform_(
+            1.0 - float(cfg.aug_brightness), 1.0 + float(cfg.aug_brightness)
+        ).to(dtype=out.dtype)
+        bias = torch.empty((b, 1, 1, 1, 1), device=device, dtype=torch.float32).uniform_(
+            -float(cfg.aug_brightness), float(cfg.aug_brightness)
+        ).to(dtype=out.dtype)
+        out = out * gain + bias
+
+    if cfg.aug_gray_prob > 0.0:
+        mask = (torch.rand((b, 1, 1, 1, 1), device=device) < float(cfg.aug_gray_prob)).to(dtype=torch.bool)
+        if bool(mask.any().item()):
+            gray = out.mean(dim=2, keepdim=True).expand_as(out)
+            out = torch.where(mask, gray, out)
+
+    if cfg.aug_noise_std > 0.0:
+        noise = torch.randn_like(out, dtype=torch.float32) * float(cfg.aug_noise_std)
+        out = out + noise.to(dtype=out.dtype)
+
+    return out.clamp_(0.0, 1.0)
 
 
 def run_epoch(
@@ -872,6 +993,7 @@ def run_epoch(
     amp_dtype: torch.dtype,
     use_autocast: bool,
     button_pos_weight: torch.Tensor,
+    transition_pos_weight: torch.Tensor,
     mouse_active_pos_weight: torch.Tensor,
     optimizer: Optional[torch.optim.Optimizer] = None,
     total_steps: int = 1,
@@ -886,6 +1008,10 @@ def run_epoch(
     detail_sums = {name: torch.zeros((), device=device) for name in ("button", "mouse_active", "mouse_delta", "transition")}
     step1_stats = BinaryStats(cfg.num_bin, device)
     final_stats = BinaryStats(cfg.num_bin, device)
+    step1_press_stats = BinaryStats(cfg.num_bin, device)
+    step1_release_stats = BinaryStats(cfg.num_bin, device)
+    final_press_stats = BinaryStats(cfg.num_bin, device)
+    final_release_stats = BinaryStats(cfg.num_bin, device)
     mouse_stats = MouseStats(device)
     steps = 0
 
@@ -893,14 +1019,17 @@ def run_epoch(
     pbar = tqdm(range(int(batches)), desc=desc, dynamic_ncols=True)
     for batch_idx in pbar:
         frames, batch_targets = load_batch(iterator_it, targets, device, cfg)
+        if is_train:
+            frames = augment_frames(frames, cfg)
         with torch.set_grad_enabled(is_train):
             with torch.amp.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_autocast):
-                output = model(frames, prev_actions=batch_targets.prev_actions, dt=batch_targets.dt)
+                output = model(frames, dt=batch_targets.dt)
                 loss, details = compute_losses(
                     output,
                     batch_targets,
                     cfg,
                     button_pos_weight=button_pos_weight,
+                    transition_pos_weight=transition_pos_weight,
                     mouse_active_pos_weight=mouse_active_pos_weight,
                 )
                 loss_div = loss / max(1, int(cfg.grad_accum))
@@ -923,7 +1052,18 @@ def run_epoch(
                     optimizer.zero_grad(set_to_none=True)
                     global_step += 1
 
-        update_metrics(output, batch_targets, cfg, step1_stats, final_stats, mouse_stats)
+        update_metrics(
+            output,
+            batch_targets,
+            cfg,
+            step1_stats,
+            final_stats,
+            step1_press_stats,
+            step1_release_stats,
+            final_press_stats,
+            final_release_stats,
+            mouse_stats,
+        )
         loss_sum += loss.detach().float()
         for name, value in details.items():
             detail_sums[name] += value.float()
@@ -933,6 +1073,7 @@ def run_epoch(
                 {
                     "loss": float((loss_sum / max(1, steps)).item()),
                     "btn": float((detail_sums["button"] / max(1, steps)).item()),
+                    "cmd": float((detail_sums["transition"] / max(1, steps)).item()),
                     "mouse": float((detail_sums["mouse_delta"] / max(1, steps)).item()),
                 }
             )
@@ -940,22 +1081,39 @@ def run_epoch(
 
     step1 = step1_stats.compute()
     final = final_stats.compute()
+    step1_press = step1_press_stats.compute()
+    step1_release = step1_release_stats.compute()
+    final_press = final_press_stats.compute()
+    final_release = final_release_stats.compute()
     mouse = mouse_stats.compute()
     button_names = list(cfg.key_names) + list(cfg.mouse_button_names)
     metrics = {
         "loss": float((loss_sum / max(1, steps)).item()),
         "button_loss": float((detail_sums["button"] / max(1, steps)).item()),
+        "transition_loss": float((detail_sums["transition"] / max(1, steps)).item()),
         "step1_button_macro_f1": step1["macro_f1"],
         "step1_button_macro_precision": step1["macro_precision"],
         "step1_button_macro_recall": step1["macro_recall"],
         "final_button_macro_f1": final["macro_f1"],
         "final_button_macro_precision": final["macro_precision"],
         "final_button_macro_recall": final["macro_recall"],
+        "step1_press_macro_f1": step1_press["macro_f1"],
+        "step1_release_macro_f1": step1_release["macro_f1"],
+        "final_press_macro_f1": final_press["macro_f1"],
+        "final_release_macro_f1": final_release["macro_f1"],
         "step1_mouse_mae": mouse["mae"],
         "active_mouse_mae": mouse["active_mae"],
         "per_class_summary": per_class_f1_summary(step1_stats, button_names),
+        "command_summary": (
+            "press " + per_class_f1_summary(step1_press_stats, button_names)
+            + " | release " + per_class_f1_summary(step1_release_stats, button_names)
+        ),
         "step1_button_rows": binary_stats_rows(step1_stats, button_names),
         "final_button_rows": binary_stats_rows(final_stats, button_names),
+        "step1_press_rows": binary_stats_rows(step1_press_stats, button_names),
+        "step1_release_rows": binary_stats_rows(step1_release_stats, button_names),
+        "final_press_rows": binary_stats_rows(final_press_stats, button_names),
+        "final_release_rows": binary_stats_rows(final_release_stats, button_names),
     }
     return metrics, global_step
 
@@ -1007,26 +1165,69 @@ def maybe_resume(
         return 0, 0, -1e9
     print(f"Resuming from {ckpt_path}")
     state = torch.load(ckpt_path, map_location=device)
-    family_reason = policy_checkpoint_family_mismatch_reason(state["config"])
-    if family_reason is not None:
-        raise RuntimeError(f"Cannot resume policy checkpoint {ckpt_path}: {family_reason}")
-    model.load_state_dict(state["model_state"])
+    try:
+        model.load_state_dict(state["model_state"])
+    except RuntimeError as exc:
+        if cfg.resume_path is None:
+            print(
+                f"Skipping incompatible checkpoint {ckpt_path}. "
+                "Starting a fresh run for the current model/action configuration."
+            )
+            return 0, 0, -1e9
+        raise RuntimeError(
+            f"Cannot resume checkpoint {ckpt_path}: it does not match the current CNN+temporal model. "
+            "Start a fresh run or pass --no-resume."
+        ) from exc
     optimizer.load_state_dict(state["optimizer_state"])
     return int(state["epoch"]), int(state["global_step"]), float(state["best_score"])
 
 
 def parse_args() -> TrainConfig:
-    parser = argparse.ArgumentParser(description="Train the 256px long-context action policy.")
+    parser = argparse.ArgumentParser(description="Train the CNN+temporal behavioral cloning policy.")
     add = parser.add_argument
     add("--data-root", default=None)
     add("--ckpt-dir", default=None)
-    add("--resume", dest="resume", action="store_true", default=True)
+    add("--resume", dest="resume", action="store_true", default=None)
     add("--no-resume", dest="resume", action="store_false")
     add("--resume-path", default=None)
     add("--num-epochs", type=int, default=None)
     add("--batch-size", type=int, default=None)
     add("--seq-len", type=int, default=None)
     add("--prediction-horizon", type=int, default=None)
+    add("--model-size", type=int, default=None)
+    add("--d-model", type=int, default=None)
+    add("--temporal-backend", choices=["gru", "tcn"], default=None)
+    add("--temporal-layers", type=int, default=None)
+    add("--temporal-kernel-size", type=int, default=None)
+    add("--dropout", type=float, default=None)
+    add("--encode-chunk-size", type=int, default=None)
+    add("--train-seq-stride", type=int, default=None)
+    add("--val-seq-stride", type=int, default=None)
+    add("--target-effective-batch", type=int, default=None)
+    add("--lr", type=float, default=None)
+    add("--min-lr", type=float, default=None)
+    add("--warmup-steps", type=int, default=None)
+    add("--weight-decay", type=float, default=None)
+    add("--train-split", type=float, default=None)
+    add("--pos-weight-power", type=float, default=None)
+    add("--pos-weight-clamp", type=float, default=None)
+    add("--button-threshold-from-pos-weight", dest="button_threshold_from_pos_weight", action="store_true", default=None)
+    add("--flat-button-threshold", dest="button_threshold_from_pos_weight", action="store_false", default=None)
+    add("--button-threshold-min", type=float, default=None)
+    add("--button-threshold-max", type=float, default=None)
+    add("--transition-threshold", type=float, default=None)
+    add("--transition-loss-weight", type=float, default=None)
+    add("--action-label-offset", type=int, default=None)
+    add("--enable-mouse-actions", dest="mouse_actions_enabled", action="store_true", default=None)
+    add("--disable-mouse-actions", dest="mouse_actions_enabled", action="store_false", default=None)
+    add("--skip-key-names", default=None, help="Comma-separated key names to exclude from training labels.")
+    add("--train-all-keys", action="store_true", help="Disable the default Greenville test filter for e,q,c,z.")
+    add("--button-label-smoothing", type=float, default=None)
+    add("--aug-brightness", type=float, default=None)
+    add("--aug-contrast", type=float, default=None)
+    add("--aug-noise-std", type=float, default=None)
+    add("--aug-gray-prob", type=float, default=None)
+    add("--early-stop-patience", type=int, default=None)
     add("--max-train-batches", type=int, default=None)
     add("--max-val-batches", type=int, default=None)
     add("--dali-num-threads", type=int, default=None)
@@ -1036,7 +1237,6 @@ def parse_args() -> TrainConfig:
     add("--compile", dest="compile_model", action="store_true", default=None)
     add("--no-compile", dest="compile_model", action="store_false", default=None)
     add("--compile-mode", default=None)
-    add("--attention-backend", choices=["auto", "flash", "mem_efficient", "math"], default=None)
     add("--dali-resize-mode", choices=["video_resize", "video_then_resize", "none"], default=None)
     add("--dali-read-ahead", dest="dali_read_ahead", action="store_true")
     add("--no-dali-read-ahead", dest="dali_read_ahead", action="store_false")
@@ -1069,6 +1269,36 @@ def parse_args() -> TrainConfig:
         "batch_size",
         "seq_len",
         "prediction_horizon",
+        "model_size",
+        "d_model",
+        "temporal_backend",
+        "temporal_layers",
+        "temporal_kernel_size",
+        "dropout",
+        "encode_chunk_size",
+        "train_seq_stride",
+        "val_seq_stride",
+        "target_effective_batch",
+        "lr",
+        "min_lr",
+        "warmup_steps",
+        "weight_decay",
+        "train_split",
+        "pos_weight_power",
+        "pos_weight_clamp",
+        "button_threshold_from_pos_weight",
+        "button_threshold_min",
+        "button_threshold_max",
+        "transition_threshold",
+        "transition_loss_weight",
+        "action_label_offset",
+        "mouse_actions_enabled",
+        "button_label_smoothing",
+        "aug_brightness",
+        "aug_contrast",
+        "aug_noise_std",
+        "aug_gray_prob",
+        "early_stop_patience",
         "max_train_batches",
         "max_val_batches",
         "dali_num_threads",
@@ -1077,7 +1307,6 @@ def parse_args() -> TrainConfig:
         "amp_dtype",
         "compile_model",
         "compile_mode",
-        "attention_backend",
         "dali_resize_mode",
         "dali_read_ahead",
         "dali_dont_use_mmap",
@@ -1089,6 +1318,12 @@ def parse_args() -> TrainConfig:
         value = args_by_name[key]
         if value is not None:
             kwargs[key] = value
+    if args.train_all_keys:
+        kwargs["skipped_key_names"] = ()
+    elif args.skip_key_names is not None:
+        kwargs["skipped_key_names"] = tuple(
+            name.strip() for name in str(args.skip_key_names).split(",") if name.strip()
+        )
     return TrainConfig(**kwargs)
 
 
@@ -1105,7 +1340,6 @@ def train() -> None:
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
     torch.set_float32_matmul_precision("high")
-    configure_attention_backend(cfg.attention_backend, device=device)
 
     if cfg.sync_dataset:
         cfg.data_root = sync_dataset_for_training(
@@ -1122,11 +1356,20 @@ def train() -> None:
         raise RuntimeError(f"No runs found under {cfg.data_root!r}.")
     train_pairs, val_pairs = split_runs(pairs, cfg.train_split, cfg.split_seed)
     print(f"Runs: total={len(pairs)} train={len(train_pairs)} val={len(val_pairs)}")
+    if cfg.skipped_key_names:
+        print(f"Skipping action keys for this training run: {', '.join(cfg.skipped_key_names)}")
+    print(f"Training action keys: {', '.join(cfg.key_names + cfg.mouse_button_names)}")
 
-    mouse_scales = compute_mouse_scales(train_pairs, cfg)
+    if cfg.mouse_actions_enabled:
+        mouse_scales = compute_mouse_scales(train_pairs, cfg)
+    else:
+        mouse_scales = (1.0, 1.0)
     cfg.mouse_velocity_scales = mouse_scales
     cfg.__post_init__()
-    print(f"Mouse scales p{cfg.mouse_scale_percentile:.1f}: x={mouse_scales[0]:.3f} y={mouse_scales[1]:.3f}")
+    if cfg.mouse_actions_enabled:
+        print(f"Mouse scales p{cfg.mouse_scale_percentile:.1f}: x={mouse_scales[0]:.3f} y={mouse_scales[1]:.3f}")
+    else:
+        print("Mouse actions disabled: training with zero mouse deltas and no mouse-button targets.")
 
     train_targets = build_window_targets(train_pairs, cfg, stride=cfg.train_seq_stride, return_meta=True)
     val_targets = build_window_targets(val_pairs, cfg, stride=cfg.val_seq_stride, return_meta=True) if val_pairs else None
@@ -1134,7 +1377,13 @@ def train() -> None:
         "Windows:",
         f"train={tuple(train_targets.button_horizon.shape)}",
         f"val={(tuple(val_targets.button_horizon.shape) if val_targets is not None else None)}",
+        f"action_label_offset={cfg.action_label_offset}",
     )
+    train_persist = persistence_baseline_metrics(train_targets, cfg)
+    print(f"Persistence baseline: train_f1@1={train_persist['macro_f1']:.4f}")
+    if val_targets is not None:
+        val_persist = persistence_baseline_metrics(val_targets, cfg)
+        print(f"Persistence baseline: val_f1@1={val_persist['macro_f1']:.4f} {val_persist['per_class_summary']}")
 
     train_file_list = os.path.join(cfg.ckpt_dir, "train_file_list.txt")
     val_file_list = os.path.join(cfg.ckpt_dir, "val_file_list.txt")
@@ -1147,6 +1396,16 @@ def train() -> None:
         write_window_file_list(val_targets.meta, val_file_list)
 
     button_pos_weight = compute_pos_weight(train_targets.button_horizon.reshape(-1, cfg.num_bin), cfg.pos_weight_power, cfg.pos_weight_clamp).to(device)
+    transition_targets = torch.cat(
+        [
+            train_targets.press.reshape(-1, cfg.num_bin),
+            train_targets.release.reshape(-1, cfg.num_bin),
+        ],
+        dim=0,
+    )
+    transition_pos_weight = compute_pos_weight(transition_targets, cfg.pos_weight_power, cfg.pos_weight_clamp).to(device)
+    button_thresholds = decision_thresholds_from_pos_weight(button_pos_weight, cfg).detach().cpu()
+    cfg.button_state_thresholds = tuple(float(x) for x in button_thresholds.tolist())
     mouse_active_pos_weight = compute_pos_weight(
         train_targets.mouse_active_horizon.reshape(-1, 1),
         cfg.pos_weight_power,
@@ -1155,8 +1414,15 @@ def train() -> None:
     print(
         "Class weighting:",
         f"button_mean={float(button_pos_weight.mean().item()):.3f}",
+        f"transition_mean={float(transition_pos_weight.mean().item()):.3f}",
         f"mouse_active={float(mouse_active_pos_weight.mean().item()):.3f}",
     )
+    button_names = list(cfg.key_names) + list(cfg.mouse_button_names)
+    threshold_parts = [
+        f"{name}={float(threshold):.3f}"
+        for name, threshold in zip(button_names, cfg.button_state_thresholds)
+    ]
+    print("Button decision thresholds:", " ".join(threshold_parts))
 
     train_targets = pin_bundle(train_targets)
     if val_targets is not None:
@@ -1169,7 +1435,7 @@ def train() -> None:
         random_shuffle=cfg.dali_train_random_shuffle,
         last_batch_policy=LastBatchPolicy.DROP,
     )
-    train_batches = int(train_targets.prev_actions.shape[0]) // int(cfg.batch_size)
+    train_batches = int(train_targets.button_horizon.shape[0]) // int(cfg.batch_size)
     if cfg.max_train_batches is not None:
         train_batches = min(train_batches, cfg.max_train_batches)
     if train_batches <= 0:
@@ -1178,7 +1444,7 @@ def train() -> None:
     val_iter = None
     val_batches = 0
     if val_targets is not None:
-        val_batch_size = min(max(1, cfg.batch_size), int(val_targets.prev_actions.shape[0]))
+        val_batch_size = min(max(1, cfg.batch_size), int(val_targets.button_horizon.shape[0]))
         val_iter = make_dali_iterator(
             val_file_list,
             cfg,
@@ -1186,7 +1452,7 @@ def train() -> None:
             random_shuffle=cfg.dali_val_random_shuffle,
             last_batch_policy=LastBatchPolicy.PARTIAL,
         )
-        val_batches = int(math.ceil(int(val_targets.prev_actions.shape[0]) / float(val_batch_size)))
+        val_batches = int(math.ceil(int(val_targets.button_horizon.shape[0]) / float(val_batch_size)))
         if cfg.max_val_batches is not None:
             val_batches = min(val_batches, cfg.max_val_batches)
 
@@ -1212,6 +1478,7 @@ def train() -> None:
 
     optimizer_steps_per_epoch = int(math.ceil(train_batches / float(cfg.grad_accum)))
     total_steps = max(1, optimizer_steps_per_epoch * cfg.num_epochs)
+    epochs_without_improvement = 0
 
     for epoch in range(start_epoch, cfg.num_epochs):
         train_metrics, global_step = run_epoch(
@@ -1225,6 +1492,7 @@ def train() -> None:
             amp_dtype=amp_dtype,
             use_autocast=use_autocast,
             button_pos_weight=button_pos_weight,
+            transition_pos_weight=transition_pos_weight,
             mouse_active_pos_weight=mouse_active_pos_weight,
             optimizer=optimizer,
             total_steps=total_steps,
@@ -1232,7 +1500,7 @@ def train() -> None:
         )
 
         val_metrics = None
-        score = train_metrics["step1_button_macro_f1"] - 0.001 * train_metrics["step1_mouse_mae"]
+        score = driving_score(train_metrics, cfg)
         if val_iter is not None and val_targets is not None and val_batches > 0:
             with torch.inference_mode():
                 val_metrics, _ = run_epoch(
@@ -1246,12 +1514,15 @@ def train() -> None:
                     amp_dtype=amp_dtype,
                     use_autocast=use_autocast,
                     button_pos_weight=button_pos_weight,
+                    transition_pos_weight=transition_pos_weight,
                     mouse_active_pos_weight=mouse_active_pos_weight,
                 )
-            score = val_metrics["step1_button_macro_f1"] - 0.001 * val_metrics["step1_mouse_mae"]
+            score = driving_score(val_metrics, cfg)
 
-        if score > best_score:
+        improved = score > best_score
+        if improved:
             best_score = score
+            epochs_without_improvement = 0
             save_checkpoint(
                 os.path.join(cfg.ckpt_dir, "model_best.pt"),
                 model=base_model,
@@ -1261,6 +1532,8 @@ def train() -> None:
                 global_step=global_step,
                 best_score=best_score,
             )
+        else:
+            epochs_without_improvement += 1
 
         save_checkpoint(
             os.path.join(cfg.ckpt_dir, "model_latest.pt"),
@@ -1286,59 +1559,96 @@ def train() -> None:
             f"Epoch {epoch + 1}/{cfg.num_epochs}",
             f"tr_loss={train_metrics['loss']:.4f}",
             f"tr_f1@1={train_metrics['step1_button_macro_f1']:.4f}",
-            f"tr_f1@{cfg.prediction_horizon}={train_metrics['final_button_macro_f1']:.4f}",
+            f"tr_cmd@1={(0.5 * (train_metrics['step1_press_macro_f1'] + train_metrics['step1_release_macro_f1'])):.4f}",
             f"tr_mouse@1={train_metrics['step1_mouse_mae']:.3f}",
             f"tr_active_mouse@1={train_metrics['active_mouse_mae']:.3f}",
         ]
+        if int(cfg.prediction_horizon) > 1:
+            parts.append(f"tr_f1@{cfg.prediction_horizon}={train_metrics['final_button_macro_f1']:.4f}")
+            parts.append(
+                f"tr_cmd@{cfg.prediction_horizon}="
+                f"{(0.5 * (train_metrics['final_press_macro_f1'] + train_metrics['final_release_macro_f1'])):.4f}"
+            )
         if val_metrics is not None:
             parts.extend(
                 [
                     f"va_loss={val_metrics['loss']:.4f}",
                     f"va_f1@1={val_metrics['step1_button_macro_f1']:.4f}",
-                    f"va_f1@{cfg.prediction_horizon}={val_metrics['final_button_macro_f1']:.4f}",
+                    f"va_cmd@1={(0.5 * (val_metrics['step1_press_macro_f1'] + val_metrics['step1_release_macro_f1'])):.4f}",
                     f"va_mouse@1={val_metrics['step1_mouse_mae']:.3f}",
                     f"best={best_score:.4f}",
                     val_metrics["per_class_summary"],
+                    val_metrics["command_summary"],
                 ]
             )
+            if int(cfg.prediction_horizon) > 1:
+                parts.insert(-4, f"va_f1@{cfg.prediction_horizon}={val_metrics['final_button_macro_f1']:.4f}")
+                parts.insert(
+                    -4,
+                    f"va_cmd@{cfg.prediction_horizon}="
+                    f"{(0.5 * (val_metrics['final_press_macro_f1'] + val_metrics['final_release_macro_f1'])):.4f}",
+                )
         else:
             parts.append(train_metrics["per_class_summary"])
         print(" | ".join(part for part in parts if part))
-        print(
+        train_stats = (
             f"Epoch {epoch + 1} train stats: "
             f"f1@1={train_metrics['step1_button_macro_f1']:.4f} "
+            f"cmd@1={(0.5 * (train_metrics['step1_press_macro_f1'] + train_metrics['step1_release_macro_f1'])):.4f} "
             f"prec@1={train_metrics['step1_button_macro_precision']:.4f} "
             f"rec@1={train_metrics['step1_button_macro_recall']:.4f} "
-            f"f1@{cfg.prediction_horizon}={train_metrics['final_button_macro_f1']:.4f} "
             f"mouse_mae@1={train_metrics['step1_mouse_mae']:.3f} "
             f"active_mouse_mae@1={train_metrics['active_mouse_mae']:.3f}"
         )
+        if int(cfg.prediction_horizon) > 1:
+            train_stats += (
+                f" f1@{cfg.prediction_horizon}={train_metrics['final_button_macro_f1']:.4f}"
+                f" cmd@{cfg.prediction_horizon}="
+                f"{(0.5 * (train_metrics['final_press_macro_f1'] + train_metrics['final_release_macro_f1'])):.4f}"
+            )
+        print(train_stats)
         print_button_stats_table(
             f"Epoch {epoch + 1} train per-key/button @1:",
             train_metrics["step1_button_rows"],
         )
-        print_button_stats_table(
-            f"Epoch {epoch + 1} train per-key/button @{cfg.prediction_horizon}:",
-            train_metrics["final_button_rows"],
-        )
+        if int(cfg.prediction_horizon) > 1:
+            print_button_stats_table(
+                f"Epoch {epoch + 1} train per-key/button @{cfg.prediction_horizon}:",
+                train_metrics["final_button_rows"],
+            )
         if val_metrics is not None:
-            print(
+            val_stats = (
                 f"Epoch {epoch + 1} val stats: "
                 f"f1@1={val_metrics['step1_button_macro_f1']:.4f} "
+                f"cmd@1={(0.5 * (val_metrics['step1_press_macro_f1'] + val_metrics['step1_release_macro_f1'])):.4f} "
                 f"prec@1={val_metrics['step1_button_macro_precision']:.4f} "
                 f"rec@1={val_metrics['step1_button_macro_recall']:.4f} "
-                f"f1@{cfg.prediction_horizon}={val_metrics['final_button_macro_f1']:.4f} "
                 f"mouse_mae@1={val_metrics['step1_mouse_mae']:.3f} "
                 f"active_mouse_mae@1={val_metrics['active_mouse_mae']:.3f}"
             )
+            if int(cfg.prediction_horizon) > 1:
+                val_stats += (
+                    f" f1@{cfg.prediction_horizon}={val_metrics['final_button_macro_f1']:.4f}"
+                    f" cmd@{cfg.prediction_horizon}="
+                    f"{(0.5 * (val_metrics['final_press_macro_f1'] + val_metrics['final_release_macro_f1'])):.4f}"
+                )
+            print(val_stats)
             print_button_stats_table(
                 f"Epoch {epoch + 1} val per-key/button @1:",
                 val_metrics["step1_button_rows"],
             )
-            print_button_stats_table(
-                f"Epoch {epoch + 1} val per-key/button @{cfg.prediction_horizon}:",
-                val_metrics["final_button_rows"],
-            )
+            if int(cfg.prediction_horizon) > 1:
+                print_button_stats_table(
+                    f"Epoch {epoch + 1} val per-key/button @{cfg.prediction_horizon}:",
+                    val_metrics["final_button_rows"],
+                )
+        if (
+            val_metrics is not None
+            and int(cfg.early_stop_patience) > 0
+            and epochs_without_improvement >= int(cfg.early_stop_patience)
+        ):
+            print(f"Early stopping after {epoch + 1} epochs; best score={best_score:.4f}.")
+            break
 
 
 if __name__ == "__main__":

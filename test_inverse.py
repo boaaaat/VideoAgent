@@ -703,7 +703,7 @@ def write_stats_video(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Render inverse-dynamics predictions and ground truth beside a video.")
-    parser.add_argument("--checkpoint", default=r'C:\Users\Abhil\Desktop\vs_code_stuff\python\ai\checkpoints_idm\model_epoch_16.pt', help="Path to inverse model checkpoint.")
+    parser.add_argument("--checkpoint", default=r'C:\Users\Abhil\Desktop\vs_code_stuff\python\ai\checkpoints_idm\model_epoch_9.pt', help="Path to inverse model checkpoint.")
     parser.add_argument("--video", default=r'C:\Users\Abhil\Desktop\vs_code_stuff\python\ai\data\arc_raiders\run_20260421_182551.mp4', help="Input video path.")
     parser.add_argument("--labels", default=None, help="Ground-truth CSV path. Defaults to the video path with .csv extension.")
     parser.add_argument("--output", default=r'C:\Users\Abhil\Desktop\vs_code_stuff\python\ai\data\test_inverse.mp4', help="Output annotated mp4 path.")

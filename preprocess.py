@@ -1,30 +1,39 @@
-import os
 import glob
+import os
 import subprocess
+from pathlib import Path
 
-# Path to your dataset (WSL-visible)
-DATA_ROOT = "C:/Users/Abhil/Desktop/vs code stuff/python/ai/data/flee_the_facility"
+# Path to your dataset.
+DATA_ROOT = str(Path(__file__).resolve().parent / "data" / "arc_raiders")
 
 # Output resolution (no aspect ratio preserved)
 TARGET_W = 512
 TARGET_H = 512
 
-# FFmpeg / NVENC settings
-CODEC = "hevc_nvenc"   # or "h264_nvenc"
+# FFmpeg / NVENC settings. H.264 with short GOPs is easier for DALI random
+# window reads than long-GOP HEVC.
+CODEC = "h264_nvenc"
 PRESET = "p5"
-CQ = "28"
+CQ = "23"
+GOP_SIZE = "16"
+TEMP_SUFFIX = "_temp"
 FFMPEG = "ffmpeg"      # FFmpeg should be in PATH
 
 
-def process_video(in_path: str):
-    """Resize to EXACT 512×512 and re-encode with NVENC."""
+def temp_video_path(in_path: str) -> str:
+    path = Path(in_path)
+    return str(path.with_name(f"{path.stem}{TEMP_SUFFIX}{path.suffix}"))
 
-    base, _ = os.path.splitext(in_path)
-    out_path = base + "_512.mp4"
 
-    if os.path.exists(out_path):
-        print(f"[SKIP] Already exists: {out_path}")
+def process_video(in_path: str) -> None:
+    """Resize to EXACT 512x512 and re-encode in place with DALI-friendly GOPs."""
+
+    path = Path(in_path)
+    if path.stem.endswith(TEMP_SUFFIX):
+        print(f"[SKIP] Temp file: {in_path}")
         return
+
+    temp_path = temp_video_path(in_path)
 
     # This works on almost any FFmpeg build:
     # -hwaccel cuda is optional; remove it if it errors on your setup.
@@ -44,20 +53,38 @@ def process_video(in_path: str):
         # NVENC GPU encoder
         "-c:v", CODEC,
         "-preset", PRESET,
+        "-rc", "vbr",
         "-cq", CQ,
+        "-pix_fmt", "yuv420p",
 
-        out_path,
+        # Short, simple GOPs make DALI frame-window reads cheaper and more robust.
+        "-g", GOP_SIZE,
+        "-keyint_min", GOP_SIZE,
+        "-bf", "0",
+        "-forced-idr", "1",
+
+        # Dataset clips do not need audio, and faststart keeps MP4 metadata up front.
+        "-an",
+        "-movflags", "+faststart",
+
+        temp_path,
     ]
 
     print("\n[PROCESS]", in_path)
     print(" ".join(cmd))
     subprocess.run(cmd, check=True)
-    print("[DONE]", out_path)
+
+    os.replace(temp_path, in_path)
+    print("[DONE]", in_path)
 
 
-def main():
+def main() -> None:
     # Adjust glob if your naming differs
-    video_files = sorted(glob.glob(os.path.join(DATA_ROOT, "run_*.mp4")))
+    video_files = [
+        path
+        for path in sorted(glob.glob(os.path.join(DATA_ROOT, "run_*.mp4")))
+        if not Path(path).stem.endswith(TEMP_SUFFIX)
+    ]
 
     if not video_files:
         print("No videos found.")

@@ -176,6 +176,15 @@ def parse_row(
     return keys, clicks, (dx, dy), timestamp
 
 
+def transition_between(
+    previous: Dict[str, bool],
+    current: Dict[str, bool],
+) -> Tuple[List[str], List[str]]:
+    pressed = [name for name, active in current.items() if active and not previous.get(name, False)]
+    released = [name for name, active in previous.items() if active and not current.get(name, False)]
+    return pressed, released
+
+
 def draw_overlay(
     frame,
     *,
@@ -183,15 +192,18 @@ def draw_overlay(
     total_frames: int,
     fps: float,
     label_idx: Optional[int],
-    label_shift: int,
+    prediction_horizon: int,
+    action_label_offset: int,
     keys: Optional[Dict[str, bool]],
     clicks: Optional[Dict[str, bool]],
+    pressed: Optional[List[str]],
+    released: Optional[List[str]],
     mouse_delta: Tuple[int, int],
     label_timestamp: Optional[float],
 ) -> None:
     h, w = frame.shape[:2]
-    box_w = min(420, w - 20)
-    box_h = min(170, h - 20)
+    box_w = min(520, w - 20)
+    box_h = min(215, h - 20)
     x0, y0 = 10, 10
     x1, y1 = x0 + box_w, y0 + box_h
 
@@ -216,7 +228,18 @@ def draw_overlay(
     label_str = f"{label_idx}" if label_idx is not None else "N/A"
     cv2.putText(
         frame,
-        f"Label idx: {label_str}  shift: {label_shift:+d}",
+        f"Target idx: {label_str} = frame + horizon + offset",
+        (x0 + 10, y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        (200, 200, 200),
+        1,
+    )
+    y += 22
+
+    cv2.putText(
+        frame,
+        f"Horizon: {prediction_horizon:+d}  action_label_offset: {action_label_offset:+d}",
         (x0 + 10, y),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.5,
@@ -294,6 +317,30 @@ def draw_overlay(
         )
         y += 22
 
+    if pressed is not None and released is not None:
+        press_labels = [_display_key(name) for name in pressed]
+        release_labels = [_display_key(name) for name in released]
+        cv2.putText(
+            frame,
+            f"Press: {' '.join(press_labels) or 'None'}",
+            (x0 + 10, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (80, 255, 80),
+            1,
+        )
+        y += 22
+        cv2.putText(
+            frame,
+            f"Release: {' '.join(release_labels) or 'None'}",
+            (x0 + 10, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (80, 160, 255),
+            1,
+        )
+        y += 22
+
     dx, dy = mouse_delta
     cv2.putText(
         frame,
@@ -313,7 +360,7 @@ def main() -> int:
     parser.add_argument(
         "--video",
         help="Path to the video file.",
-        default=os.path.join(game_data_root(selected_game, root="data_pseudo"), "run_yt_1Bc5jfeoTYY.mp4"),
+        default=r'C:\Users\Abhil\Desktop\vs_code_stuff\python\ai\data\greenville\run_20260518_153515.mp4',
     )
     parser.add_argument(
         "--csv",
@@ -324,8 +371,20 @@ def main() -> int:
     parser.add_argument(
         "--label-shift",
         type=int,
+        default=None,
+        help="Legacy direct label shift. Prefer --prediction-horizon and --action-label-offset.",
+    )
+    parser.add_argument(
+        "--prediction-horizon",
+        type=int,
+        default=1,
+        help="Training prediction horizon h. Target idx = frame + h + action_label_offset.",
+    )
+    parser.add_argument(
+        "--action-label-offset",
+        type=int,
         default=0,
-        help="Shift labels by N frames (train_2 uses label_offset).",
+        help="Same offset used by train.py. Target idx = frame + horizon + offset.",
     )
     parser.add_argument(
         "--max-frames",
@@ -425,13 +484,30 @@ def main() -> int:
                     desc="Writing",
                 )
 
-            label_idx = current_idx + int(args.label_shift)
+            prediction_horizon = max(1, int(args.prediction_horizon))
+            if args.label_shift is None:
+                action_label_offset = int(args.action_label_offset)
+                label_idx = current_idx + prediction_horizon + action_label_offset
+            else:
+                action_label_offset = int(args.label_shift) - prediction_horizon
+                label_idx = current_idx + int(args.label_shift)
+
             if 0 <= label_idx < len(rows):
                 keys, clicks, mouse_delta, label_ts = parse_row(
                     rows[label_idx], key_names, click_names
                 )
+                if label_idx > 0:
+                    prev_keys, prev_clicks, _, _ = parse_row(
+                        rows[label_idx - 1], key_names, click_names
+                    )
+                    all_prev = {**prev_keys, **prev_clicks}
+                    all_current = {**keys, **clicks}
+                    pressed, released = transition_between(all_prev, all_current)
+                else:
+                    pressed, released = [], []
             else:
                 keys, clicks, mouse_delta, label_ts = None, None, (0, 0), None
+                pressed, released = None, None
                 label_idx = None
 
             draw_overlay(
@@ -440,9 +516,12 @@ def main() -> int:
                 total_frames=total_frames,
                 fps=fps,
                 label_idx=label_idx,
-                label_shift=args.label_shift,
+                prediction_horizon=prediction_horizon,
+                action_label_offset=action_label_offset,
                 keys=keys,
                 clicks=clicks,
+                pressed=pressed,
+                released=released,
                 mouse_delta=mouse_delta,
                 label_timestamp=label_ts,
             )
