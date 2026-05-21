@@ -318,15 +318,7 @@ def load_checkpoint(
     checkpoint_config = dict(state["config"])
     model_state = state["model_state"]
 
-    if checkpoint_config.get("temporal_backend") == "gru":
-        print("Applying V1 backward compatibility overrides for GRU model...")
-        checkpoint_config.setdefault("frame_spatial_pool", 1)
-        checkpoint_config.setdefault("frame_spatial_channels", checkpoint_config.get("d_model", 128))
-    
     cfg = _apply_checkpoint_config(cfg, checkpoint_config)
-    
-    if checkpoint_config.get("temporal_backend") == "gru":
-        cfg.temporal_backend = "gru"
     cfg = _coerce_config_types(cfg)
     cfg.ckpt_path = ckpt_path
     print(f"Checkpoint: epoch={state.get('epoch')} step={state.get('global_step')} best={state.get('best_score')}")
@@ -427,12 +419,7 @@ def main() -> None:
     cfg, model_state = load_checkpoint(cfg, device)
     RUNTIME_CFG = cfg
 
-    if getattr(cfg, "temporal_backend", "attention") == "gru":
-        import models_v1
-        model = models_v1.ActionConditionedVideoPolicy(cfg).to(device)
-    else:
-        model = ActionConditionedVideoPolicy(cfg).to(device)
-        
+    model = ActionConditionedVideoPolicy(cfg).to(device)
     model.load_state_dict(model_state)
     print(
         "Model:",
