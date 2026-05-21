@@ -44,7 +44,7 @@ class ModelConfig:
     coord_scale: float = 1.0
     coord_dropout: float = 0.1
     encode_chunk_size: int = 16
-    max_context: int = 64
+    max_context: int = 100
 
     button_state_threshold: float = 0.5
     button_state_thresholds: Optional[Sequence[float]] = None
