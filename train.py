@@ -27,7 +27,7 @@ from action_space import game_data_root
 from augmentations import augment_frames
 from dataset_wsl_sync import sync_dataset_for_training
 from models import (
-    ActionConditionedVideoPolicy,
+    DrivingVideoPolicy,
     ModelConfig,
     PolicyOutput,
 )
@@ -35,15 +35,15 @@ from models import (
 
 @dataclass
 class TrainConfig(ModelConfig):
-    batch_size: int = 1
-    target_effective_batch: int = 8
+    batch_size: int = 4
+    target_effective_batch: int = 32
     grad_accum: int = 8
     num_epochs: int = 40
 
-    lr: float = 1e-4
+    lr: float = 2e-4
     min_lr: float = 1e-5
     warmup_steps: int = 300
-    weight_decay: float = 0.08
+    weight_decay: float = 0.05
     grad_clip: float = 1.0
 
     amp_dtype: str = "bf16"
@@ -69,13 +69,13 @@ class TrainConfig(ModelConfig):
     aug_gray_prob: float = 0.02
     aug_translate_frac: float = 0.0
     aug_scale_frac: float = 0.0
-    aug_edges_crop_prob: float = 0.15
-    aug_edges_crop_min_frac: float = 0.05
-    aug_edges_crop_max_frac: float = 0.15
+    aug_edges_crop_prob: float = 0.0
+    aug_edges_crop_min_frac: float = 0.0
+    aug_edges_crop_max_frac: float = 0.0
     aug_cutout_prob: float = 0.10
     aug_cutout_min_frac: float = 0.04
-    aug_cutout_max_frac: float = 0.12
-    aug_cutout_count: int = 2
+    aug_cutout_max_frac: float = 0.10
+    aug_cutout_count: int = 1
 
     early_stop_patience: int = 5
 
@@ -1212,7 +1212,7 @@ def train() -> None:
         raise RuntimeError("This trainer supports bf16/fp32 only.")
     print(f"AMP: dtype={amp_dtype} autocast={use_autocast}")
 
-    base_model: torch.nn.Module = ActionConditionedVideoPolicy(cfg).to(device)
+    base_model: torch.nn.Module = DrivingVideoPolicy(cfg).to(device)
     base_model = base_model.to(memory_format=torch.channels_last)
     optimizer = torch.optim.AdamW(base_model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay, fused=True)
     print(f"Parameters: {sum(p.numel() for p in base_model.parameters()) / 1e6:.4f}M")

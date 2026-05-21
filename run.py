@@ -18,7 +18,7 @@ from pynput import keyboard
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from models import (  # noqa: E402
-    ActionConditionedVideoPolicy,
+    DrivingVideoPolicy,
     ModelConfig,
     TemporalState,
 )
@@ -68,6 +68,10 @@ MOUSE_NAME_MAP = {
     "right_click": "right",
     "middle_click": "middle",
 }
+
+
+def new_temporal_state() -> TemporalState:
+    return TemporalState()
 
 
 def release_all() -> None:
@@ -419,7 +423,7 @@ def main() -> None:
     cfg, model_state = load_checkpoint(cfg, device)
     RUNTIME_CFG = cfg
 
-    model = ActionConditionedVideoPolicy(cfg).to(device)
+    model = DrivingVideoPolicy(cfg).to(device)
     model.load_state_dict(model_state)
     print(
         "Model:",
@@ -428,10 +432,8 @@ def main() -> None:
         f"horizon={cfg.prediction_horizon}",
         f"command_horizon={cfg.command_horizon}",
         f"d_model={cfg.d_model}",
-        "temporal=attention",
-        f"layers={cfg.temporal_layers}",
-        f"heads={cfg.temporal_heads}",
-        f"spatial={cfg.frame_spatial_pool}x{cfg.frame_spatial_pool}x{cfg.frame_spatial_channels}",
+        "temporal=gru",
+        f"crop_top={int(cfg.model_size * 0.40)}",
     )
     print(
         "Button thresholds:",
@@ -447,19 +449,11 @@ def main() -> None:
     )
 
     inference_dtype = torch.float32
-    if device.type == "cuda" and bool(getattr(torch.cuda, "is_bf16_supported", lambda: False)()):
-        inference_dtype = torch.bfloat16
-    if inference_dtype != torch.float32:
-        try:
-            model = model.to(dtype=inference_dtype)
-        except Exception:
-            inference_dtype = torch.float32
-            model = model.to(dtype=inference_dtype)
 
     model.eval()
     controller = ActionController(cfg)
 
-    state: TemporalState = model.init_state(batch_size=1, device=device, dtype=inference_dtype)
+    state: TemporalState = new_temporal_state()
     was_autopilot = False
     last_step_time: Optional[float] = None
 
@@ -472,12 +466,12 @@ def main() -> None:
             loop_start = time.perf_counter()
 
             if autopilot and not was_autopilot:
-                state = model.init_state(batch_size=1, device=device, dtype=inference_dtype)
+                state = new_temporal_state()
                 last_step_time = None
                 print("Autopilot ENABLED - temporal state reset")
 
             if (not autopilot) and was_autopilot:
-                state = model.init_state(batch_size=1, device=device, dtype=inference_dtype)
+                state = new_temporal_state()
                 last_step_time = None
                 release_all()
                 print("Autopilot DISABLED - temporal state reset")

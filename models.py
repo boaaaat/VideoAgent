@@ -26,7 +26,7 @@ class ModelConfig:
     train_seq_stride: int = 40
     val_seq_stride: int = 80
     prediction_dt: float = 1.0 / 20.0
-    prediction_horizon: int = 5
+    prediction_horizon: int = 1
 
     key_names: Optional[List[str]] = None
     mouse_button_names: Optional[List[str]] = None
@@ -128,389 +128,130 @@ def _group_count(channels: int) -> int:
             return groups
     return 1
 
-
-class ConvBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, *, stride: int = 1, dropout: float = 0.0):
+class PilotNetBackbone(nn.Module):
+    """
+    Based on NVIDIA's PilotNet architecture, heavily optimized for detecting 
+    lane lines and road boundaries without washing out spatial features.
+    """
+    def __init__(self, in_channels: int = 3, dropout: float = 0.2):
         super().__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
-        self.norm = nn.GroupNorm(_group_count(out_channels), out_channels)
-        self.drop = nn.Dropout2d(float(dropout)) if dropout > 0.0 else nn.Identity()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.drop(F.silu(self.norm(self.conv(x)), inplace=True))
-
-
-class ResidualConvBlock(nn.Module):
-    def __init__(self, channels: int, *, dropout: float = 0.0):
-        super().__init__()
-        self.net = nn.Sequential(
-            ConvBlock(channels, channels, stride=1, dropout=dropout),
-            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(_group_count(channels), channels),
+        # Standard PilotNet Conv stack
+        self.conv_layers = nn.Sequential(
+            nn.Conv2d(in_channels, 24, kernel_size=5, stride=2, bias=False),
+            nn.BatchNorm2d(24),
+            nn.ELU(inplace=True),
+            
+            nn.Conv2d(24, 36, kernel_size=5, stride=2, bias=False),
+            nn.BatchNorm2d(36),
+            nn.ELU(inplace=True),
+            
+            nn.Conv2d(36, 48, kernel_size=5, stride=2, bias=False),
+            nn.BatchNorm2d(48),
+            nn.ELU(inplace=True),
+            
+            nn.Conv2d(48, 64, kernel_size=3, stride=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ELU(inplace=True),
+            
+            nn.Conv2d(64, 64, kernel_size=3, stride=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ELU(inplace=True),
+            
+            nn.Dropout2d(dropout)
         )
-        self.gamma = nn.Parameter(torch.ones(channels) * 1e-3)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = self.net(x)
-        return x + y * self.gamma.to(device=x.device, dtype=x.dtype).view(1, -1, 1, 1)
+        return self.conv_layers(x)
 
-
-class FrameCNN(nn.Module):
+class DrivingVideoPolicy(nn.Module):
     def __init__(self, cfg: ModelConfig):
-        super().__init__()
-        widths = [
-            max(32, cfg.d_model // 8),
-            max(48, cfg.d_model // 4),
-            max(96, cfg.d_model // 2),
-            cfg.d_model,
-        ]
-        layers: List[nn.Module] = []
-        in_channels = 8
-        for idx, out_channels in enumerate(widths):
-            layers.append(ConvBlock(in_channels, out_channels, stride=2, dropout=cfg.dropout * 0.2))
-            layers.append(ResidualConvBlock(out_channels, dropout=cfg.dropout * 0.2))
-            in_channels = out_channels
-            if idx >= 1:
-                layers.append(ResidualConvBlock(out_channels, dropout=cfg.dropout * 0.2))
-        self.net = nn.Sequential(*layers)
-        self.pool_size = int(cfg.frame_spatial_pool)
-        spatial_channels = int(cfg.frame_spatial_channels)
-        self.spatial_proj = nn.Sequential(
-            nn.Conv2d(cfg.d_model, cfg.d_model, kernel_size=3, padding=1, groups=cfg.d_model, bias=False),
-            nn.GroupNorm(_group_count(cfg.d_model), cfg.d_model),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(cfg.d_model, spatial_channels, kernel_size=1, bias=False),
-            nn.GroupNorm(_group_count(spatial_channels), spatial_channels),
-            nn.SiLU(inplace=True),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.net(x)
-        x = self.spatial_proj(x)
-        x = F.adaptive_avg_pool2d(x, output_size=(self.pool_size, self.pool_size))
-        return x.flatten(2).transpose(1, 2).contiguous()
-
-
-class SpatialAttentionPool(nn.Module):
-    def __init__(self, cfg: ModelConfig, *, num_source_tokens: int):
-        super().__init__()
-        self.num_queries = int(cfg.spatial_attention_tokens)
-        self.grid_tokens = int(cfg.spatial_temporal_grid) * int(cfg.spatial_temporal_grid)
-        self.token_norm = nn.LayerNorm(cfg.frame_spatial_channels)
-        self.token_proj = nn.Linear(cfg.frame_spatial_channels, cfg.d_model)
-        self.pos_embed = nn.Parameter(torch.zeros(num_source_tokens, cfg.d_model))
-        self.query_embed = nn.Parameter(torch.zeros(self.num_queries, cfg.d_model))
-        self.attn = nn.MultiheadAttention(
-            embed_dim=cfg.d_model,
-            num_heads=cfg.spatial_attention_heads,
-            dropout=cfg.dropout,
-            batch_first=True,
-        )
-        self.attn_drop = nn.Dropout(cfg.dropout)
-        self.mlp_norm = nn.LayerNorm(cfg.d_model)
-        hidden_dim = max(cfg.d_model, int(round(cfg.d_model * float(cfg.temporal_mlp_ratio))))
-        self.mlp = nn.Sequential(
-            nn.Linear(cfg.d_model, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(cfg.dropout),
-            nn.Linear(hidden_dim, cfg.d_model),
-            nn.Dropout(cfg.dropout),
-        )
-        self.out_norm = nn.LayerNorm(cfg.d_model)
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
-        nn.init.trunc_normal_(self.query_embed, std=0.02)
-
-    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
-        x = self.token_proj(self.token_norm(tokens))
-        pos = self.pos_embed.to(device=x.device, dtype=x.dtype).unsqueeze(0)
-        x = x + pos
-        query = self.query_embed.to(device=x.device, dtype=x.dtype).unsqueeze(0).expand(x.size(0), -1, -1)
-        pooled, _ = self.attn(query, x, x, need_weights=False)
-        pooled = query + self.attn_drop(pooled)
-        pooled = pooled + self.mlp(self.mlp_norm(pooled))
-        pooled = self.out_norm(pooled)
-        if pooled.size(1) == self.grid_tokens:
-            return pooled.contiguous()
-        pooled = pooled.transpose(1, 2)
-        pooled = F.adaptive_avg_pool1d(pooled, self.grid_tokens)
-        return pooled.transpose(1, 2).contiguous()
-
-
-class CausalAttentionBlock(nn.Module):
-    def __init__(self, cfg: ModelConfig):
-        super().__init__()
-        self.attn_norm = nn.LayerNorm(cfg.d_model)
-        self.attn = nn.MultiheadAttention(
-            embed_dim=cfg.d_model,
-            num_heads=cfg.temporal_heads,
-            dropout=cfg.dropout,
-            batch_first=True,
-        )
-        self.attn_drop = nn.Dropout(cfg.dropout)
-        self.mlp_norm = nn.LayerNorm(cfg.d_model)
-        hidden_dim = max(cfg.d_model, int(round(cfg.d_model * float(cfg.temporal_mlp_ratio))))
-        self.mlp = nn.Sequential(
-            nn.Linear(cfg.d_model, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(cfg.dropout),
-            nn.Linear(hidden_dim, cfg.d_model),
-            nn.Dropout(cfg.dropout),
-        )
-
-    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor) -> torch.Tensor:
-        y = self.attn_norm(x)
-        y, _ = self.attn(y, y, y, attn_mask=attn_mask, need_weights=False)
-        x = x + self.attn_drop(y)
-        return x + self.mlp(self.mlp_norm(x))
-
-
-class CausalAttentionTemporal(nn.Module):
-    def __init__(self, cfg: ModelConfig, *, input_dim: int):
         super().__init__()
         self.cfg = cfg
-        self.max_context = int(cfg.max_context)
-        self.in_norm = nn.LayerNorm(input_dim)
-        self.in_proj = nn.Linear(input_dim, cfg.d_model)
-        self.pos_embed = nn.Parameter(torch.zeros(self.max_context, cfg.d_model))
-        self.blocks = nn.ModuleList(CausalAttentionBlock(cfg) for _ in range(cfg.temporal_layers))
-        self.norm = nn.LayerNorm(cfg.d_model)
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
-
-    def _encode_context(self, x: torch.Tensor) -> torch.Tensor:
-        length = int(x.size(1))
-        if length > self.max_context:
-            raise ValueError(f"Temporal context length {length} exceeds max_context={self.max_context}.")
-        y = self.in_proj(self.in_norm(x))
-        pos = self.pos_embed[:length].to(device=y.device, dtype=y.dtype).unsqueeze(0)
-        y = y + pos
-        attn_mask = torch.ones((length, length), device=y.device, dtype=torch.bool).triu(1)
-        for block in self.blocks:
-            y = block(y, attn_mask)
-        return self.norm(y)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        hidden: Optional[torch.Tensor] = None,
-        *,
-        update_cache: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        if update_cache:
-            context = x if hidden is None else torch.cat([hidden.to(device=x.device, dtype=x.dtype), x], dim=1)
-            if context.size(1) > self.max_context:
-                context = context[:, -self.max_context :].contiguous()
-            y = self._encode_context(context)
-            return y[:, -x.size(1) :].contiguous(), context.detach()
-        if hidden is not None:
-            hidden = hidden.to(device=x.device, dtype=x.dtype)
-            context = torch.cat([hidden, x], dim=1)
-            if context.size(1) > self.max_context:
-                context = context[:, -self.max_context :].contiguous()
-            y = self._encode_context(context)
-            return y[:, -x.size(1) :].contiguous(), context.detach()
-        return self._encode_context(x), None
-
-
-class ActionConditionedVideoPolicy(nn.Module):
-    def __init__(self, cfg: Optional[ModelConfig] = None):
-        super().__init__()
-        self.cfg = cfg if cfg is not None else ModelConfig()
-        self.frame_tokens = int(self.cfg.frame_spatial_pool) * int(self.cfg.frame_spatial_pool)
-        self.spatial_grid_tokens = int(self.cfg.spatial_temporal_grid) * int(self.cfg.spatial_temporal_grid)
-        self.frame_feature_dim = self.spatial_grid_tokens * int(self.cfg.d_model)
-
-        self.frame_encoder = FrameCNN(self.cfg)
-        self.spatial_pool = SpatialAttentionPool(self.cfg, num_source_tokens=self.frame_tokens)
-        self.dt_embed = nn.Sequential(
-            nn.Linear(3, self.cfg.d_model),
-            nn.GELU(),
-            nn.Linear(self.cfg.d_model, self.frame_feature_dim),
+        
+        # Crop parameters: e.g., if model_size is 256, top_crop=100 removes the sky
+        self.top_crop = int(self.cfg.model_size * 0.40) 
+        
+        # We only pass the current RGB frame to prevent motion/coord artifacts from distracting
+        self.cnn = PilotNetBackbone(in_channels=3, dropout=cfg.dropout)
+        
+        # Calculate flattened size dynamically based on crop and model size
+        dummy_h = self.cfg.model_size - self.top_crop
+        dummy_w = self.cfg.model_size
+        dummy_input = torch.zeros(1, 3, dummy_h, dummy_w)
+        with torch.no_grad():
+            flattened_size = self.cnn(dummy_input).flatten(1).size(1)
+            
+        self.fc_features = nn.Sequential(
+            nn.Linear(flattened_size, self.cfg.d_model),
+            nn.ELU(inplace=True),
+            nn.Dropout(cfg.dropout)
         )
-        self.fuse = nn.Sequential(
-            nn.LayerNorm(self.frame_feature_dim),
-            nn.Linear(self.frame_feature_dim, self.cfg.d_model),
-            nn.GELU(),
-            nn.Dropout(self.cfg.dropout),
-            nn.Linear(self.cfg.d_model, self.frame_feature_dim),
+        
+        # RNN for temporal consistency (smoother steering than raw transformers)
+        self.temporal_rnn = nn.GRU(
+            input_size=self.cfg.d_model, 
+            hidden_size=self.cfg.d_model, 
+            num_layers=1, 
+            batch_first=True
         )
-        self.temporal = CausalAttentionTemporal(self.cfg, input_dim=self.frame_feature_dim)
-        self.head = nn.Sequential(
-            nn.LayerNorm(self.cfg.d_model),
-            nn.Linear(self.cfg.d_model, self.cfg.d_model),
-            nn.GELU(),
-            nn.Dropout(self.cfg.dropout),
-        )
+        
+        # Final projection to button/steering logits
         self.button_head = nn.Linear(self.cfg.d_model, self.cfg.prediction_horizon * self.cfg.num_bin)
-
         nn.init.constant_(self.button_head.bias, -1.0)
-
-    @property
-    def num_buttons(self) -> int:
-        return int(self.cfg.num_bin)
-
-    def parameter_groups(self) -> Dict[str, List[nn.Parameter]]:
-        params = [p for p in self.parameters() if p.requires_grad]
-        return {"model": params, "backbone": params, "controller": params}
-
-    def init_state(
-        self,
-        batch_size: int,
-        device: Optional[torch.device] = None,
-        dtype: Optional[torch.dtype] = None,
-    ) -> TemporalState:
-        device = device if device is not None else next(self.parameters()).device
-        dtype = dtype if dtype is not None else next(self.parameters()).dtype
-        return TemporalState(
-            prev_frame=None,
-            hidden_state=None,
-            steps=0,
-        )
 
     def _normalize_frames(self, frames: torch.Tensor) -> torch.Tensor:
         if frames.dtype == torch.uint8:
             frames = frames.float() / 255.0
         return frames.clamp(0.0, 1.0)
 
-    def _dt_features(self, dt: torch.Tensor) -> torch.Tensor:
-        if dt.dim() == 3 and dt.size(-1) == 1:
-            dt = dt[..., 0]
-        dt = dt.clamp(min=1.0 / 240.0, max=0.5)
-        features = torch.stack([dt, torch.log(dt), 1.0 / dt], dim=-1)
-        return self.dt_embed(features.to(dtype=next(self.dt_embed.parameters()).dtype))
-
-    def _button_thresholds(self, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        thresholds = self.cfg.button_state_thresholds
-        if thresholds is None:
-            return torch.full((self.cfg.num_bin,), float(self.cfg.button_state_threshold), device=device, dtype=dtype)
-        return torch.tensor(list(thresholds), device=device, dtype=dtype)
-
-    def _coord_channels(
-        self,
-        *,
-        batch: int,
-        steps: int,
-        height: int,
-        width: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        y = torch.linspace(-1.0, 1.0, height, device=device, dtype=dtype).view(1, 1, 1, height, 1)
-        x = torch.linspace(-1.0, 1.0, width, device=device, dtype=dtype).view(1, 1, 1, 1, width)
-        x = x.expand(batch, steps, 1, height, width)
-        y = y.expand(batch, steps, 1, height, width)
-        coords = torch.cat([x, y], dim=2)
-        if float(self.cfg.coord_scale) != 1.0:
-            coords = coords * float(self.cfg.coord_scale)
-        if self.training and float(self.cfg.coord_dropout) > 0.0:
-            keep = torch.rand((batch, 1, 1, 1, 1), device=device) >= float(self.cfg.coord_dropout)
-            coords = coords * keep.to(dtype=dtype)
-        return coords
-
-    def _encode_frames(
-        self,
-        frames: torch.Tensor,
-        *,
-        previous_frame: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if frames.dim() == 4:
-            frames = frames.unsqueeze(1)
-        if frames.dim() != 5:
-            raise ValueError(f"Expected frames [B,T,3,H,W], got {tuple(frames.shape)}.")
+    def forward(self, frames: torch.Tensor, dt: torch.Tensor, state: Optional[TemporalState] = None, return_aux: bool = False):
+        # frames shape: [B, T, C, H, W]
         b, t, c, h, w = frames.shape
-        if c != 3:
-            raise ValueError(f"Expected RGB frames, got shape {tuple(frames.shape)}.")
-
+        
+        # 1. Normalize and Crop the sky
         frames = self._normalize_frames(frames)
-        if previous_frame is None:
-            prev = torch.cat([frames[:, :1], frames[:, :-1]], dim=1)
-            motion = frames - prev
-            motion[:, 0] = 0.0
+        frames = frames[:, :, :, self.top_crop:, :] # Removes top portion of the image
+        
+        # 2. Extract spatial features
+        x = frames.reshape(b * t, c, h - self.top_crop, w)
+        x = self.cnn(x)
+        x = x.flatten(1) # Flatten spatial dimensions entirely
+        x = self.fc_features(x)
+        x = x.view(b, t, self.cfg.d_model)
+        
+        # 3. Temporal aggregation
+        # We ignore dt here as standard driving models respond to visual layout, 
+        # but you can concatenate dt_features to 'x' before the RNN if framerate varies heavily.
+        if state is not None and state.hidden_state is not None:
+            temporal, hidden = self.temporal_rnn(x, state.hidden_state)
         else:
-            prev0 = previous_frame.to(device=frames.device, dtype=frames.dtype).unsqueeze(1)
-            prev = torch.cat([prev0, frames[:, :-1]], dim=1)
-            motion = frames - prev
-
-        coords = self._coord_channels(
-            batch=b,
-            steps=t,
-            height=h,
-            width=w,
-            device=frames.device,
-            dtype=frames.dtype,
-        )
-        x = torch.cat([frames, motion, coords], dim=2).reshape(b * t, 8, h, w)
-        if x.is_cuda:
-            x = x.contiguous(memory_format=torch.channels_last)
-
-        chunks: List[torch.Tensor] = []
-        for start in range(0, x.size(0), int(self.cfg.encode_chunk_size)):
-            chunks.append(self.frame_encoder(x[start : start + int(self.cfg.encode_chunk_size)]))
-        spatial_tokens = torch.cat(chunks, dim=0)
-        visual = self.spatial_pool(spatial_tokens).view(b, t, self.frame_feature_dim)
-        return visual, frames[:, -1].detach()
-
-    def _build_inputs(self, visual: torch.Tensor, dt: torch.Tensor) -> torch.Tensor:
-        if dt.dim() == 1:
-            dt = dt.unsqueeze(1).expand(visual.shape[0], visual.shape[1])
-        dt_emb = self._dt_features(dt).to(dtype=visual.dtype)
-        x = visual + dt_emb
-        return x + self.fuse(x).to(dtype=visual.dtype)
-
-    def _run_temporal(
-        self,
-        x: torch.Tensor,
-        hidden: Optional[torch.Tensor] = None,
-        *,
-        update_cache: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        return self.temporal(x, hidden, update_cache=update_cache)
-
-    def _pack_output(self, temporal: torch.Tensor) -> PolicyOutput:
-        b, t, d = temporal.shape
-        h = self.head(temporal)
-        button = self.button_head(h).view(b, t, self.cfg.prediction_horizon, self.cfg.num_bin)
-
+            temporal, hidden = self.temporal_rnn(x)
+            
+        # 4. Predict
+        button = self.button_head(temporal).view(b, t, self.cfg.prediction_horizon, self.cfg.num_bin)
+        
         step_button = button[:, :, 0]
-        return PolicyOutput(
+        output = PolicyOutput(
             button_logits=step_button,
             horizon_button_logits=button,
             future_button_logits={idx + 1: button[:, :, idx] for idx in range(self.cfg.prediction_horizon)},
         )
+        return output
 
-    def forward(
-        self,
-        frames: torch.Tensor,
-        dt: torch.Tensor,
-        state: Optional[TemporalState] = None,
-        return_aux: bool = False,
-    ) -> PolicyOutput:
-        del state, return_aux
-        visual, _ = self._encode_frames(frames)
-        temporal_in = self._build_inputs(visual, dt)
-        temporal, _ = self._run_temporal(temporal_in)
-        return self._pack_output(temporal)
-
-    def forward_step(
-        self,
-        frame: torch.Tensor,
-        dt: torch.Tensor,
-        state: TemporalState,
-        return_aux: bool = False,
-    ) -> Tuple[PolicyOutput, TemporalState]:
-        del return_aux
-        if frame.dim() != 4:
-            raise ValueError(f"forward_step expects frame shape [B,3,H,W], got {tuple(frame.shape)}.")
-        visual, last_frame = self._encode_frames(frame.unsqueeze(1), previous_frame=state.prev_frame)
-        step_input = self._build_inputs(visual, dt.reshape(frame.size(0), 1))
-
-        temporal, hidden = self._run_temporal(step_input, state.hidden_state, update_cache=True)
-        output = self._pack_output(temporal)
-
+    def forward_step(self, frame: torch.Tensor, dt: torch.Tensor, state: TemporalState, return_aux: bool = False):
+        # frame shape: [B, C, H, W] -> make it [B, 1, C, H, W]
+        output = self.forward(frame.unsqueeze(1), dt.unsqueeze(1), state)
+        
+        # Update hidden state for inference
+        step_features = self.cnn(self._normalize_frames(frame)[:, :, self.top_crop:, :]).flatten(1)
+        _, hidden = self.temporal_rnn(self.fc_features(step_features).unsqueeze(1), state.hidden_state)
+        
         new_state = TemporalState(
-            prev_frame=last_frame.detach(),
-            hidden_state=None if hidden is None else hidden.detach(),
-            steps=int(state.steps) + 1,
+            prev_frame=frame.detach(),
+            hidden_state=hidden.detach(),
+            steps=state.steps + 1,
         )
+        
         squeezed = PolicyOutput(
             button_logits=output.button_logits[:, 0],
             horizon_button_logits=output.horizon_button_logits[:, 0],
@@ -519,13 +260,10 @@ class ActionConditionedVideoPolicy(nn.Module):
         return squeezed, new_state
 
 
-RealTimeTemporalControlNet = ActionConditionedVideoPolicy
-
-
 if __name__ == "__main__":
     torch.manual_seed(0)
     cfg = ModelConfig(model_size=256, seq_len=100, prediction_horizon=1, max_context=100)
-    model = ActionConditionedVideoPolicy(cfg)
+    model = PilotNetBackbone(cfg)
     x = torch.rand(1, cfg.seq_len, 3, cfg.model_size, cfg.model_size)
     dt = torch.full((1, cfg.seq_len), cfg.prediction_dt)
     out = model(x, dt=dt)
