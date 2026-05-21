@@ -34,7 +34,7 @@ size = pdi.size()
 @dataclass
 class RuntimeConfig(ModelConfig):
     ckpt_dir: str = "./checkpoints_rt"
-    ckpt_path: Optional[str] = None
+    ckpt_path: Optional[str] = r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\checkpoints_rt\model_epoch_14.pt'
     pos_weight_power: float = 0.5
     pos_weight_clamp: float = 8.0
     button_threshold_from_pos_weight: bool = True
