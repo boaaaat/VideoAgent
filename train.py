@@ -114,7 +114,6 @@ class TrainConfig(ModelConfig):
             if self.button_state_thresholds is None or len(tuple(self.button_state_thresholds)) != self.num_bin:
                 self.button_state_thresholds = tuple(float(self.button_state_threshold) for _ in range(self.num_bin))
         self.skipped_key_names = skipped
-        self.max_context = max(int(self.max_context), int(self.seq_len))
         self.batch_size = max(1, int(self.batch_size))
         self.target_effective_batch = max(1, int(self.target_effective_batch))
         self.num_epochs = max(1, int(self.num_epochs))
@@ -943,18 +942,7 @@ def parse_args() -> TrainConfig:
     add("--prediction-horizon", type=int, default=None)
     add("--model-size", type=int, default=None)
     add("--d-model", type=int, default=None)
-    add("--frame-spatial-pool", type=int, default=None)
-    add("--frame-spatial-channels", type=int, default=None)
-    add("--spatial-attention-tokens", type=int, default=None)
-    add("--spatial-attention-heads", type=int, default=None)
-    add("--spatial-temporal-grid", type=int, default=None)
-    add("--temporal-layers", type=int, default=None)
-    add("--temporal-heads", type=int, default=None)
-    add("--temporal-mlp-ratio", type=float, default=None)
     add("--dropout", type=float, default=None)
-    add("--coord-scale", type=float, default=None)
-    add("--coord-dropout", type=float, default=None)
-    add("--encode-chunk-size", type=int, default=None)
     add("--train-seq-stride", type=int, default=None)
     add("--val-seq-stride", type=int, default=None)
     add("--target-effective-batch", type=int, default=None)
@@ -1030,18 +1018,7 @@ def parse_args() -> TrainConfig:
         "prediction_horizon",
         "model_size",
         "d_model",
-        "frame_spatial_pool",
-        "frame_spatial_channels",
-        "spatial_attention_tokens",
-        "spatial_attention_heads",
-        "spatial_temporal_grid",
-        "temporal_layers",
-        "temporal_heads",
-        "temporal_mlp_ratio",
         "dropout",
-        "coord_scale",
-        "coord_dropout",
-        "encode_chunk_size",
         "train_seq_stride",
         "val_seq_stride",
         "target_effective_batch",

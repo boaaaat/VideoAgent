@@ -22,17 +22,17 @@ from inverse_dynamics import (  # noqa: E402
     inverse_checkpoint_family_mismatch_reason,
 )
 from models import (  # noqa: E402
-    ActionConditionedVideoPolicy,
+    DrivingVideoPolicy,
     ModelConfig,
     get_key_names as MODEL_GET_KEY_NAMES,
     get_mouse_button_names as MODEL_GET_MOUSE_BUTTON_NAMES,
 )
 
 
-FeatureLayer = Literal["motion", "stage1", "stage2", "stage3", "stage4", "spatial", "tokens"]
+FeatureLayer = Literal["motion", "stage1", "stage2", "stage3", "stage4", "stage5", "spatial", "tokens"]
 ModelKind = Literal["auto", "policy", "inverse"]
 LoadedModelKind = Literal["policy", "inverse"]
-VisualModel = ActionConditionedVideoPolicy | InverseDynamicsModel
+VisualModel = DrivingVideoPolicy | InverseDynamicsModel
 VisualConfig = ModelConfig | InverseDynamicsConfig
 
 
@@ -126,18 +126,9 @@ def _coerce_config_types(cfg: ModelConfig) -> ModelConfig:
     cfg.train_seq_stride = int(cfg.train_seq_stride)
     cfg.val_seq_stride = int(cfg.val_seq_stride)
     cfg.model_size = int(cfg.model_size)
-    cfg.max_context = int(cfg.max_context)
     cfg.prediction_dt = float(cfg.prediction_dt)
     cfg.prediction_horizon = int(getattr(cfg, "prediction_horizon", 1))
     cfg.d_model = int(cfg.d_model)
-    cfg.frame_spatial_pool = int(cfg.frame_spatial_pool)
-    cfg.frame_spatial_channels = int(cfg.frame_spatial_channels)
-    cfg.spatial_attention_tokens = int(cfg.spatial_attention_tokens)
-    cfg.spatial_attention_heads = int(cfg.spatial_attention_heads)
-    cfg.spatial_temporal_grid = int(cfg.spatial_temporal_grid)
-    cfg.temporal_layers = int(cfg.temporal_layers)
-    cfg.temporal_heads = int(cfg.temporal_heads)
-    cfg.encode_chunk_size = int(cfg.encode_chunk_size)
     cfg.num_bin = len(cfg.key_names) + len(cfg.mouse_button_names)
     return cfg
 
@@ -171,14 +162,7 @@ def _detect_checkpoint_kind(state) -> LoadedModelKind:
     policy_keys = {field.name for field in fields(ModelConfig)}
 
     inverse_markers = {"output_seq_len", "visual_encoder_name", "cnn_channels", "gru_hidden_size", "gru_layers"}
-    policy_markers = {
-        "prediction_horizon",
-        "frame_spatial_pool",
-        "frame_spatial_channels",
-        "spatial_attention_tokens",
-        "spatial_temporal_grid",
-        "max_context",
-    }
+    policy_markers = {"prediction_horizon", "model_size", "d_model"}
     if any(key in config_dict for key in inverse_markers):
         return "inverse"
     if any(key in config_dict for key in policy_markers):
@@ -219,7 +203,7 @@ def _find_latest_checkpoint(ckpt_dir: str) -> Optional[str]:
 
 
 def initialize_model_lazy_layers(
-    model: ActionConditionedVideoPolicy,
+    model: DrivingVideoPolicy,
     cfg: ModelConfig,
     device: torch.device,
 ) -> None:
@@ -235,7 +219,7 @@ def initialize_model_lazy_layers(
 def load_model_from_checkpoint(
     ckpt_path: str,
     device: torch.device,
-) -> Tuple[ActionConditionedVideoPolicy, ModelConfig]:
+) -> Tuple[DrivingVideoPolicy, ModelConfig]:
     state = _load_checkpoint_state(ckpt_path, device)
     cfg = ModelConfig()
     config_dict = _extract_checkpoint_config(state)
@@ -244,7 +228,7 @@ def load_model_from_checkpoint(
     else:
         cfg = _coerce_config_types(cfg)
 
-    model = ActionConditionedVideoPolicy(cfg=cfg).to(device)
+    model = DrivingVideoPolicy(cfg=cfg).to(device)
     initialize_model_lazy_layers(model, cfg, device)
     model_state = _extract_model_state(state)
     missing, unexpected = model.load_state_dict(model_state, strict=False)
@@ -321,28 +305,30 @@ def _activation_stages(net: torch.nn.Sequential, x: torch.Tensor) -> List[torch.
     return stages
 
 
+def _pilotnet_stages(net: torch.nn.Sequential, x: torch.Tensor) -> List[torch.Tensor]:
+    stages: List[torch.Tensor] = []
+    y = x
+    saw_conv = False
+    for module in net:
+        if isinstance(module, torch.nn.Conv2d) and saw_conv:
+            stages.append(y)
+        if isinstance(module, torch.nn.Conv2d):
+            saw_conv = True
+        y = module(y)
+    stages.append(y)
+    return stages
+
+
 def _policy_encoder_input(
-    model: ActionConditionedVideoPolicy,
+    model: DrivingVideoPolicy,
     frame_rgb: torch.Tensor,
     previous_frame_rgb: Optional[torch.Tensor],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    del previous_frame_rgb
     if frame_rgb.dim() != 4 or frame_rgb.size(1) != 3:
         raise ValueError(f"Expected current frame [B,3,H,W], got {tuple(frame_rgb.shape)}.")
-    b, _, h, w = frame_rgb.shape
     frame_rgb = model._normalize_frames(frame_rgb)
-    if previous_frame_rgb is None:
-        motion = torch.zeros_like(frame_rgb)
-    else:
-        motion = frame_rgb - previous_frame_rgb.to(device=frame_rgb.device, dtype=frame_rgb.dtype)
-    coords = model._coord_channels(
-        batch=b,
-        steps=1,
-        height=h,
-        width=w,
-        device=frame_rgb.device,
-        dtype=frame_rgb.dtype,
-    )[:, 0]
-    x = torch.cat([frame_rgb, motion, coords], dim=1)
+    x = model._apply_masks(frame_rgb)
     if x.is_cuda:
         x = x.contiguous(memory_format=torch.channels_last)
     return x, frame_rgb.detach()
@@ -374,24 +360,20 @@ def _compute_feature_map(
     previous_frame_rgb: Optional[torch.Tensor],
     layer: FeatureLayer,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    if isinstance(model, ActionConditionedVideoPolicy):
+    if isinstance(model, DrivingVideoPolicy):
         x, current = _policy_encoder_input(model, frame_rgb, previous_frame_rgb)
         if layer == "motion":
-            return x[:, 3:6].abs(), current
-        stages = _activation_stages(model.frame_encoder.net, x)
+            return x.abs(), current
+        stages = _pilotnet_stages(model.cnn.conv_layers, x)
         if layer.startswith("stage"):
             stage_idx = int(layer.removeprefix("stage")) - 1
             if stage_idx < 0 or stage_idx >= len(stages):
                 raise ValueError(f"Policy CNN has {len(stages)} stages; cannot show {layer!r}.")
             return stages[stage_idx], current
-        spatial = model.frame_encoder.spatial_proj(stages[-1])
-        if layer == "spatial":
-            return spatial, current
         if layer == "tokens":
-            return torch.nn.functional.adaptive_avg_pool2d(
-                spatial,
-                output_size=(model.frame_encoder.pool_size, model.frame_encoder.pool_size),
-            ), current
+            return stages[-1], current
+        if layer == "spatial":
+            return stages[-1], current
         raise ValueError(f"Unknown policy CNN layer {layer!r}.")
 
     x, current = _inverse_encoder_input(frame_rgb, previous_frame_rgb)
@@ -569,7 +551,7 @@ def process_video_cnn(
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Visualize feature-energy heatmaps from the current CNN encoders.")
-    parser.add_argument("--input", default=r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\data\greenville\run_20260519_214809.mp4', help="Input video path. Defaults to the newest run in cfg.data_root.")
+    parser.add_argument("--input", default=r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\data\greenville\run_20260520_121714.mp4', help="Input video path. Defaults to the newest run in cfg.data_root.")
     parser.add_argument("--output", default=None, help="Output video path (.mp4). Default auto-names next to input.")
     parser.add_argument(
         "--model-kind",
@@ -589,10 +571,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--layer",
-        choices=["motion", "stage1", "stage2", "stage3", "stage4", "spatial", "tokens"],
+        choices=["motion", "stage1", "stage2", "stage3", "stage4", "stage5", "spatial", "tokens"],
         default="tokens",
         help=(
-            "CNN signal to visualize. Policy checkpoints support all choices; inverse checkpoints support "
+            "CNN signal to visualize. Policy checkpoints use masked RGB for motion, stage1-stage5 for "
+            "PilotNet layers, and final conv features for spatial/tokens. Inverse checkpoints support "
             "motion and stage1-stage4."
         ),
     )

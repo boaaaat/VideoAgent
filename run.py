@@ -196,21 +196,9 @@ def _coerce_config_types(cfg: RuntimeConfig) -> RuntimeConfig:
     cfg.train_seq_stride = int(cfg.train_seq_stride)
     cfg.val_seq_stride = int(cfg.val_seq_stride)
     cfg.model_size = int(cfg.model_size)
-    cfg.max_context = int(cfg.max_context)
     cfg.prediction_horizon = int(cfg.prediction_horizon)
     cfg.command_horizon = max(1, min(int(cfg.command_horizon), int(cfg.prediction_horizon)))
     cfg.d_model = int(cfg.d_model)
-    cfg.frame_spatial_pool = max(1, int(getattr(cfg, "frame_spatial_pool", 4)))
-    cfg.frame_spatial_channels = int(getattr(cfg, "frame_spatial_channels", 0))
-    if cfg.frame_spatial_channels <= 0:
-        cfg.frame_spatial_channels = max(16, cfg.d_model // 4)
-    cfg.frame_spatial_channels = max(8, min(int(cfg.frame_spatial_channels), int(cfg.d_model)))
-    cfg.temporal_layers = int(cfg.temporal_layers)
-    cfg.temporal_heads = max(1, int(getattr(cfg, "temporal_heads", 4)))
-    while cfg.d_model % cfg.temporal_heads != 0 and cfg.temporal_heads > 1:
-        cfg.temporal_heads -= 1
-    cfg.temporal_mlp_ratio = float(getattr(cfg, "temporal_mlp_ratio", 2.0))
-    cfg.encode_chunk_size = int(cfg.encode_chunk_size)
     cfg.prediction_dt = float(cfg.prediction_dt)
     cfg.mouse_buttons_enabled = bool(cfg.mouse_buttons_enabled)
     cfg.num_bin = len(cfg.key_names) + len(cfg.mouse_button_names)
@@ -428,12 +416,11 @@ def main() -> None:
     print(
         "Model:",
         f"size={cfg.model_size}",
-        f"context={cfg.max_context}",
         f"horizon={cfg.prediction_horizon}",
         f"command_horizon={cfg.command_horizon}",
         f"d_model={cfg.d_model}",
         "temporal=gru",
-        f"crop_top={int(cfg.model_size * 0.40)}",
+        "input=masked_full_frame",
     )
     print(
         "Button thresholds:",
