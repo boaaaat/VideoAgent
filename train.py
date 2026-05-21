@@ -67,13 +67,15 @@ class TrainConfig(ModelConfig):
     aug_contrast: float = 0.10
     aug_noise_std: float = 0.006
     aug_gray_prob: float = 0.02
+    aug_translate_frac: float = 0.0
+    aug_scale_frac: float = 0.0
     aug_edges_crop_prob: float = 0.15
-    aug_edges_crop_min_frac: float = 0.02
+    aug_edges_crop_min_frac: float = 0.05
     aug_edges_crop_max_frac: float = 0.15
     aug_cutout_prob: float = 0.10
     aug_cutout_min_frac: float = 0.04
     aug_cutout_max_frac: float = 0.12
-    aug_cutout_count: int = 1
+    aug_cutout_count: int = 2
 
     early_stop_patience: int = 5
 
