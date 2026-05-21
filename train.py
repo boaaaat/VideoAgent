@@ -50,9 +50,9 @@ class TrainConfig(ModelConfig):
     compile_model: bool = True
     compile_mode: str = "default"
 
-    train_split: float = 0.8
+    train_split: float = 0.9
     split_seed: int = 1337
-    pos_weight_power: float = 0.5
+    pos_weight_power: float = 0.6
     pos_weight_clamp: float = 8.0
     button_threshold_from_pos_weight: bool = True
     button_threshold_min: float = 0.5
@@ -66,9 +66,14 @@ class TrainConfig(ModelConfig):
     aug_brightness: float = 0.08
     aug_contrast: float = 0.10
     aug_noise_std: float = 0.006
-    aug_gray_prob: float = 0.03
-    aug_translate_frac: float = 0.0
-    aug_scale_frac: float = 0.0
+    aug_gray_prob: float = 0.02
+    aug_edges_crop_prob: float = 0.15
+    aug_edges_crop_min_frac: float = 0.02
+    aug_edges_crop_max_frac: float = 0.15
+    aug_cutout_prob: float = 0.10
+    aug_cutout_min_frac: float = 0.04
+    aug_cutout_max_frac: float = 0.12
+    aug_cutout_count: int = 1
 
     early_stop_patience: int = 5
 
@@ -134,6 +139,13 @@ class TrainConfig(ModelConfig):
         self.aug_gray_prob = float(min(max(self.aug_gray_prob, 0.0), 1.0))
         self.aug_translate_frac = float(min(max(self.aug_translate_frac, 0.0), 0.25))
         self.aug_scale_frac = float(min(max(self.aug_scale_frac, 0.0), 0.50))
+        self.aug_edges_crop_prob = float(min(max(self.aug_edges_crop_prob, 0.0), 1.0))
+        self.aug_edges_crop_min_frac = float(min(max(self.aug_edges_crop_min_frac, 0.0), 0.45))
+        self.aug_edges_crop_max_frac = float(min(max(self.aug_edges_crop_max_frac, self.aug_edges_crop_min_frac), 0.45))
+        self.aug_cutout_prob = float(min(max(self.aug_cutout_prob, 0.0), 1.0))
+        self.aug_cutout_min_frac = float(min(max(self.aug_cutout_min_frac, 0.0), 0.75))
+        self.aug_cutout_max_frac = float(min(max(self.aug_cutout_max_frac, self.aug_cutout_min_frac), 0.75))
+        self.aug_cutout_count = max(1, min(int(self.aug_cutout_count), 16))
         self.early_stop_patience = max(0, int(self.early_stop_patience))
         self.dali_resize_mode = str(self.dali_resize_mode).strip().lower()
         if self.dali_resize_mode not in {"video_resize", "video_then_resize", "none"}:
@@ -965,6 +977,13 @@ def parse_args() -> TrainConfig:
     add("--aug-gray-prob", type=float, default=None)
     add("--aug-translate-frac", type=float, default=None)
     add("--aug-scale-frac", type=float, default=None)
+    add("--aug-edges-crop-prob", type=float, default=None)
+    add("--aug-edges-crop-min-frac", type=float, default=None)
+    add("--aug-edges-crop-max-frac", type=float, default=None)
+    add("--aug-cutout-prob", type=float, default=None)
+    add("--aug-cutout-min-frac", type=float, default=None)
+    add("--aug-cutout-max-frac", type=float, default=None)
+    add("--aug-cutout-count", type=int, default=None)
     add("--early-stop-patience", type=int, default=None)
     add("--max-train-batches", type=int, default=None)
     add("--max-val-batches", type=int, default=None)
@@ -1042,6 +1061,13 @@ def parse_args() -> TrainConfig:
         "aug_gray_prob",
         "aug_translate_frac",
         "aug_scale_frac",
+        "aug_edges_crop_prob",
+        "aug_edges_crop_min_frac",
+        "aug_edges_crop_max_frac",
+        "aug_cutout_prob",
+        "aug_cutout_min_frac",
+        "aug_cutout_max_frac",
+        "aug_cutout_count",
         "early_stop_patience",
         "max_train_batches",
         "max_val_batches",

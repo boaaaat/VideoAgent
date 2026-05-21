@@ -6,7 +6,7 @@ import subprocess
 import sys
 from dataclasses import fields
 from pathlib import Path
-from typing import Dict, Literal, Optional, Tuple
+from typing import Dict, List, Literal, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -26,11 +26,10 @@ from models import (  # noqa: E402
     ModelConfig,
     get_key_names as MODEL_GET_KEY_NAMES,
     get_mouse_button_names as MODEL_GET_MOUSE_BUTTON_NAMES,
-    policy_checkpoint_family_mismatch_reason,
 )
 
 
-FeatureLayer = Literal["x32", "x16", "x8", "fused"]
+FeatureLayer = Literal["motion", "stage1", "stage2", "stage3", "stage4", "spatial", "tokens"]
 ModelKind = Literal["auto", "policy", "inverse"]
 LoadedModelKind = Literal["policy", "inverse"]
 VisualModel = ActionConditionedVideoPolicy | InverseDynamicsModel
@@ -128,11 +127,18 @@ def _coerce_config_types(cfg: ModelConfig) -> ModelConfig:
     cfg.val_seq_stride = int(cfg.val_seq_stride)
     cfg.model_size = int(cfg.model_size)
     cfg.max_context = int(cfg.max_context)
-    cfg.local_context_frames = int(cfg.local_context_frames)
     cfg.prediction_dt = float(cfg.prediction_dt)
-    cfg.require_pretrained_backbone = bool(cfg.require_pretrained_backbone)
+    cfg.prediction_horizon = int(getattr(cfg, "prediction_horizon", 1))
+    cfg.d_model = int(cfg.d_model)
+    cfg.frame_spatial_pool = int(cfg.frame_spatial_pool)
+    cfg.frame_spatial_channels = int(cfg.frame_spatial_channels)
+    cfg.spatial_attention_tokens = int(cfg.spatial_attention_tokens)
+    cfg.spatial_attention_heads = int(cfg.spatial_attention_heads)
+    cfg.spatial_temporal_grid = int(cfg.spatial_temporal_grid)
+    cfg.temporal_layers = int(cfg.temporal_layers)
+    cfg.temporal_heads = int(cfg.temporal_heads)
+    cfg.encode_chunk_size = int(cfg.encode_chunk_size)
     cfg.num_bin = len(cfg.key_names) + len(cfg.mouse_button_names)
-    cfg.prev_action_dim = cfg.num_bin + 2
     return cfg
 
 
@@ -165,7 +171,14 @@ def _detect_checkpoint_kind(state) -> LoadedModelKind:
     policy_keys = {field.name for field in fields(ModelConfig)}
 
     inverse_markers = {"output_seq_len", "visual_encoder_name", "cnn_channels", "gru_hidden_size", "gru_layers"}
-    policy_markers = {"policy_model_family", "prev_action_dim", "future_horizons", "max_context", "token_count"}
+    policy_markers = {
+        "prediction_horizon",
+        "frame_spatial_pool",
+        "frame_spatial_channels",
+        "spatial_attention_tokens",
+        "spatial_temporal_grid",
+        "max_context",
+    }
     if any(key in config_dict for key in inverse_markers):
         return "inverse"
     if any(key in config_dict for key in policy_markers):
@@ -214,9 +227,8 @@ def initialize_model_lazy_layers(
     model.eval()
     with torch.no_grad():
         dummy_frames = torch.zeros(1, 1, 3, cfg.model_size, cfg.model_size, device=device)
-        dummy_prev = torch.zeros(1, 1, cfg.prev_action_dim, device=device)
         dummy_dt = torch.full((1, 1), float(cfg.prediction_dt), device=device)
-        _ = model(dummy_frames, prev_actions=dummy_prev, dt=dummy_dt)
+        _ = model(dummy_frames, dt=dummy_dt)
     model.train(was_training)
 
 
@@ -227,9 +239,6 @@ def load_model_from_checkpoint(
     state = _load_checkpoint_state(ckpt_path, device)
     cfg = ModelConfig()
     config_dict = _extract_checkpoint_config(state)
-    family_reason = policy_checkpoint_family_mismatch_reason(config_dict)
-    if family_reason is not None:
-        raise RuntimeError(f"Cannot load policy checkpoint {ckpt_path}: {family_reason}")
     if config_dict:
         cfg = _apply_config_overrides(cfg, config_dict)
     else:
@@ -296,22 +305,107 @@ def load_visual_model_from_checkpoint(
     return model, cfg, model_kind
 
 
+def _activation_stages(net: torch.nn.Sequential, x: torch.Tensor) -> List[torch.Tensor]:
+    stages: List[torch.Tensor] = []
+    y = x
+    saw_stage = False
+    for module in net:
+        conv = getattr(module, "conv", None)
+        starts_new_stage = isinstance(conv, torch.nn.Conv2d) and tuple(conv.stride) == (2, 2)
+        if starts_new_stage and saw_stage:
+            stages.append(y)
+        if starts_new_stage:
+            saw_stage = True
+        y = module(y)
+    stages.append(y)
+    return stages
+
+
+def _policy_encoder_input(
+    model: ActionConditionedVideoPolicy,
+    frame_rgb: torch.Tensor,
+    previous_frame_rgb: Optional[torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if frame_rgb.dim() != 4 or frame_rgb.size(1) != 3:
+        raise ValueError(f"Expected current frame [B,3,H,W], got {tuple(frame_rgb.shape)}.")
+    b, _, h, w = frame_rgb.shape
+    frame_rgb = model._normalize_frames(frame_rgb)
+    if previous_frame_rgb is None:
+        motion = torch.zeros_like(frame_rgb)
+    else:
+        motion = frame_rgb - previous_frame_rgb.to(device=frame_rgb.device, dtype=frame_rgb.dtype)
+    coords = model._coord_channels(
+        batch=b,
+        steps=1,
+        height=h,
+        width=w,
+        device=frame_rgb.device,
+        dtype=frame_rgb.dtype,
+    )[:, 0]
+    x = torch.cat([frame_rgb, motion, coords], dim=1)
+    if x.is_cuda:
+        x = x.contiguous(memory_format=torch.channels_last)
+    return x, frame_rgb.detach()
+
+
+def _inverse_encoder_input(
+    frame_rgb: torch.Tensor,
+    previous_frame_rgb: Optional[torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if frame_rgb.dim() != 4 or frame_rgb.size(1) != 3:
+        raise ValueError(f"Expected current frame [B,3,H,W], got {tuple(frame_rgb.shape)}.")
+    frame_rgb = frame_rgb.clamp(0.0, 1.0)
+    frame_scaled = (frame_rgb * 2.0) - 1.0
+    if previous_frame_rgb is None:
+        motion = torch.zeros_like(frame_scaled)
+    else:
+        prev_frame_rgb = previous_frame_rgb.to(device=frame_rgb.device, dtype=frame_rgb.dtype).clamp(0.0, 1.0)
+        prev_scaled = (prev_frame_rgb * 2.0) - 1.0
+        motion = frame_scaled - prev_scaled
+    x = torch.cat([frame_scaled, motion], dim=1)
+    if x.is_cuda:
+        x = x.contiguous(memory_format=torch.channels_last)
+    return x, frame_rgb.detach()
+
+
 def _compute_feature_map(
     model: VisualModel,
-    x: torch.Tensor,
+    frame_rgb: torch.Tensor,
+    previous_frame_rgb: Optional[torch.Tensor],
     layer: FeatureLayer,
-) -> torch.Tensor:
-    x = model._normalize_frames(x)
-    x32, x16, x8 = model.backbone(x)
-    if layer == "x32":
-        return x32
-    if layer == "x16":
-        return x16
-    if layer == "x8":
-        return x8
-    if layer == "fused":
-        return model.fpn(x32, x16, x8)
-    raise ValueError(f"Unknown layer {layer!r}")
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if isinstance(model, ActionConditionedVideoPolicy):
+        x, current = _policy_encoder_input(model, frame_rgb, previous_frame_rgb)
+        if layer == "motion":
+            return x[:, 3:6].abs(), current
+        stages = _activation_stages(model.frame_encoder.net, x)
+        if layer.startswith("stage"):
+            stage_idx = int(layer.removeprefix("stage")) - 1
+            if stage_idx < 0 or stage_idx >= len(stages):
+                raise ValueError(f"Policy CNN has {len(stages)} stages; cannot show {layer!r}.")
+            return stages[stage_idx], current
+        spatial = model.frame_encoder.spatial_proj(stages[-1])
+        if layer == "spatial":
+            return spatial, current
+        if layer == "tokens":
+            return torch.nn.functional.adaptive_avg_pool2d(
+                spatial,
+                output_size=(model.frame_encoder.pool_size, model.frame_encoder.pool_size),
+            ), current
+        raise ValueError(f"Unknown policy CNN layer {layer!r}.")
+
+    x, current = _inverse_encoder_input(frame_rgb, previous_frame_rgb)
+    if layer == "motion":
+        return x[:, 3:6].abs(), current
+    if layer in ("spatial", "tokens"):
+        raise ValueError(f"Inverse dynamics CNN does not have a {layer!r} layer; use motion or stage1-stage4.")
+    stages = _activation_stages(model.frame_encoder.net, x)
+    if layer.startswith("stage"):
+        stage_idx = int(layer.removeprefix("stage")) - 1
+        if stage_idx < 0 or stage_idx >= len(stages):
+            raise ValueError(f"Inverse dynamics CNN has {len(stages)} stages; cannot show {layer!r}.")
+        return stages[stage_idx], current
+    raise ValueError(f"Unknown inverse CNN layer {layer!r}.")
 
 
 def _feature_heatmap_for_frame(
@@ -319,7 +413,8 @@ def _feature_heatmap_for_frame(
     model: VisualModel,
     device: torch.device,
     *,
-    layer: FeatureLayer = "fused",
+    previous_frame_rgb: Optional[torch.Tensor] = None,
+    layer: FeatureLayer = "tokens",
     resize_to: Optional[int] = None,
     robust_norm: bool = True,
     q_low: float = 0.05,
@@ -327,7 +422,7 @@ def _feature_heatmap_for_frame(
     gamma: float = 0.75,
     amp_dtype: torch.dtype = torch.bfloat16,
     use_autocast: bool = True,
-) -> np.ndarray:
+) -> Tuple[np.ndarray, torch.Tensor]:
     orig_h, orig_w = frame_bgr.shape[:2]
     proc = frame_bgr
     if resize_to is not None and (orig_h != resize_to or orig_w != resize_to):
@@ -340,7 +435,7 @@ def _feature_heatmap_for_frame(
 
     with torch.inference_mode():
         with torch.amp.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_autocast and x.is_cuda):
-            feat = _compute_feature_map(model, x, layer=layer)
+            feat, current_frame_rgb = _compute_feature_map(model, x, previous_frame_rgb, layer=layer)
 
     heat = torch.linalg.vector_norm(feat.float(), ord=2, dim=1)[0]
     if robust_norm:
@@ -357,7 +452,7 @@ def _feature_heatmap_for_frame(
 
     heat_np = (heat.detach().cpu().numpy() * 255.0).astype(np.uint8)
     heat_up = cv2.resize(heat_np, (orig_w, orig_h), interpolation=cv2.INTER_CUBIC)
-    return cv2.applyColorMap(heat_up, cv2.COLORMAP_JET)
+    return cv2.applyColorMap(heat_up, cv2.COLORMAP_JET), current_frame_rgb.detach()
 
 
 def _default_output_path(input_path: str, layer: str, mode: str, model_kind: LoadedModelKind) -> str:
@@ -372,7 +467,7 @@ def process_video_cnn(
     device: torch.device,
     *,
     model_kind: LoadedModelKind,
-    layer: FeatureLayer = "fused",
+    layer: FeatureLayer = "tokens",
     mode: Literal["heat", "overlay", "side_by_side", "triple"] = "side_by_side",
     alpha: float = 0.5,
     resize_to: Optional[int] = None,
@@ -386,6 +481,7 @@ def process_video_cnn(
     ffmpeg_codec: str = "hevc_nvenc",
     ffmpeg_preset: str = "p4",
     ffmpeg_crf: int = 20,
+    max_frames: Optional[int] = None,
 ) -> None:
     if not os.path.exists(input_path):
         raise FileNotFoundError(f"Input video not found: {input_path}")
@@ -420,18 +516,22 @@ def process_video_cnn(
     )
 
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if max_frames is not None:
+        total_frames = min(max(0, total_frames), max(0, int(max_frames)))
     pbar = tqdm(total=max(0, total_frames), desc=f"CNN vis [{model_kind}] ({layer}, {mode})")
     frame_idx = 0
+    previous_frame_rgb: Optional[torch.Tensor] = None
     try:
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
 
-            heat_color = _feature_heatmap_for_frame(
+            heat_color, previous_frame_rgb = _feature_heatmap_for_frame(
                 frame,
                 model,
                 device,
+                previous_frame_rgb=previous_frame_rgb,
                 layer=layer,
                 resize_to=resize_to,
                 robust_norm=robust_norm,
@@ -457,6 +557,8 @@ def process_video_cnn(
             writer.write(out_frame)
             frame_idx += 1
             pbar.update(1)
+            if max_frames is not None and frame_idx >= int(max_frames):
+                break
     finally:
         pbar.close()
         writer.release()
@@ -466,26 +568,34 @@ def process_video_cnn(
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Visualize CNN/FPN feature maps from policy or inverse checkpoints.")
-    parser.add_argument("--input", default=None, help="Input video path. Defaults to the newest run in cfg.data_root.")
+    parser = argparse.ArgumentParser(description="Visualize feature-energy heatmaps from the current CNN encoders.")
+    parser.add_argument("--input", default=r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\data\greenville\run_20260519_214809.mp4', help="Input video path. Defaults to the newest run in cfg.data_root.")
     parser.add_argument("--output", default=None, help="Output video path (.mp4). Default auto-names next to input.")
     parser.add_argument(
         "--model-kind",
         choices=["auto", "policy", "inverse"],
-        default="inverse",
+        default="auto",
         help="Checkpoint type. Default auto-detects from the checkpoint config/state dict.",
     )
     parser.add_argument(
         "--ckpt-path",
-        default=r"C:\Users\Abhil\Desktop\vs_code_stuff\python\ai\checkpoints_idm\model_epoch_27.pt",
+        default=None,
         help="Checkpoint path. If omitted, auto-select from --ckpt-dir.",
     )
     parser.add_argument(
         "--ckpt-dir",
-        default="C:/Users/Abhil/Desktop/vs_code_stuff/python/ai/checkpoints_rt",
+        default="./checkpoints_rt",
         help="Checkpoint directory used when --ckpt-path is omitted.",
     )
-    parser.add_argument("--layer", choices=["x32", "x16", "x8", "fused"], default="fused")
+    parser.add_argument(
+        "--layer",
+        choices=["motion", "stage1", "stage2", "stage3", "stage4", "spatial", "tokens"],
+        default="spatial",
+        help=(
+            "CNN signal to visualize. Policy checkpoints support all choices; inverse checkpoints support "
+            "motion and stage1-stage4."
+        ),
+    )
     parser.add_argument("--mode", choices=["heat", "overlay", "side_by_side", "triple"], default="side_by_side")
     parser.add_argument("--alpha", type=float, default=0.5, help="Overlay blend factor.")
     parser.add_argument(
@@ -501,6 +611,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fp16", action="store_true", help="Use fp16 autocast on CUDA instead of bf16.")
     parser.add_argument("--no-amp", action="store_true", help="Disable autocast during encoder inference.")
     parser.add_argument("--cpu", action="store_true", help="Force CPU execution.")
+    parser.add_argument("--max-frames", type=int, default=None, help="Stop after this many frames.")
     parser.add_argument("--ffmpeg-path", default=None, help="Path to ffmpeg binary. Default uses PATH lookup.")
     parser.add_argument("--ffmpeg-codec", default="hevc_nvenc")
     parser.add_argument("--ffmpeg-preset", default="p4")
@@ -559,6 +670,7 @@ def main() -> None:
         ffmpeg_codec=str(args.ffmpeg_codec),
         ffmpeg_preset=str(args.ffmpeg_preset),
         ffmpeg_crf=int(args.ffmpeg_crf),
+        max_frames=None if args.max_frames is None else int(args.max_frames),
     )
 
 
