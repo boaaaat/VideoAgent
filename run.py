@@ -2,9 +2,11 @@ import csv
 import os
 import sys
 import time
+import ctypes  # Added for high-res clock period adjustments
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Deque, Dict, List, Optional, Tuple
 
 import cv2
 import dxcam
@@ -20,15 +22,27 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from models import (  # noqa: E402
     DrivingVideoPolicy,
     ModelConfig,
-    TemporalState,
 )
-
 
 pdi.FAILSAFE = True
 autopilot = False
 cam = dxcam.create(output_color="BGR")
 button_states: Dict[str, bool] = {}
 size = pdi.size()
+
+# --- FIX 1: Native High-Resolution Windows Timer Support ---
+def enable_high_resolution_timer():
+    try:
+        ctypes.windll.winmm.timeBeginPeriod(1)
+        print("Sharp 1ms Windows timer system resolution enabled.")
+    except Exception as exc:
+        print(f"Warning: failed to enable high-resolution scheduler: {exc}")
+
+def disable_high_resolution_timer():
+    try:
+        ctypes.windll.winmm.timeEndPeriod(1)
+    except Exception:
+        pass
 
 
 @dataclass
@@ -37,9 +51,9 @@ class RuntimeConfig(ModelConfig):
     ckpt_path: Optional[str] = None
     pos_weight_power: float = 0.5
     pos_weight_clamp: float = 8.0
-    button_threshold_from_pos_weight: bool = True
-    button_threshold_min: float = 0.5
-    button_threshold_max: float = 0.90
+    button_threshold_from_pos_weight: bool = False
+    button_threshold_min: float = 0.35  # Lowered to help sensitivity sliders
+    button_threshold_max: float = 0.50
     use_checkpoint_button_thresholds: bool = False
 
     decision_interval: float = 1.0 / 20.0
@@ -48,6 +62,7 @@ class RuntimeConfig(ModelConfig):
     print_prob_decimals: int = 3
 
     mouse_buttons_enabled: bool = False
+    gru_memory_frames: int = 80
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -60,6 +75,7 @@ class RuntimeConfig(ModelConfig):
         self.button_threshold_min = float(np.clip(float(self.button_threshold_min), 0.0, 1.0))
         self.button_threshold_max = float(np.clip(float(self.button_threshold_max), self.button_threshold_min, 1.0))
         self.mouse_buttons_enabled = bool(self.mouse_buttons_enabled)
+        self.gru_memory_frames = max(1, int(self.gru_memory_frames))
 
 
 RUNTIME_CFG = RuntimeConfig()
@@ -70,8 +86,20 @@ MOUSE_NAME_MAP = {
 }
 
 
-def new_temporal_state() -> TemporalState:
-    return TemporalState()
+class RollingGRUMemoryBuffer:
+    def __init__(self, max_frames: int) -> None:
+        self.features: Deque[torch.Tensor] = deque(maxlen=max(1, int(max_frames)))
+
+    def clear(self) -> None:
+        self.features.clear()
+
+    def append(self, feature: torch.Tensor) -> None:
+        self.features.append(feature.detach())
+
+    def as_batch(self) -> torch.Tensor:
+        if not self.features:
+            raise RuntimeError("Cannot build a GRU batch from an empty memory buffer.")
+        return torch.stack(tuple(self.features), dim=0).unsqueeze(0)
 
 
 def release_all() -> None:
@@ -201,15 +229,18 @@ def _coerce_config_types(cfg: RuntimeConfig) -> RuntimeConfig:
     cfg.d_model = int(cfg.d_model)
     cfg.prediction_dt = float(cfg.prediction_dt)
     cfg.mouse_buttons_enabled = bool(cfg.mouse_buttons_enabled)
+    cfg.gru_memory_frames = max(1, int(getattr(cfg, "gru_memory_frames", 80)))
     cfg.num_bin = len(cfg.key_names) + len(cfg.mouse_button_names)
     cfg.button_state_threshold = float(np.clip(float(cfg.button_state_threshold), 0.0, 1.0))
     cfg.use_checkpoint_button_thresholds = bool(getattr(cfg, "use_checkpoint_button_thresholds", False))
+    
     if cfg.button_state_thresholds is None:
         cfg.button_state_thresholds = tuple(float(cfg.button_state_threshold) for _ in range(cfg.num_bin))
     else:
         thresholds = tuple(float(np.clip(float(x), 0.0, 1.0)) for x in cfg.button_state_thresholds)
         if len(thresholds) != cfg.num_bin:
             thresholds = tuple(float(cfg.button_state_threshold) for _ in range(cfg.num_bin))
+        # FIX 2: Removed hardcoded (0.5, 0.5, 0.5, 0.3) line to support custom decision configurations
         cfg.button_state_thresholds = thresholds
     return cfg
 
@@ -399,6 +430,7 @@ class ActionController:
 def main() -> None:
     global RUNTIME_CFG
 
+    enable_high_resolution_timer()  # Turn on 1ms Windows precision boundaries
     cfg = RUNTIME_CFG
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -409,6 +441,10 @@ def main() -> None:
         torch.set_float32_matmul_precision("high")
 
     cfg, model_state = load_checkpoint(cfg, device)
+    
+    # Custom sensitivity optimization overrides (Tweak these variables to adjust turning rules!)
+    # w, a, s, d
+    cfg.button_state_thresholds = (0.50, 0.5, 0.5, 0.35)
     RUNTIME_CFG = cfg
 
     model = DrivingVideoPolicy(cfg).to(device)
@@ -418,6 +454,7 @@ def main() -> None:
         f"size={cfg.model_size}",
         f"horizon={cfg.prediction_horizon}",
         f"command_horizon={cfg.command_horizon}",
+        f"gru_memory_frames={cfg.gru_memory_frames}",
         f"d_model={cfg.d_model}",
         "temporal=gru",
         "input=masked_full_frame",
@@ -440,12 +477,12 @@ def main() -> None:
     model.eval()
     controller = ActionController(cfg)
 
-    state: TemporalState = new_temporal_state()
+    temporal_buffer = RollingGRUMemoryBuffer(cfg.gru_memory_frames)
     was_autopilot = False
-    last_step_time: Optional[float] = None
+    straight_counter = 0
 
     print("=" * 60)
-    print("Running. Press '=' to toggle autopilot, '-' to disable, Ctrl+C to quit.")
+    print("Running. Press '1' to toggle autopilot, '2' to disable, Ctrl+C to quit.")
     print("=" * 60)
 
     try:
@@ -453,13 +490,12 @@ def main() -> None:
             loop_start = time.perf_counter()
 
             if autopilot and not was_autopilot:
-                state = new_temporal_state()
-                last_step_time = None
+                temporal_buffer.clear()
+                straight_counter = 0
                 print("Autopilot ENABLED - temporal state reset")
 
             if (not autopilot) and was_autopilot:
-                state = new_temporal_state()
-                last_step_time = None
+                temporal_buffer.clear()
                 release_all()
                 print("Autopilot DISABLED - temporal state reset")
 
@@ -468,29 +504,33 @@ def main() -> None:
             if autopilot:
                 frame_cpu = capture_frame(cfg)
                 if frame_cpu is not None:
-                    now = time.perf_counter()
-                    if last_step_time is None:
-                        dt_seconds = float(cfg.decision_interval)
-                    else:
-                        dt_seconds = now - last_step_time
-                    last_step_time = now
-                    dt_seconds = float(np.clip(dt_seconds, 1.0 / 60.0, 0.25))
-
                     frame = frame_cpu.to(device, non_blocking=True)
                     if frame.dtype != inference_dtype:
                         frame = frame.to(dtype=inference_dtype)
-                    dt = torch.tensor([dt_seconds], device=device, dtype=frame.dtype)
-
                     with torch.inference_mode():
-                        output, state = model.forward_step(frame.unsqueeze(0), dt=dt, state=state)
+                        frame_batch = frame.unsqueeze(0)
+                        frame_norm = model._normalize_frames(frame_batch)
+                        masked_frame = model._apply_masks(frame_norm)
+                        step_features = model.cnn(masked_frame)
+                        step_features = model.pool(step_features)
+                        feature = model.fc_features(step_features.reshape(step_features.shape[0], -1))[0]
+                        temporal_buffer.append(feature)
+
+                        gru_input = temporal_buffer.as_batch()
+                        temporal, _ = model.temporal_rnn(gru_input)
+                        button_logits = model.button_head(temporal[:, -1]).reshape(
+                            1,
+                            int(cfg.prediction_horizon),
+                            int(cfg.num_bin),
+                        )
                     command_idx = max(0, min(int(cfg.command_horizon) - 1, int(cfg.prediction_horizon) - 1))
-                    button_probs = torch.sigmoid(output.horizon_button_logits[0, command_idx])
+                    button_probs = torch.sigmoid(button_logits[0, command_idx])
                     thresholds = torch.tensor(
                         list(cfg.button_state_thresholds),
                         device=button_probs.device,
                         dtype=button_probs.dtype,
                     )
-                    predicted_buttons = (button_probs >= thresholds).to(dtype=output.button_logits.dtype)
+                    predicted_buttons = (button_probs >= thresholds).to(dtype=button_logits.dtype)
 
                     controller.apply(
                         predicted_buttons,
@@ -509,6 +549,7 @@ def main() -> None:
     except pdi.FailSafeException:
         print("Fail-safe triggered.")
     finally:
+        disable_high_resolution_timer()
         release_all()
         print("Released all inputs. Exiting.")
 

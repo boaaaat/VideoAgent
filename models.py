@@ -30,8 +30,10 @@ class ModelConfig:
     key_names: Optional[List[str]] = None
     mouse_button_names: Optional[List[str]] = None
 
-    d_model: int = 192
+    d_model: int = 128
     dropout: float = 0.10
+
+    pooling = (6, 3)
 
     button_state_threshold: float = 0.5
     button_state_thresholds: Optional[Sequence[float]] = None
@@ -132,6 +134,8 @@ class DrivingVideoPolicy(nn.Module):
         self.car_x_max_pct = 0.60  # Right side of the car
         
         self.cnn = PilotNetBackbone(in_channels=3, dropout=cfg.dropout)
+
+        self.pool = nn.AdaptiveAvgPool2d(cfg.pooling)
         
         # We pass the full model size now because we aren't changing the tensor shape
         dummy_input = torch.zeros(1, 3, self.cfg.model_size, self.cfg.model_size)
@@ -139,7 +143,7 @@ class DrivingVideoPolicy(nn.Module):
             flattened_size = self.cnn(dummy_input).reshape(1, -1).size(1)
             
         self.fc_features = nn.Sequential(
-            nn.Linear(flattened_size, self.cfg.d_model),
+            nn.Linear(64 * cfg.pooling[0] * cfg.pooling[1], self.cfg.d_model),
             nn.ELU(inplace=True),
             nn.Dropout(cfg.dropout)
         )
@@ -201,6 +205,7 @@ class DrivingVideoPolicy(nn.Module):
         # 2. Extract spatial features
         x = frames.reshape(b * t, c, h, w)
         x = self.cnn(x)
+        x = self.pool(x)
         x = x.reshape(x.shape[0], -1)
         x = self.fc_features(x)
         x = x.reshape(b, t, self.cfg.d_model)
@@ -230,6 +235,7 @@ class DrivingVideoPolicy(nn.Module):
         masked_frame = self._apply_masks(frame_norm)
 
         step_features = self.cnn(masked_frame)
+        step_features = self.pool(step_features)
         x = self.fc_features(step_features.reshape(step_features.shape[0], -1)).unsqueeze(1)
         _, hidden = self.temporal_rnn(x, state.hidden_state)
         

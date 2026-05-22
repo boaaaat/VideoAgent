@@ -551,7 +551,7 @@ def process_video_cnn(
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Visualize feature-energy heatmaps from the current CNN encoders.")
-    parser.add_argument("--input", default=r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\data\greenville\run_20260520_121714.mp4', help="Input video path. Defaults to the newest run in cfg.data_root.")
+    parser.add_argument("--input", default=r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\data\greenville\run_20260521_182038.mp4', help="Input video path. Defaults to the newest run in cfg.data_root.")
     parser.add_argument("--output", default=None, help="Output video path (.mp4). Default auto-names next to input.")
     parser.add_argument(
         "--model-kind",

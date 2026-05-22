@@ -81,7 +81,12 @@ AUGMENTATION_PRESETS: Dict[str, Dict[str, float | int]] = {
 }
 
 
-def _spatial_jitter(frames: torch.Tensor, cfg: VideoAugmentConfig) -> torch.Tensor:
+def _sample_time_shape(frames: torch.Tensor, same_over_time: bool) -> tuple[int, int]:
+    b, t = frames.shape[:2]
+    return b, 1 if same_over_time else t
+
+
+def _spatial_jitter(frames: torch.Tensor, cfg: VideoAugmentConfig, *, same_over_time: bool) -> torch.Tensor:
     translate_frac = float(cfg.aug_translate_frac)
     scale_frac = float(cfg.aug_scale_frac)
     if translate_frac <= 0.0 and scale_frac <= 0.0:
@@ -90,15 +95,19 @@ def _spatial_jitter(frames: torch.Tensor, cfg: VideoAugmentConfig) -> torch.Tens
     b, t, c, h, w = frames.shape
     work = frames.float()
 
-    scale = torch.ones((b, t), device=frames.device, dtype=torch.float32)
+    sample_shape = _sample_time_shape(frames, same_over_time)
+    scale = torch.ones(sample_shape, device=frames.device, dtype=torch.float32)
     if scale_frac > 0.0:
         scale.uniform_(1.0 - scale_frac, 1.0 + scale_frac)
+    scale = scale.expand(b, t)
 
-    tx = torch.zeros((b, t), device=frames.device, dtype=torch.float32)
-    ty = torch.zeros((b, t), device=frames.device, dtype=torch.float32)
+    tx = torch.zeros(sample_shape, device=frames.device, dtype=torch.float32)
+    ty = torch.zeros(sample_shape, device=frames.device, dtype=torch.float32)
     if translate_frac > 0.0:
         tx.uniform_(-2.0 * translate_frac, 2.0 * translate_frac)
         ty.uniform_(-2.0 * translate_frac, 2.0 * translate_frac)
+    tx = tx.expand(b, t)
+    ty = ty.expand(b, t)
 
     theta = torch.zeros((b, t, 2, 3), device=frames.device, dtype=torch.float32)
     theta[:, :, 0, 0] = scale
@@ -113,7 +122,7 @@ def _spatial_jitter(frames: torch.Tensor, cfg: VideoAugmentConfig) -> torch.Tens
     return jittered.reshape(b, t, c, h, w).to(dtype=frames.dtype)
 
 
-def _edges_crop_blackout(frames: torch.Tensor, cfg: VideoAugmentConfig) -> torch.Tensor:
+def _edges_crop_blackout(frames: torch.Tensor, cfg: VideoAugmentConfig, *, same_over_time: bool) -> torch.Tensor:
     prob = float(cfg.aug_edges_crop_prob)
     min_frac = float(cfg.aug_edges_crop_min_frac)
     max_frac = float(cfg.aug_edges_crop_max_frac)
@@ -126,19 +135,20 @@ def _edges_crop_blackout(frames: torch.Tensor, cfg: VideoAugmentConfig) -> torch
     if max_frac <= 0.0:
         return frames
 
-    crop_frac = torch.empty((b, t), device=frames.device, dtype=torch.float32).uniform_(min_frac, max_frac)
+    sample_shape = _sample_time_shape(frames, same_over_time)
+    crop_frac = torch.empty(sample_shape, device=frames.device, dtype=torch.float32).uniform_(min_frac, max_frac)
     edge_w = torch.clamp((crop_frac * float(w)).round().long(), min=1, max=max(1, w // 2))
     xx = torch.arange(w, device=frames.device).view(1, 1, 1, 1, w)
-    keep = (xx >= edge_w.view(b, t, 1, 1, 1)) & (xx < (w - edge_w).view(b, t, 1, 1, 1))
+    keep = (xx >= edge_w.view(*sample_shape, 1, 1, 1)) & (xx < (w - edge_w).view(*sample_shape, 1, 1, 1))
     cropped = torch.where(keep, frames, frames.new_zeros(()))
 
     if prob >= 1.0:
         return cropped
-    mask = (torch.rand((b, t, 1, 1, 1), device=frames.device) < prob).to(dtype=torch.bool)
+    mask = (torch.rand((*sample_shape, 1, 1, 1), device=frames.device) < prob).to(dtype=torch.bool)
     return torch.where(mask, cropped, frames)
 
 
-def _cutout(frames: torch.Tensor, cfg: VideoAugmentConfig) -> torch.Tensor:
+def _cutout(frames: torch.Tensor, cfg: VideoAugmentConfig, *, same_over_time: bool) -> torch.Tensor:
     prob = float(cfg.aug_cutout_prob)
     min_frac = float(cfg.aug_cutout_min_frac)
     max_frac = float(cfg.aug_cutout_max_frac)
@@ -153,6 +163,7 @@ def _cutout(frames: torch.Tensor, cfg: VideoAugmentConfig) -> torch.Tensor:
     out = frames.clone()
     yy = torch.arange(h, device=frames.device).view(1, 1, 1, h, 1)
     xx = torch.arange(w, device=frames.device).view(1, 1, 1, 1, w)
+    sample_shape = _sample_time_shape(frames, same_over_time)
     edge_x = max(1, int(round(w * 0.15)))
     edge_y = max(1, int(round(h * 0.15)))
     center_x0 = edge_x
@@ -161,19 +172,19 @@ def _cutout(frames: torch.Tensor, cfg: VideoAugmentConfig) -> torch.Tensor:
     center_y1 = max(center_y0 + 1, h - edge_y)
 
     for _ in range(count):
-        active = (torch.rand((b, t), device=frames.device) < prob).view(b, t, 1, 1, 1)
-        frac = torch.empty((b, t), device=frames.device, dtype=torch.float32).uniform_(min_frac, max_frac)
+        active = (torch.rand(sample_shape, device=frames.device) < prob).view(*sample_shape, 1, 1, 1)
+        frac = torch.empty(sample_shape, device=frames.device, dtype=torch.float32).uniform_(min_frac, max_frac)
         cut_h = torch.clamp((frac * float(h)).round().long(), min=1, max=h)
         cut_w = torch.clamp((frac * float(w)).round().long(), min=1, max=w)
-        band = torch.randint(0, 4, (b, t), device=frames.device)
+        band = torch.randint(0, 4, sample_shape, device=frames.device)
 
-        zeros = torch.zeros((b, t), device=frames.device, dtype=torch.long)
-        full_w = torch.full((b, t), w, device=frames.device, dtype=torch.long)
-        full_h = torch.full((b, t), h, device=frames.device, dtype=torch.long)
-        cx0 = torch.full((b, t), center_x0, device=frames.device, dtype=torch.long)
-        cx1 = torch.full((b, t), center_x1, device=frames.device, dtype=torch.long)
-        cy0 = torch.full((b, t), center_y0, device=frames.device, dtype=torch.long)
-        cy1 = torch.full((b, t), center_y1, device=frames.device, dtype=torch.long)
+        zeros = torch.zeros(sample_shape, device=frames.device, dtype=torch.long)
+        full_w = torch.full(sample_shape, w, device=frames.device, dtype=torch.long)
+        full_h = torch.full(sample_shape, h, device=frames.device, dtype=torch.long)
+        cx0 = torch.full(sample_shape, center_x0, device=frames.device, dtype=torch.long)
+        cx1 = torch.full(sample_shape, center_x1, device=frames.device, dtype=torch.long)
+        cy0 = torch.full(sample_shape, center_y0, device=frames.device, dtype=torch.long)
+        cy1 = torch.full(sample_shape, center_y1, device=frames.device, dtype=torch.long)
 
         band_x0 = torch.where((band == 2), zeros, torch.where((band == 3), cx1, zeros))
         band_x1 = torch.where((band == 2), cx0, torch.where((band == 3), full_w, full_w))
@@ -187,57 +198,58 @@ def _cutout(frames: torch.Tensor, cfg: VideoAugmentConfig) -> torch.Tensor:
 
         span_x = (band_w - cut_w + 1).clamp(min=1)
         span_y = (band_h - cut_h + 1).clamp(min=1)
-        x0 = band_x0 + torch.floor(torch.rand((b, t), device=frames.device) * span_x.float()).long()
-        y0 = band_y0 + torch.floor(torch.rand((b, t), device=frames.device) * span_y.float()).long()
+        x0 = band_x0 + torch.floor(torch.rand(sample_shape, device=frames.device) * span_x.float()).long()
+        y0 = band_y0 + torch.floor(torch.rand(sample_shape, device=frames.device) * span_y.float()).long()
         x1 = x0 + cut_w
         y1 = y0 + cut_h
 
         hole = (
             active
-            & (yy >= y0.view(b, t, 1, 1, 1))
-            & (yy < y1.view(b, t, 1, 1, 1))
-            & (xx >= x0.view(b, t, 1, 1, 1))
-            & (xx < x1.view(b, t, 1, 1, 1))
+            & (yy >= y0.view(*sample_shape, 1, 1, 1))
+            & (yy < y1.view(*sample_shape, 1, 1, 1))
+            & (xx >= x0.view(*sample_shape, 1, 1, 1))
+            & (xx < x1.view(*sample_shape, 1, 1, 1))
         )
         out = torch.where(hole, out.new_zeros(()), out)
     return out
 
 
-def augment_frames(frames: torch.Tensor, cfg: VideoAugmentConfig) -> torch.Tensor:
+def augment_frames(frames: torch.Tensor, cfg: VideoAugmentConfig, *, same_over_time: bool = True) -> torch.Tensor:
     """Video-safe training augmentations. No flips: those would require action remapping."""
     if not frames.is_floating_point():
         return frames
-    b, t = frames.shape[:2]
     device = frames.device
-    out = _spatial_jitter(frames, cfg)
-    out = _edges_crop_blackout(out, cfg)
+    sample_shape = _sample_time_shape(frames, same_over_time)
+    out = _spatial_jitter(frames, cfg, same_over_time=same_over_time)
+    out = _edges_crop_blackout(out, cfg, same_over_time=same_over_time)
 
     if cfg.aug_contrast > 0.0:
-        contrast = torch.empty((b, t, 1, 1, 1), device=device, dtype=torch.float32).uniform_(
+        contrast = torch.empty((*sample_shape, 1, 1, 1), device=device, dtype=torch.float32).uniform_(
             1.0 - float(cfg.aug_contrast), 1.0 + float(cfg.aug_contrast)
         ).to(dtype=out.dtype)
         mean = out.mean(dim=(-1, -2), keepdim=True)
         out = (out - mean) * contrast + mean
 
     if cfg.aug_brightness > 0.0:
-        gain = torch.empty((b, t, 1, 1, 1), device=device, dtype=torch.float32).uniform_(
+        gain = torch.empty((*sample_shape, 1, 1, 1), device=device, dtype=torch.float32).uniform_(
             1.0 - float(cfg.aug_brightness), 1.0 + float(cfg.aug_brightness)
         ).to(dtype=out.dtype)
-        bias = torch.empty((b, t, 1, 1, 1), device=device, dtype=torch.float32).uniform_(
+        bias = torch.empty((*sample_shape, 1, 1, 1), device=device, dtype=torch.float32).uniform_(
             -float(cfg.aug_brightness), float(cfg.aug_brightness)
         ).to(dtype=out.dtype)
         out = out * gain + bias
 
     if cfg.aug_gray_prob > 0.0:
-        mask = (torch.rand((b, t, 1, 1, 1), device=device) < float(cfg.aug_gray_prob)).to(dtype=torch.bool)
+        mask = (torch.rand((*sample_shape, 1, 1, 1), device=device) < float(cfg.aug_gray_prob)).to(dtype=torch.bool)
         gray = out.mean(dim=2, keepdim=True).expand_as(out)
         out = torch.where(mask, gray, out)
 
     if cfg.aug_noise_std > 0.0:
-        noise = torch.randn_like(out, dtype=torch.float32) * float(cfg.aug_noise_std)
+        noise_shape = (out.size(0), 1, *out.shape[2:]) if same_over_time else out.shape
+        noise = torch.randn(noise_shape, device=device, dtype=torch.float32) * float(cfg.aug_noise_std)
         out = out + noise.to(dtype=out.dtype)
 
-    out = _cutout(out, cfg)
+    out = _cutout(out, cfg, same_over_time=same_over_time)
     return out.clamp_(0.0, 1.0)
 
 
@@ -382,7 +394,7 @@ def main() -> int:
     )
     torch.manual_seed(int(args.seed))
     original_bgr, frames = _read_sample_frames(args.video, args.frame_start, args.num_frames, args.resize_size)
-    augmented = augment_frames(frames, cfg)
+    augmented = augment_frames(frames, cfg, same_over_time=False)
     augmented_bgr = _tensor_frames_to_bgr(augmented)
     out_path = args.out or _default_sheet_path(args.video, args.preset)
     write_augmentation_sheet(original_bgr, augmented_bgr, out_path, title=f"augmented: {args.preset}")

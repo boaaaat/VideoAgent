@@ -52,13 +52,14 @@ class TrainConfig(ModelConfig):
 
     train_split: float = 0.9
     split_seed: int = 1337
-    pos_weight_power: float = 0.6
-    pos_weight_clamp: float = 8.0
-    button_threshold_from_pos_weight: bool = True
+    pos_weight_power: float = 0.5
+    pos_weight_clamp: float = 8
+    button_threshold_from_pos_weight: bool = False
     button_threshold_min: float = 0.5
-    button_threshold_max: float = 0.80
+    button_threshold_max: float = 0.5
 
     button_loss_weight: float = 1.0
+    button_focal_gamma: float = 2.0
     action_label_offset: int = 0
     skipped_key_names: Optional[Sequence[str]] = ("e", "q", "c", "z")
     button_label_smoothing: float = 0.02
@@ -77,13 +78,13 @@ class TrainConfig(ModelConfig):
     aug_cutout_max_frac: float = 0.10
     aug_cutout_count: int = 1
 
-    early_stop_patience: int = 5
+    early_stop_patience: int = 0
 
     dali_num_threads: int = 6
     dali_prefetch_queue_depth: int = 4
     dali_reader_prefetch_queue_depth: int = 4
     dali_read_ahead: bool = False
-    dali_dont_use_mmap: bool = True
+    dali_dont_use_mmap: bool = False
     dali_resize_mode: str = "video_then_resize"
     dali_prepare_first_batch: bool = True
     dali_train_random_shuffle: bool = True
@@ -132,6 +133,7 @@ class TrainConfig(ModelConfig):
         self.button_threshold_min = float(min(max(self.button_threshold_min, 0.0), 1.0))
         self.button_threshold_max = float(min(max(self.button_threshold_max, self.button_threshold_min), 1.0))
         self.grad_clip = max(0.0, float(self.grad_clip))
+        self.button_focal_gamma = max(0.0, float(self.button_focal_gamma))
         self.action_label_offset = int(self.action_label_offset)
         self.button_label_smoothing = float(min(max(self.button_label_smoothing, 0.0), 0.2))
         self.aug_brightness = float(min(max(self.aug_brightness, 0.0), 0.5))
@@ -418,6 +420,7 @@ def video_pipeline(
     if file_list is not None and filenames is not None:
         raise ValueError("video_pipeline accepts only one of file_list or filenames.")
 
+    use_reader_resize = resize_mode in {"video_resize", "video_then_resize"}
     reader_kwargs = {
         "device": "gpu",
         "name": "Reader",
@@ -431,16 +434,29 @@ def video_pipeline(
         "image_type": types.RGB,
         "bytes_per_sample_hint": resized_bytes,
         "tensor_init_bytes": resized_bytes,
-        "pad_mode": "none",
     }
-    if file_list is not None:
+    if use_reader_resize:
         reader_kwargs.update(
             {
-                "file_list": file_list,
-                "file_list_format": "frames",
-                "file_list_include_end": False,
+                "resize_x": resize_size,
+                "resize_y": resize_size,
+                "interp_type": types.INTERP_LINEAR,
+                "temp_buffer_hint": resized_bytes,
             }
         )
+    else:
+        reader_kwargs["pad_mode"] = "none"
+    if file_list is not None:
+        reader_kwargs["file_list"] = file_list
+        if use_reader_resize:
+            reader_kwargs["file_list_frame_num"] = True
+        else:
+            reader_kwargs.update(
+                {
+                    "file_list_format": "frames",
+                    "file_list_include_end": False,
+                }
+            )
     else:
         reader_kwargs["filenames"] = filenames
         if labels is not None:
@@ -448,7 +464,10 @@ def video_pipeline(
     if enable_frame_num not in (None, False, "none"):
         reader_kwargs["enable_frame_num"] = enable_frame_num
 
-    vids = fn.experimental.readers.video(**reader_kwargs)
+    if use_reader_resize:
+        vids = fn.readers.video_resize(**reader_kwargs)
+    else:
+        vids = fn.experimental.readers.video(**reader_kwargs)
 
     labels = None
     frame_nums = None
@@ -457,17 +476,18 @@ def video_pipeline(
         vids, labels = reader_outputs[0], reader_outputs[1]
         if len(reader_outputs) > 2:
             frame_nums = reader_outputs[2]
-    if resize_mode in {"video_resize", "video_then_resize"}:
-        vids = fn.resize(
-            vids,
-            resize_x=resize_size,
-            resize_y=resize_size,
-            interp_type=types.INTERP_LINEAR,
-            bytes_per_sample_hint=resized_bytes,
-            temp_buffer_hint=resized_bytes,
-        )
-    elif resize_mode != "none":
-        raise ValueError(f"Unknown DALI resize_mode: {resize_mode}")
+    if not use_reader_resize:
+        if resize_mode in {"video_resize", "video_then_resize"}:
+            vids = fn.resize(
+                vids,
+                resize_x=resize_size,
+                resize_y=resize_size,
+                interp_type=types.INTERP_LINEAR,
+                bytes_per_sample_hint=resized_bytes,
+                temp_buffer_hint=resized_bytes,
+            )
+        elif resize_mode != "none":
+            raise ValueError(f"Unknown DALI resize_mode: {resize_mode}")
 
     if normalize_frames:
         frames = fn.crop_mirror_normalize(
@@ -495,13 +515,6 @@ def ensure_fchw_layout(frames: torch.Tensor) -> torch.Tensor:
     raise RuntimeError(f"Unexpected frame shape from DALI: {tuple(frames.shape)}")
 
 
-def maybe_channels_last_seq(frames: torch.Tensor) -> torch.Tensor:
-    b, t, c, h, w = frames.shape
-    flat = frames.reshape(b * t, c, h, w)
-    flat = flat.contiguous(memory_format=torch.channels_last)
-    return flat.view(b, t, c, h, w)
-
-
 def normalize_dali_labels(labels: torch.Tensor) -> torch.Tensor:
     return labels.reshape(-1).long()
 
@@ -522,6 +535,26 @@ def compute_pos_weight(
     neg = total.expand_as(pos) - pos
     weight = (neg / pos.clamp(min=1.0)).pow(float(power))
     return weight.clamp(min=1.0, max=float(clamp)).float()
+
+
+def supervised_start_frame(seq_len: int) -> int:
+    return max(0, int(seq_len) // 2)
+
+
+def supervised_frame_range(seq_len: int) -> Tuple[int, int]:
+    return supervised_start_frame(seq_len), max(0, int(seq_len))
+
+
+def second_half_only(valid: torch.Tensor) -> torch.Tensor:
+    if valid.dim() < 2:
+        raise ValueError(f"Expected a time dimension in valid mask, got shape {tuple(valid.shape)}")
+    time = torch.arange(valid.size(1), device=valid.device) >= supervised_start_frame(valid.size(1))
+    view_shape = [1] * valid.dim()
+    view_shape[1] = valid.size(1)
+    time = time.view(*view_shape)
+    if valid.dtype == torch.bool:
+        return valid & time
+    return valid * time.to(dtype=valid.dtype)
 
 
 def decision_thresholds_from_pos_weight(pos_weight: torch.Tensor, cfg: TrainConfig) -> torch.Tensor:
@@ -594,18 +627,22 @@ def compute_losses(
     *,
     button_pos_weight: torch.Tensor,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    valid = targets.horizon_valid.float()
+    valid = second_half_only(targets.horizon_valid).float()
     valid_4d = valid.unsqueeze(-1)
     button_target = targets.button_horizon.float()
     if float(cfg.button_label_smoothing) > 0.0:
         eps = float(cfg.button_label_smoothing)
         button_target = button_target * (1.0 - eps) + 0.5 * eps
+    button_logits = output.horizon_button_logits.float()
     button_loss_raw = F.binary_cross_entropy_with_logits(
-        output.horizon_button_logits.float(),
+        button_logits,
         button_target,
         pos_weight=button_pos_weight.view(1, 1, 1, -1).float(),
         reduction="none",
     )
+    button_prob = torch.sigmoid(button_logits)
+    p_t = button_prob * button_target + (1.0 - button_prob) * (1.0 - button_target)
+    button_loss_raw = button_loss_raw * (1.0 - p_t).clamp(min=0.0, max=1.0).pow(float(cfg.button_focal_gamma))
     button_loss = (button_loss_raw * valid_4d).sum() / (valid_4d.sum() * cfg.num_bin).clamp(min=1.0)
 
     total = cfg.button_loss_weight * button_loss
@@ -622,9 +659,10 @@ def update_metrics(
     step1_stats: BinaryStats,
     final_stats: BinaryStats,
 ) -> None:
-    step1_valid = targets.horizon_valid[:, :, 0] > 0.5
+    valid = second_half_only(targets.horizon_valid)
+    step1_valid = valid[:, :, 0] > 0.5
     final_idx = int(cfg.prediction_horizon) - 1
-    final_valid = targets.horizon_valid[:, :, final_idx] > 0.5
+    final_valid = valid[:, :, final_idx] > 0.5
     thresholds = button_threshold_tensor(cfg, device=output.horizon_button_logits.device).view(1, 1, -1)
     step1_pred = torch.sigmoid(output.horizon_button_logits[:, :, 0].float()) >= thresholds
     final_pred = torch.sigmoid(output.horizon_button_logits[:, :, final_idx].float()) >= thresholds
@@ -669,7 +707,7 @@ def persistence_baseline_metrics(targets: WindowTargets, cfg: TrainConfig) -> Di
     stats = BinaryStats(cfg.num_bin, torch.device("cpu"))
     current = targets.button_horizon[:, :, 0].new_zeros(targets.button_horizon[:, :, 0].shape)
     current[:, 1:] = targets.button_horizon[:, :-1, 0]
-    valid = targets.horizon_valid[:, :, 0] > 0.5
+    valid = second_half_only(targets.horizon_valid[:, :, 0] > 0.5)
     valid[:, 0] = False
     stats.update(current > 0.5, targets.button_horizon[:, :, 0] > 0.5, valid)
     result = stats.compute()
@@ -756,10 +794,13 @@ def load_batch(iterator, targets: WindowTargets, device: torch.device, cfg: Trai
         frames = frames.to(dtype=torch.bfloat16)
     elif amp_name in {"fp32", "float32", "none"} and frames.dtype != torch.float32:
         frames = frames.float()
-    if frames.is_cuda:
-        frames = maybe_channels_last_seq(frames)
-    labels = normalize_dali_labels(batch["labels"]).cpu()
-    target = move_bundle_to_device(bundle_index(targets, labels), device)
+    labels = normalize_dali_labels(batch["labels"]).to(device, non_blocking=True)
+    target = WindowTargets(
+        dt=targets.dt[labels],
+        button_horizon=targets.button_horizon[labels],
+        horizon_valid=targets.horizon_valid[labels],
+        meta=None,
+    )
     return frames, target
 
 
@@ -960,6 +1001,7 @@ def parse_args() -> TrainConfig:
     add("--action-label-offset", type=int, default=None)
     add("--skip-key-names", default=None, help="Comma-separated key names to exclude from training labels.")
     add("--train-all-keys", action="store_true", help="Disable the default Greenville test filter for e,q,c,z.")
+    add("--button-focal-gamma", type=float, default=None)
     add("--button-label-smoothing", type=float, default=None)
     add("--aug-brightness", type=float, default=None)
     add("--aug-contrast", type=float, default=None)
@@ -1033,6 +1075,7 @@ def parse_args() -> TrainConfig:
         "button_threshold_min",
         "button_threshold_max",
         "action_label_offset",
+        "button_focal_gamma",
         "button_label_smoothing",
         "aug_brightness",
         "aug_contrast",
@@ -1117,6 +1160,12 @@ def train() -> None:
         f"val={(tuple(val_targets.button_horizon.shape) if val_targets is not None else None)}",
         f"action_label_offset={cfg.action_label_offset}",
     )
+    supervised_start, supervised_end = supervised_frame_range(cfg.seq_len)
+    print(
+        "Loss supervision:",
+        f"frames={supervised_start}-{supervised_end}",
+        f"focal_gamma={cfg.button_focal_gamma:.1f}",
+    )
     train_persist = persistence_baseline_metrics(train_targets, cfg)
     print(f"Persistence baseline: train_f1@1={train_persist['macro_f1']:.4f}")
     if val_targets is not None:
@@ -1137,7 +1186,7 @@ def train() -> None:
         train_targets.button_horizon,
         cfg.pos_weight_power,
         cfg.pos_weight_clamp,
-        valid=train_targets.horizon_valid,
+        valid=second_half_only(train_targets.horizon_valid),
     ).to(device)
     button_thresholds = decision_thresholds_from_pos_weight(button_pos_weight, cfg).detach().cpu()
     cfg.button_state_thresholds = tuple(float(x) for x in list(button_thresholds.tolist()))
@@ -1152,9 +1201,9 @@ def train() -> None:
     ]
     print("Button decision thresholds:", " ".join(threshold_parts))
 
-    train_targets = pin_bundle(train_targets)
+    train_targets = move_bundle_to_device(train_targets, device)
     if val_targets is not None:
-        val_targets = pin_bundle(val_targets)
+        val_targets = move_bundle_to_device(val_targets, device)
 
     train_iter = make_dali_iterator(
         train_file_list,
