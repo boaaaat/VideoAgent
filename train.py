@@ -43,7 +43,7 @@ class TrainConfig(ModelConfig):
     lr: float = 1e-4
     min_lr: float = 1e-5
     warmup_steps: int = 300
-    weight_decay: float = 0.08
+    weight_decay: float = 0.05
     grad_clip: float = 1.0
 
     amp_dtype: str = "bf16"
@@ -67,12 +67,14 @@ class TrainConfig(ModelConfig):
     aug_contrast: float = 0.10
     aug_noise_std: float = 0.006
     aug_gray_prob: float = 0.02
-    aug_edges_crop_prob: float = 0.15
-    aug_edges_crop_min_frac: float = 0.02
-    aug_edges_crop_max_frac: float = 0.15
+    aug_edges_crop_prob: float = 0.0
+    aug_edges_crop_min_frac: float = 0.0
+    aug_edges_crop_max_frac: float = 0.0
+    aug_translate_frac: float = 0.0
+    aug_scale_frac = 0.0
     aug_cutout_prob: float = 0.10
     aug_cutout_min_frac: float = 0.04
-    aug_cutout_max_frac: float = 0.12
+    aug_cutout_max_frac: float = 0.10
     aug_cutout_count: int = 1
 
     early_stop_patience: int = 5
@@ -87,7 +89,7 @@ class TrainConfig(ModelConfig):
     dali_train_random_shuffle: bool = True
     dali_val_random_shuffle: bool = False
     dali_shuffle_seed: int = 1337
-    sync_dataset: bool = True
+    sync_dataset: bool = False
     dataset_cache_root: Optional[str] = None
     dataset_sync_delete_stale: Optional[bool] = None
     dataset_sync_hash_same_size: bool = True

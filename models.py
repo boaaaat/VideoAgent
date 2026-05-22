@@ -26,7 +26,7 @@ class ModelConfig:
     train_seq_stride: int = 40
     val_seq_stride: int = 80
     prediction_dt: float = 1.0 / 20.0
-    prediction_horizon: int = 5
+    prediction_horizon: int = 1
 
     key_names: Optional[List[str]] = None
     mouse_button_names: Optional[List[str]] = None
