@@ -3,10 +3,9 @@ import os
 import sys
 import time
 import ctypes  # Added for high-res clock period adjustments
-from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Deque, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import dxcam
@@ -22,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from models import (  # noqa: E402
     DrivingVideoPolicy,
     ModelConfig,
+    TemporalState,
 )
 
 pdi.FAILSAFE = True
@@ -48,7 +48,7 @@ def disable_high_resolution_timer():
 @dataclass
 class RuntimeConfig(ModelConfig):
     ckpt_dir: str = "./checkpoints_rt"
-    ckpt_path: Optional[str] = None
+    ckpt_path: Optional[str] = r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\checkpoints_idm\model_epoch_31_5x5.pt'
     pos_weight_power: float = 0.5
     pos_weight_clamp: float = 8.0
     button_threshold_from_pos_weight: bool = False
@@ -84,22 +84,6 @@ MOUSE_NAME_MAP = {
     "right_click": "right",
     "middle_click": "middle",
 }
-
-
-class RollingGRUMemoryBuffer:
-    def __init__(self, max_frames: int) -> None:
-        self.features: Deque[torch.Tensor] = deque(maxlen=max(1, int(max_frames)))
-
-    def clear(self) -> None:
-        self.features.clear()
-
-    def append(self, feature: torch.Tensor) -> None:
-        self.features.append(feature.detach())
-
-    def as_batch(self) -> torch.Tensor:
-        if not self.features:
-            raise RuntimeError("Cannot build a GRU batch from an empty memory buffer.")
-        return torch.stack(tuple(self.features), dim=0).unsqueeze(0)
 
 
 def release_all() -> None:
@@ -454,9 +438,8 @@ def main() -> None:
         f"size={cfg.model_size}",
         f"horizon={cfg.prediction_horizon}",
         f"command_horizon={cfg.command_horizon}",
-        f"gru_memory_frames={cfg.gru_memory_frames}",
         f"d_model={cfg.d_model}",
-        "temporal=gru",
+        "temporal=convgru",
         "input=masked_full_frame",
     )
     print(
@@ -477,9 +460,8 @@ def main() -> None:
     model.eval()
     controller = ActionController(cfg)
 
-    temporal_buffer = RollingGRUMemoryBuffer(cfg.gru_memory_frames)
+    temporal_state = TemporalState()
     was_autopilot = False
-    straight_counter = 0
 
     print("=" * 60)
     print("Running. Press '1' to toggle autopilot, '2' to disable, Ctrl+C to quit.")
@@ -490,12 +472,11 @@ def main() -> None:
             loop_start = time.perf_counter()
 
             if autopilot and not was_autopilot:
-                temporal_buffer.clear()
-                straight_counter = 0
+                temporal_state = TemporalState()
                 print("Autopilot ENABLED - temporal state reset")
 
             if (not autopilot) and was_autopilot:
-                temporal_buffer.clear()
+                temporal_state = TemporalState()
                 release_all()
                 print("Autopilot DISABLED - temporal state reset")
 
@@ -509,20 +490,9 @@ def main() -> None:
                         frame = frame.to(dtype=inference_dtype)
                     with torch.inference_mode():
                         frame_batch = frame.unsqueeze(0)
-                        frame_norm = model._normalize_frames(frame_batch)
-                        masked_frame = model._apply_masks(frame_norm)
-                        step_features = model.cnn(masked_frame)
-                        step_features = model.pool(step_features)
-                        feature = model.fc_features(step_features.reshape(step_features.shape[0], -1))[0]
-                        temporal_buffer.append(feature)
-
-                        gru_input = temporal_buffer.as_batch()
-                        temporal, _ = model.temporal_rnn(gru_input)
-                        button_logits = model.button_head(temporal[:, -1]).reshape(
-                            1,
-                            int(cfg.prediction_horizon),
-                            int(cfg.num_bin),
-                        )
+                        dt = torch.tensor([float(cfg.prediction_dt)], device=device, dtype=frame_batch.dtype)
+                        output, temporal_state = model.forward_step(frame_batch, dt, temporal_state)
+                        button_logits = output.horizon_button_logits
                     command_idx = max(0, min(int(cfg.command_horizon) - 1, int(cfg.prediction_horizon) - 1))
                     button_probs = torch.sigmoid(button_logits[0, command_idx])
                     thresholds = torch.tensor(

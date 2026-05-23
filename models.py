@@ -30,10 +30,10 @@ class ModelConfig:
     key_names: Optional[List[str]] = None
     mouse_button_names: Optional[List[str]] = None
 
-    d_model: int = 128
+    d_model: int = 192
     dropout: float = 0.10
 
-    pooling = (6, 3)
+    pooling = (5, 5)
 
     button_state_threshold: float = 0.5
     button_state_thresholds: Optional[Sequence[float]] = None
@@ -90,35 +90,95 @@ class TemporalState:
     hidden_state: Optional[torch.Tensor] = None
 
 
-class PilotNetBackbone(nn.Module):
+class ResBlock(nn.Module):
+    """ Lightweight 2D Residual block for regularizing spatial primitives """
+    def __init__(self, channels: int, dropout: float = 0.1):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.ELU(inplace=True),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.Dropout2d(dropout)
+        )
+        self.elu = nn.ELU(inplace=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.elu(x + self.conv(x))
+
+
+class CustomSpatialEncoder(nn.Module):
+    """
+    Downsamples the screen while embedding strong spatial features.
+    Outputs a feature map scale of (Batch, 48, H/16, W/16).
+    """
     def __init__(self, in_channels: int = 3, dropout: float = 0.2):
         super().__init__()
-        self.conv_layers = nn.Sequential(
-            nn.Conv2d(in_channels, 24, kernel_size=5, stride=2, bias=False),
-            nn.BatchNorm2d(24),
+        self.net = nn.Sequential(
+            nn.Conv2d(in_channels, 16, kernel_size=7, stride=2, padding=3, bias=False),  # /2
+            nn.BatchNorm2d(16),
             nn.ELU(inplace=True),
             
-            nn.Conv2d(24, 36, kernel_size=5, stride=2, bias=False),
-            nn.BatchNorm2d(36),
+            nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1, bias=False),          # /4
+            nn.BatchNorm2d(32),
             nn.ELU(inplace=True),
+            ResBlock(32, dropout),
             
-            nn.Conv2d(36, 48, kernel_size=5, stride=2, bias=False),
+            nn.Conv2d(32, 48, kernel_size=3, stride=2, padding=1, bias=False),          # /8
             nn.BatchNorm2d(48),
             nn.ELU(inplace=True),
+            ResBlock(48, dropout),
             
-            nn.Conv2d(48, 64, kernel_size=3, stride=1, bias=False),
-            nn.BatchNorm2d(64),
-            nn.ELU(inplace=True),
-            
-            nn.Conv2d(64, 64, kernel_size=3, stride=1, bias=False),
-            nn.BatchNorm2d(64),
-            nn.ELU(inplace=True),
-            
-            nn.Dropout2d(dropout)
+            nn.Conv2d(48, 48, kernel_size=3, stride=2, padding=1, bias=False),          # /16
+            nn.BatchNorm2d(48),
+            nn.ELU(inplace=True)
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.conv_layers(x)
+        return self.net(x)
+
+
+class ConvGRUCell(nn.Module):
+    """
+    A GRU cell that replaces standard Linear matrix multiplications with Conv2d loops,
+    preserving structural 2D coordinates across time.
+    """
+    def __init__(self, input_dim: int, hidden_dim: int, kernel_size: int = 3):
+        super().__init__()
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        padding = kernel_size // 2
+        
+        self.gates_conv = nn.Conv2d(
+            in_channels=input_dim + hidden_dim,
+            out_channels=2 * hidden_dim,
+            kernel_size=kernel_size,
+            padding=padding,
+            bias=True
+        )
+        self.candidate_conv = nn.Conv2d(
+            in_channels=input_dim + hidden_dim,
+            out_channels=hidden_dim,
+            kernel_size=kernel_size,
+            padding=padding,
+            bias=True
+        )
+
+    def forward(self, x: torch.Tensor, h_prev: torch.Tensor) -> torch.Tensor:
+        combined = torch.cat([x, h_prev], dim=1)
+        gates = self.gates_conv(combined)
+        r_gate, z_gate = torch.chunk(gates, 2, dim=1)
+        
+        r_gate = torch.sigmoid(r_gate)
+        z_gate = torch.sigmoid(z_gate)
+        
+        combined_candidate = torch.cat([x, r_gate * h_prev], dim=1)
+        candidate = torch.tanh(self.candidate_conv(combined_candidate))
+        
+        h_next = (1.0 - z_gate) * h_prev + z_gate * candidate
+        return h_next
+
 
 class DrivingVideoPolicy(nn.Module):
     def __init__(self, cfg: ModelConfig):
@@ -126,33 +186,24 @@ class DrivingVideoPolicy(nn.Module):
         self.cfg = cfg
         
         # --- Center Car Mask Boundaries (Percentages) ---
-        # Adjust these percentages to draw a tight box around your car in Greenville.
-        # 0.0 is top/left, 1.0 is bottom/right.
-        self.car_y_min_pct = 0.50  # Top of the car
-        self.car_y_max_pct = 0.80  # Bottom of the car (leaves the bottom 20% for UI)
-        self.car_x_min_pct = 0.40  # Left side of the car
-        self.car_x_max_pct = 0.60  # Right side of the car
+        self.car_y_min_pct = 0.50
+        self.car_y_max_pct = 0.80
+        self.car_x_min_pct = 0.40
+        self.car_x_max_pct = 0.60
         
-        self.cnn = PilotNetBackbone(in_channels=3, dropout=cfg.dropout)
-
+        self.spatial_encoder = CustomSpatialEncoder(in_channels=3, dropout=cfg.dropout)
+        
+        # ConvGRU tracking state
+        self.feat_channels = 48
+        self.temporal_rnn = ConvGRUCell(input_dim=self.feat_channels, hidden_dim=self.feat_channels, kernel_size=3)
+        
+        # Retain your custom 6x3 pooling layout for driving horizon bias
         self.pool = nn.AdaptiveAvgPool2d(cfg.pooling)
         
-        # We pass the full model size now because we aren't changing the tensor shape
-        dummy_input = torch.zeros(1, 3, self.cfg.model_size, self.cfg.model_size)
-        with torch.no_grad():
-            flattened_size = self.cnn(dummy_input).reshape(1, -1).size(1)
-            
         self.fc_features = nn.Sequential(
-            nn.Linear(64 * cfg.pooling[0] * cfg.pooling[1], self.cfg.d_model),
+            nn.Linear(self.feat_channels * cfg.pooling[0] * cfg.pooling[1], self.cfg.d_model),
             nn.ELU(inplace=True),
             nn.Dropout(cfg.dropout)
-        )
-        
-        self.temporal_rnn = nn.GRU(
-            input_size=self.cfg.d_model, 
-            hidden_size=self.cfg.d_model, 
-            num_layers=1, 
-            batch_first=True
         )
         
         self.button_head = nn.Linear(self.cfg.d_model, self.cfg.prediction_horizon * self.cfg.num_bin)
@@ -164,31 +215,24 @@ class DrivingVideoPolicy(nn.Module):
         return frames.clamp(0.0, 1.0)
 
     def _apply_masks(self, frames: torch.Tensor) -> torch.Tensor:
-        """
-        Blacks out the car, the bottom HUD, and the minimap to force the CNN
-        to look at the road and lane lines.
-        """
         h, w = frames.shape[-2:]
         masked_frames = frames.clone()
 
         # 1. Mask the Car (Center)
-        # Blocks out the 3rd-person car model so the AI stops copying its rotation.
         car_y1, car_y2 = int(h * self.car_y_min_pct), int(h * self.car_y_max_pct)
         car_x1, car_x2 = int(w * self.car_x_min_pct), int(w * self.car_x_max_pct)
         masked_frames[..., car_y1:car_y2, car_x1:car_x2] = 0.0
 
         # 2. Mask the Bottom HUD (Speedometer, Gear, etc.)
-        # Blocks the entire bottom 20% so it cannot cheat by reading speed.
         hud_y1 = int(h * 0.80)
         masked_frames[..., hud_y1:, :] = 0.0
 
         # 3. Mask the Minimap (Mid-Right)
-        # Blocks the right side where the map and money UI appear.
         map_y1, map_y2 = int(h * 0.05), int(h * 0.2)
         map_x1 = int(w * 0.75)
         masked_frames[..., map_y1:map_y2, map_x1:] = 0.0
 
-        # 4. Top Left Roblox UI (Optional but recommended)
+        # 4. Top Left Roblox UI
         roblox_ui_y2 = int(h * 0.1)
         roblox_ui_x2 = int(w * 0.1)
         masked_frames[..., :roblox_ui_y2, :roblox_ui_x2] = 0.0
@@ -198,26 +242,38 @@ class DrivingVideoPolicy(nn.Module):
     def forward(self, frames: torch.Tensor, dt: torch.Tensor, state: Optional[TemporalState] = None, return_aux: bool = False):
         b, t, c, h, w = frames.shape
         
-        # 1. Normalize and mask out the car
         frames = self._normalize_frames(frames)
         frames = self._apply_masks(frames)
         
-        # 2. Extract spatial features
+        # 1. Spatial Processing
         x = frames.reshape(b * t, c, h, w)
-        x = self.cnn(x)
-        x = self.pool(x)
-        x = x.reshape(x.shape[0], -1)
-        x = self.fc_features(x)
-        x = x.reshape(b, t, self.cfg.d_model)
+        spatial_feats = self.spatial_encoder(x)
+        _, cf, hf, wf = spatial_feats.shape
+        spatial_feats = spatial_feats.reshape(b, t, cf, hf, wf)
         
-        # 3. Temporal aggregation
+        # 2. Temporal ConvGRU Rollout Loop
         if state is not None and state.hidden_state is not None:
-            temporal, _ = self.temporal_rnn(x, state.hidden_state)
+            h_t = state.hidden_state
         else:
-            temporal, _ = self.temporal_rnn(x)
+            h_t = torch.zeros(b, self.feat_channels, hf, wf, device=frames.device, dtype=spatial_feats.dtype)
             
-        # 4. Predict
-        button = self.button_head(temporal).reshape(b, t, self.cfg.prediction_horizon, self.cfg.num_bin)
+        temporal_outputs = []
+        for step in range(t):
+            h_t = self.temporal_rnn(spatial_feats[:, step], h_t)
+            temporal_outputs.append(h_t.unsqueeze(1))
+            
+        temporal_out = torch.cat(temporal_outputs, dim=1)  # [B, T, C_feat, H_feat, W_feat]
+        
+        # 3. Linear Downsampling for Classifier Heads
+        temporal_flat = temporal_out.reshape(b * t, cf, hf, wf)
+        pooled = self.pool(temporal_flat)
+        pooled_flat = pooled.reshape(pooled.shape[0], -1)
+        
+        fc_out = self.fc_features(pooled_flat)
+        fc_out = fc_out.reshape(b, t, self.cfg.d_model)
+        
+        # 4. Action Mapping Prediction
+        button = self.button_head(fc_out).reshape(b, t, self.cfg.prediction_horizon, self.cfg.num_bin)
         
         step_button = button[:, :, 0]
         output = PolicyOutput(
@@ -228,19 +284,24 @@ class DrivingVideoPolicy(nn.Module):
         return output
 
     def forward_step(self, frame: torch.Tensor, dt: torch.Tensor, state: TemporalState, return_aux: bool = False):
+        # Match signature expected by real-time test loop integration
         output = self.forward(frame.unsqueeze(1), dt.unsqueeze(1), state)
         
-        # Process frame for hidden state update
         frame_norm = self._normalize_frames(frame)
         masked_frame = self._apply_masks(frame_norm)
-
-        step_features = self.cnn(masked_frame)
-        step_features = self.pool(step_features)
-        x = self.fc_features(step_features.reshape(step_features.shape[0], -1)).unsqueeze(1)
-        _, hidden = self.temporal_rnn(x, state.hidden_state)
+        
+        spatial_feat = self.spatial_encoder(masked_frame)
+        
+        if state.hidden_state is not None:
+            h_t = state.hidden_state
+        else:
+            b, cf, hf, wf = spatial_feat.shape
+            h_t = torch.zeros(b, self.feat_channels, hf, wf, device=frame.device, dtype=spatial_feat.dtype)
+            
+        new_hidden = self.temporal_rnn(spatial_feat, h_t)
         
         new_state = TemporalState(
-            hidden_state=hidden.detach(),
+            hidden_state=new_hidden.detach(),
         )
         
         squeezed = PolicyOutput(

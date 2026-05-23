@@ -2,7 +2,7 @@ import os
 from typing import Dict, List, Optional
 
 
-selected_game = "greenville_test"
+selected_game = "greenville"
 
 key_names: Dict[str, List[str]] = {
     "doors": ["w", "a", "s", "d", "e", "1", "2", "3", "Key.shift", "Key.space"],

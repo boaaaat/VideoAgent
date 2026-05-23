@@ -24,12 +24,13 @@ from inverse_dynamics import (  # noqa: E402
 from models import (  # noqa: E402
     DrivingVideoPolicy,
     ModelConfig,
+    TemporalState,
     get_key_names as MODEL_GET_KEY_NAMES,
     get_mouse_button_names as MODEL_GET_MOUSE_BUTTON_NAMES,
 )
 
 
-FeatureLayer = Literal["motion", "stage1", "stage2", "stage3", "stage4", "stage5", "spatial", "tokens"]
+FeatureLayer = Literal["motion", "stage1", "stage2", "stage3", "stage4", "spatial", "tokens"]
 ModelKind = Literal["auto", "policy", "inverse"]
 LoadedModelKind = Literal["policy", "inverse"]
 VisualModel = DrivingVideoPolicy | InverseDynamicsModel
@@ -289,31 +290,26 @@ def load_visual_model_from_checkpoint(
     return model, cfg, model_kind
 
 
+def _stride2_conv(module: torch.nn.Module) -> Optional[torch.nn.Conv2d]:
+    if isinstance(module, torch.nn.Conv2d):
+        conv = module
+    else:
+        conv = getattr(module, "conv", None)
+    if isinstance(conv, torch.nn.Conv2d) and tuple(conv.stride) == (2, 2):
+        return conv
+    return None
+
+
 def _activation_stages(net: torch.nn.Sequential, x: torch.Tensor) -> List[torch.Tensor]:
     stages: List[torch.Tensor] = []
     y = x
     saw_stage = False
     for module in net:
-        conv = getattr(module, "conv", None)
-        starts_new_stage = isinstance(conv, torch.nn.Conv2d) and tuple(conv.stride) == (2, 2)
+        starts_new_stage = _stride2_conv(module) is not None
         if starts_new_stage and saw_stage:
             stages.append(y)
         if starts_new_stage:
             saw_stage = True
-        y = module(y)
-    stages.append(y)
-    return stages
-
-
-def _pilotnet_stages(net: torch.nn.Sequential, x: torch.Tensor) -> List[torch.Tensor]:
-    stages: List[torch.Tensor] = []
-    y = x
-    saw_conv = False
-    for module in net:
-        if isinstance(module, torch.nn.Conv2d) and saw_conv:
-            stages.append(y)
-        if isinstance(module, torch.nn.Conv2d):
-            saw_conv = True
         y = module(y)
     stages.append(y)
     return stages
@@ -359,26 +355,41 @@ def _compute_feature_map(
     frame_rgb: torch.Tensor,
     previous_frame_rgb: Optional[torch.Tensor],
     layer: FeatureLayer,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    policy_state: Optional[TemporalState] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[TemporalState]]:
     if isinstance(model, DrivingVideoPolicy):
         x, current = _policy_encoder_input(model, frame_rgb, previous_frame_rgb)
         if layer == "motion":
-            return x.abs(), current
-        stages = _pilotnet_stages(model.cnn.conv_layers, x)
+            return x.abs(), current, policy_state
+        stages = _activation_stages(model.spatial_encoder.net, x)
         if layer.startswith("stage"):
             stage_idx = int(layer.removeprefix("stage")) - 1
             if stage_idx < 0 or stage_idx >= len(stages):
-                raise ValueError(f"Policy CNN has {len(stages)} stages; cannot show {layer!r}.")
-            return stages[stage_idx], current
-        if layer == "tokens":
-            return stages[-1], current
+                raise ValueError(f"Policy ConvGRU encoder has {len(stages)} stages; cannot show {layer!r}.")
+            return stages[stage_idx], current, policy_state
         if layer == "spatial":
-            return stages[-1], current
-        raise ValueError(f"Unknown policy CNN layer {layer!r}.")
+            return stages[-1], current, policy_state
+        if layer == "tokens":
+            spatial_feat = stages[-1]
+            if policy_state is not None and policy_state.hidden_state is not None:
+                h_t = policy_state.hidden_state.to(device=spatial_feat.device, dtype=spatial_feat.dtype)
+            else:
+                b, _, hf, wf = spatial_feat.shape
+                h_t = torch.zeros(
+                    b,
+                    int(model.feat_channels),
+                    hf,
+                    wf,
+                    device=spatial_feat.device,
+                    dtype=spatial_feat.dtype,
+                )
+            hidden = model.temporal_rnn(spatial_feat, h_t)
+            return hidden, current, TemporalState(hidden_state=hidden.detach())
+        raise ValueError(f"Unknown policy ConvGRU layer {layer!r}.")
 
     x, current = _inverse_encoder_input(frame_rgb, previous_frame_rgb)
     if layer == "motion":
-        return x[:, 3:6].abs(), current
+        return x[:, 3:6].abs(), current, policy_state
     if layer in ("spatial", "tokens"):
         raise ValueError(f"Inverse dynamics CNN does not have a {layer!r} layer; use motion or stage1-stage4.")
     stages = _activation_stages(model.frame_encoder.net, x)
@@ -386,7 +397,7 @@ def _compute_feature_map(
         stage_idx = int(layer.removeprefix("stage")) - 1
         if stage_idx < 0 or stage_idx >= len(stages):
             raise ValueError(f"Inverse dynamics CNN has {len(stages)} stages; cannot show {layer!r}.")
-        return stages[stage_idx], current
+        return stages[stage_idx], current, policy_state
     raise ValueError(f"Unknown inverse CNN layer {layer!r}.")
 
 
@@ -404,7 +415,8 @@ def _feature_heatmap_for_frame(
     gamma: float = 0.75,
     amp_dtype: torch.dtype = torch.bfloat16,
     use_autocast: bool = True,
-) -> Tuple[np.ndarray, torch.Tensor]:
+    policy_state: Optional[TemporalState] = None,
+) -> Tuple[np.ndarray, torch.Tensor, Optional[TemporalState]]:
     orig_h, orig_w = frame_bgr.shape[:2]
     proc = frame_bgr
     if resize_to is not None and (orig_h != resize_to or orig_w != resize_to):
@@ -417,7 +429,13 @@ def _feature_heatmap_for_frame(
 
     with torch.inference_mode():
         with torch.amp.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_autocast and x.is_cuda):
-            feat, current_frame_rgb = _compute_feature_map(model, x, previous_frame_rgb, layer=layer)
+            feat, current_frame_rgb, policy_state = _compute_feature_map(
+                model,
+                x,
+                previous_frame_rgb,
+                layer=layer,
+                policy_state=policy_state,
+            )
 
     heat = torch.linalg.vector_norm(feat.float(), ord=2, dim=1)[0]
     if robust_norm:
@@ -434,7 +452,7 @@ def _feature_heatmap_for_frame(
 
     heat_np = (heat.detach().cpu().numpy() * 255.0).astype(np.uint8)
     heat_up = cv2.resize(heat_np, (orig_w, orig_h), interpolation=cv2.INTER_CUBIC)
-    return cv2.applyColorMap(heat_up, cv2.COLORMAP_JET), current_frame_rgb.detach()
+    return cv2.applyColorMap(heat_up, cv2.COLORMAP_JET), current_frame_rgb.detach(), policy_state
 
 
 def _default_output_path(input_path: str, layer: str, mode: str, model_kind: LoadedModelKind) -> str:
@@ -503,13 +521,14 @@ def process_video_cnn(
     pbar = tqdm(total=max(0, total_frames), desc=f"CNN vis [{model_kind}] ({layer}, {mode})")
     frame_idx = 0
     previous_frame_rgb: Optional[torch.Tensor] = None
+    policy_state: Optional[TemporalState] = None
     try:
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
 
-            heat_color, previous_frame_rgb = _feature_heatmap_for_frame(
+            heat_color, previous_frame_rgb, policy_state = _feature_heatmap_for_frame(
                 frame,
                 model,
                 device,
@@ -522,6 +541,7 @@ def process_video_cnn(
                 gamma=gamma,
                 amp_dtype=amp_dtype,
                 use_autocast=use_autocast,
+                policy_state=policy_state,
             )
             overlay = cv2.addWeighted(frame, 1.0 - alpha, heat_color, alpha, 0.0)
 
@@ -571,11 +591,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--layer",
-        choices=["motion", "stage1", "stage2", "stage3", "stage4", "stage5", "spatial", "tokens"],
-        default="tokens",
+        choices=["motion", "stage1", "stage2", "stage3", "stage4", "spatial", "tokens"],
+        default="spatial",
         help=(
-            "CNN signal to visualize. Policy checkpoints use masked RGB for motion, stage1-stage5 for "
-            "PilotNet layers, and final conv features for spatial/tokens. Inverse checkpoints support "
+            "CNN signal to visualize. Policy checkpoints use masked RGB for motion, stage1-stage4 for "
+            "the spatial encoder, final spatial features for spatial, and ConvGRU hidden features for tokens. "
+            "Inverse checkpoints support "
             "motion and stage1-stage4."
         ),
     )
