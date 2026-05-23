@@ -284,29 +284,41 @@ class DrivingVideoPolicy(nn.Module):
         return output
 
     def forward_step(self, frame: torch.Tensor, dt: torch.Tensor, state: TemporalState, return_aux: bool = False):
-        # Match signature expected by real-time test loop integration
-        output = self.forward(frame.unsqueeze(1), dt.unsqueeze(1), state)
-        
-        frame_norm = self._normalize_frames(frame)
-        masked_frame = self._apply_masks(frame_norm)
-        
-        spatial_feat = self.spatial_encoder(masked_frame)
-        
-        if state.hidden_state is not None:
-            h_t = state.hidden_state
-        else:
-            b, cf, hf, wf = spatial_feat.shape
-            h_t = torch.zeros(b, self.feat_channels, hf, wf, device=frame.device, dtype=spatial_feat.dtype)
+            b = frame.shape[0]
             
-        new_hidden = self.temporal_rnn(spatial_feat, h_t)
-        
-        new_state = TemporalState(
-            hidden_state=new_hidden.detach(),
-        )
-        
-        squeezed = PolicyOutput(
-            button_logits=output.button_logits[:, 0],
-            horizon_button_logits=output.horizon_button_logits[:, 0],
-            future_button_logits={k: v[:, 0] for k, v in output.future_button_logits.items()},
-        )
-        return squeezed, new_state
+            # 1. Normalize and mask out the car layout exactly once
+            frame_norm = self._normalize_frames(frame)
+            masked_frame = self._apply_masks(frame_norm)
+            
+            # 2. Extract spatial primitives
+            spatial_feat = self.spatial_encoder(masked_frame)
+            cf, hf, wf = spatial_feat.shape[1:]
+            
+            # 3. Evaluate a single temporal rollout transition step
+            if state is not None and state.hidden_state is not None:
+                h_t = state.hidden_state
+            else:
+                h_t = torch.zeros(b, self.feat_channels, hf, wf, device=frame.device, dtype=spatial_feat.dtype)
+                
+            new_hidden = self.temporal_rnn(spatial_feat, h_t)
+            
+            # 4. Map the new hidden states through your 5x5 pooling layout
+            pooled = self.pool(new_hidden)
+            pooled_flat = pooled.reshape(b, -1)
+            
+            fc_out = self.fc_features(pooled_flat)
+            
+            # 5. Project to action space values
+            button = self.button_head(fc_out).reshape(b, self.cfg.prediction_horizon, self.cfg.num_bin)
+            
+            squeezed = PolicyOutput(
+                button_logits=button[:, 0],
+                horizon_button_logits=button,
+                future_button_logits={idx + 1: button[:, idx] for idx in range(self.cfg.prediction_horizon)},
+            )
+            
+            # 6. Detach hidden state to prevent backpropagation graph memory leaks
+            new_state = TemporalState(
+                hidden_state=new_hidden.detach(),
+            )
+            return squeezed, new_state

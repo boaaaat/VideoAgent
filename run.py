@@ -428,7 +428,7 @@ def main() -> None:
     
     # Custom sensitivity optimization overrides (Tweak these variables to adjust turning rules!)
     # w, a, s, d
-    cfg.button_state_thresholds = (0.50, 0.5, 0.5, 0.35)
+    cfg.button_state_thresholds = (0.50, 0.5, 0.4, 0.5)
     RUNTIME_CFG = cfg
 
     model = DrivingVideoPolicy(cfg).to(device)
