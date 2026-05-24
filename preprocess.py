@@ -4,18 +4,18 @@ import subprocess
 from pathlib import Path
 
 # Path to your dataset.
-DATA_ROOT = str(Path(__file__).resolve().parent / "data" / "arc_raiders")
+DATA_ROOT = str(Path(__file__).resolve().parent / "data" / "greenville_test")
 
 # Output resolution (no aspect ratio preserved)
-TARGET_W = 512
-TARGET_H = 512
+TARGET_W = 256
+TARGET_H = 256
 
 # FFmpeg / NVENC settings. H.264 with short GOPs is easier for DALI random
 # window reads than long-GOP HEVC.
 CODEC = "h264_nvenc"
 PRESET = "p5"
 CQ = "23"
-GOP_SIZE = "16"
+GOP_SIZE = "2"
 TEMP_SUFFIX = "_temp"
 FFMPEG = "ffmpeg"      # FFmpeg should be in PATH
 
@@ -53,8 +53,8 @@ def process_video(in_path: str) -> None:
         # NVENC GPU encoder
         "-c:v", CODEC,
         "-preset", PRESET,
-        "-rc", "vbr",
-        "-cq", CQ,
+        "-rc", "constqp",
+        "-qp", CQ,
         "-pix_fmt", "yuv420p",
 
         # Short, simple GOPs make DALI frame-window reads cheaper and more robust.

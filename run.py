@@ -48,12 +48,12 @@ def disable_high_resolution_timer():
 @dataclass
 class RuntimeConfig(ModelConfig):
     ckpt_dir: str = "./checkpoints_rt"
-    ckpt_path: Optional[str] = r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\checkpoints_idm\model_epoch_31_5x5.pt'
+    ckpt_path: Optional[str] = r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\checkpoints_rt\model_latest.pt'
     pos_weight_power: float = 0.5
     pos_weight_clamp: float = 8.0
-    button_threshold_from_pos_weight: bool = False
-    button_threshold_min: float = 0.35  # Lowered to help sensitivity sliders
-    button_threshold_max: float = 0.50
+    button_threshold_from_pos_weight: bool = True
+    button_threshold_min: float = 0.5  # Lowered to help sensitivity sliders
+    button_threshold_max: float = 0.9
     use_checkpoint_button_thresholds: bool = False
 
     decision_interval: float = 1.0 / 20.0
@@ -428,7 +428,7 @@ def main() -> None:
     
     # Custom sensitivity optimization overrides (Tweak these variables to adjust turning rules!)
     # w, a, s, d
-    cfg.button_state_thresholds = (0.50, 0.5, 0.4, 0.5)
+    # cfg.button_state_thresholds = (0.50, 0.5, 0.4, 0.5)
     RUNTIME_CFG = cfg
 
     model = DrivingVideoPolicy(cfg).to(device)

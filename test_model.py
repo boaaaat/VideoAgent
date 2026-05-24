@@ -11,7 +11,7 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
-from models import ActionConditionedVideoPolicy, ModelConfig
+from models import DrivingVideoPolicy, ModelConfig, TemporalState
 
 
 class FFmpegPipeWriter:
@@ -141,17 +141,12 @@ def load_model_checkpoint(
         cfg.mouse_velocity_scales = tuple(float(x) for x in state["mouse_velocity_scales"])
         cfg.__post_init__()
 
-    model = ActionConditionedVideoPolicy(cfg).to(device)
+    model = DrivingVideoPolicy(cfg).to(device)
     load_result = model.load_state_dict(model_state, strict=False)
-    unexpected = [
-        key
-        for key in load_result.unexpected_keys
-        if not key.startswith("mouse_active_head.") and not key.startswith("mouse_delta_head.")
-    ]
-    if load_result.missing_keys or unexpected:
+    if load_result.missing_keys or load_result.unexpected_keys:
         raise RuntimeError(
             "Checkpoint does not match the current policy model. "
-            f"missing={load_result.missing_keys} unexpected={unexpected}"
+            f"missing={load_result.missing_keys} unexpected={load_result.unexpected_keys}"
         )
     model.eval()
     return model, cfg, config_dict
@@ -165,7 +160,7 @@ def load_ground_truth(csv_path: str, cfg: ModelConfig, total_frames: int) -> Dic
     with open(csv_path, "r", newline="", encoding="utf-8") as file_obj:
         reader = csv.DictReader(file_obj)
         fieldnames = set(reader.fieldnames or [])
-        required = ["timestamp", *list(cfg.key_names), *list(cfg.mouse_button_names), "delta_x", "delta_y"]
+        required = ["timestamp", *list(cfg.key_names), *list(cfg.mouse_button_names)]
         missing = [name for name in required if name not in fieldnames]
         if missing:
             raise RuntimeError(f"CSV schema mismatch for {csv_path}: missing columns={missing}")
@@ -206,6 +201,28 @@ def _resolve_thresholds(cfg: ModelConfig, threshold: Optional[float]) -> np.ndar
     return np.asarray(list(cfg.button_state_thresholds), dtype=np.float32)
 
 
+def _resolve_change_thresholds(
+    cfg: ModelConfig,
+    threshold: Optional[float],
+    raw_config: Optional[Dict[str, object]] = None,
+) -> np.ndarray:
+    if threshold is not None:
+        return np.full((cfg.num_bin,), float(threshold), dtype=np.float32)
+    raw_config = raw_config or {}
+    values = raw_config.get("change_thresholds")
+    if values is not None:
+        try:
+            thresholds = np.asarray(list(values), dtype=np.float32)
+            if thresholds.shape == (cfg.num_bin,):
+                return np.clip(thresholds, 0.0, 1.0).astype(np.float32)
+        except TypeError:
+            pass
+    base_threshold = raw_config.get("change_threshold", 0.5)
+    if base_threshold is None:
+        base_threshold = 0.5
+    return np.full((cfg.num_bin,), float(base_threshold), dtype=np.float32)
+
+
 def infer_video(
     video_path: str,
     model: torch.nn.Module,
@@ -215,6 +232,7 @@ def infer_video(
     *,
     command_horizon: int,
     action_label_offset: int,
+    change_thresholds: np.ndarray,
     max_frames: Optional[int],
     use_autocast: bool,
     inference_dtype: torch.dtype,
@@ -232,17 +250,21 @@ def infer_video(
 
     predictions = {
         "button_logits": np.zeros((total_frames, cfg.num_bin), dtype=np.float32),
-        "press_logits": np.zeros((total_frames, cfg.num_bin), dtype=np.float32),
-        "release_logits": np.zeros((total_frames, cfg.num_bin), dtype=np.float32),
-        "mouse_active_logits": np.zeros((total_frames, 1), dtype=np.float32),
-        "mouse_delta": np.zeros((total_frames, 2), dtype=np.float32),
+        "change_logits": np.zeros((total_frames, cfg.num_bin), dtype=np.float32),
+        "button_state": np.zeros((total_frames, cfg.num_bin), dtype=np.float32),
         "source_frame": np.full((total_frames,), -1, dtype=np.int32),
         "valid_mask": np.zeros((total_frames,), dtype=bool),
     }
 
-    state = model.init_state(batch_size=1, device=device, dtype=inference_dtype)
+    state = TemporalState()
+    prev_action = torch.zeros((1, cfg.num_bin), device=device, dtype=inference_dtype)
     h_idx = max(0, min(int(command_horizon) - 1, int(cfg.prediction_horizon) - 1))
     target_offset = h_idx + 1 + int(action_label_offset)
+    change_threshold_tensor = torch.tensor(
+        list(change_thresholds),
+        device=device,
+        dtype=torch.float32,
+    )
 
     try:
         pbar = tqdm(total=total_frames, desc="Infer", unit="frame")
@@ -261,15 +283,22 @@ def infer_video(
 
             with torch.inference_mode():
                 with torch.amp.autocast(device_type=device.type, dtype=inference_dtype, enabled=use_autocast):
-                    output, state = model.forward_step(frame, dt, state)
+                    output, state = model.forward_step(frame, dt, state, prev_action=prev_action)
+                    if output.change_logits is None:
+                        raise RuntimeError("Current DrivingVideoPolicy checkpoints must return change_logits.")
+                    change_pred = torch.sigmoid(output.change_logits.float()) >= change_threshold_tensor.view(1, -1)
+                    predicted_action = torch.where(
+                        change_pred,
+                        1.0 - prev_action.to(dtype=output.change_logits.dtype),
+                        prev_action.to(dtype=output.change_logits.dtype),
+                    )
+                    prev_action = predicted_action.detach().to(dtype=inference_dtype)
 
             target_idx = source_idx + target_offset
             if 0 <= target_idx < total_frames:
                 predictions["button_logits"][target_idx] = output.horizon_button_logits[0, h_idx].detach().cpu().float().numpy()
-                predictions["press_logits"][target_idx] = output.horizon_press_logits[0, h_idx].detach().cpu().float().numpy()
-                predictions["release_logits"][target_idx] = output.horizon_release_logits[0, h_idx].detach().cpu().float().numpy()
-                predictions["mouse_active_logits"][target_idx] = output.horizon_mouse_active_logits[0, h_idx].detach().cpu().float().numpy()
-                predictions["mouse_delta"][target_idx] = output.horizon_mouse_delta[0, h_idx].detach().cpu().float().numpy()
+                predictions["change_logits"][target_idx] = output.change_logits[0].detach().cpu().float().numpy()
+                predictions["button_state"][target_idx] = predicted_action[0].detach().cpu().float().numpy()
                 predictions["source_frame"][target_idx] = source_idx
                 predictions["valid_mask"][target_idx] = True
             pbar.update(1)
@@ -287,9 +316,16 @@ def compute_summary_stats(
 ) -> Dict[str, float]:
     valid = predictions["valid_mask"].astype(bool) & gt["valid_mask"].astype(bool)
     if not bool(valid.any()):
-        return {"accuracy": 0.0, "macro_f1": 0.0, "precision": 0.0, "recall": 0.0, "mouse_mae": 0.0}
+        return {
+            "accuracy": 0.0,
+            "macro_f1": 0.0,
+            "precision": 0.0,
+            "recall": 0.0,
+            "state_head_accuracy": 0.0,
+            "state_head_macro_f1": 0.0,
+        }
 
-    pred = (sigmoid_np(predictions["button_logits"][valid]) >= thresholds.reshape(1, -1)).astype(np.float32)
+    pred = (predictions["button_state"][valid] >= 0.5).astype(np.float32)
     true = gt["button_state"][valid].astype(np.float32)
     tp = (pred * true).sum(axis=0)
     tn = ((1.0 - pred) * (1.0 - true)).sum(axis=0)
@@ -308,13 +344,27 @@ def compute_summary_stats(
         mean_precision = 0.0
         mean_recall = 0.0
     accuracy = float((tp + tn).sum() / np.maximum(tp + tn + fp + fn, 1.0).sum())
-    mouse_mae = float(np.abs(predictions["mouse_delta"][valid] - gt["mouse_delta"][valid]).mean())
+
+    state_head_pred = (sigmoid_np(predictions["button_logits"][valid]) >= thresholds.reshape(1, -1)).astype(np.float32)
+    state_tp = (state_head_pred * true).sum(axis=0)
+    state_tn = ((1.0 - state_head_pred) * (1.0 - true)).sum(axis=0)
+    state_fp = (state_head_pred * (1.0 - true)).sum(axis=0)
+    state_fn = ((1.0 - state_head_pred) * true).sum(axis=0)
+    state_precision = state_tp / np.maximum(state_tp + state_fp, 1.0)
+    state_recall = state_tp / np.maximum(state_tp + state_fn, 1.0)
+    state_f1 = (2.0 * state_precision * state_recall) / np.maximum(state_precision + state_recall, 1e-8)
+    state_measured = (state_tp + state_fn + state_tp + state_fp) > 0.0
+    state_macro_f1 = float(state_f1[state_measured].mean()) if bool(state_measured.any()) else 0.0
+    state_accuracy = float(
+        (state_tp + state_tn).sum() / np.maximum(state_tp + state_tn + state_fp + state_fn, 1.0).sum()
+    )
     return {
         "accuracy": accuracy,
         "macro_f1": macro_f1,
         "precision": mean_precision,
         "recall": mean_recall,
-        "mouse_mae": mouse_mae,
+        "state_head_accuracy": state_accuracy,
+        "state_head_macro_f1": state_macro_f1,
     }
 
 
@@ -322,12 +372,11 @@ def compute_per_button_stats(
     predictions: Dict[str, np.ndarray],
     gt: Dict[str, np.ndarray],
     names: Sequence[str],
-    thresholds: np.ndarray,
 ) -> List[Dict[str, float | int | str]]:
     valid = predictions["valid_mask"].astype(bool) & gt["valid_mask"].astype(bool)
     if not bool(valid.any()):
         return []
-    pred = (sigmoid_np(predictions["button_logits"][valid]) >= thresholds.reshape(1, -1)).astype(np.float32)
+    pred = (predictions["button_state"][valid] >= 0.5).astype(np.float32)
     true = gt["button_state"][valid].astype(np.float32)
     items: List[Dict[str, float | int | str]] = []
     for idx, name in enumerate(names):
@@ -378,9 +427,11 @@ def _draw_key_rows(
     y: int,
     names: Sequence[str],
     probs: np.ndarray,
+    change_probs: np.ndarray,
     pred_state: np.ndarray,
     true_state: np.ndarray,
     thresholds: np.ndarray,
+    change_thresholds: np.ndarray,
 ) -> int:
     for idx, name in enumerate(names):
         pred_on = bool(pred_state[idx])
@@ -399,7 +450,8 @@ def _draw_key_rows(
             status = "off"
         y = _put_text(
             panel,
-            f"{name:>6s}  p={float(probs[idx]):.3f}  t={float(thresholds[idx]):.2f}  gt={int(true_on)}  {status}",
+            f"{name:>6s}  state={float(probs[idx]):.3f}/{float(thresholds[idx]):.2f}  "
+            f"chg={float(change_probs[idx]):.3f}/{float(change_thresholds[idx]):.2f}  gt={int(true_on)}  {status}",
             x,
             y,
             color=color,
@@ -416,6 +468,7 @@ def draw_overlay_frame(
     cfg: ModelConfig,
     names: Sequence[str],
     thresholds: np.ndarray,
+    change_thresholds: np.ndarray,
     summary: Dict[str, float],
     command_horizon: int,
     action_label_offset: int,
@@ -431,10 +484,9 @@ def draw_overlay_frame(
     panel[:] = (18, 20, 24)
 
     probs = sigmoid_np(predictions["button_logits"][frame_idx])
-    pred_state = probs >= thresholds
+    change_probs = sigmoid_np(predictions["change_logits"][frame_idx])
+    pred_state = predictions["button_state"][frame_idx] >= 0.5
     true_state = gt["button_state"][frame_idx].astype(bool)
-    gt_mouse = gt["mouse_delta"][frame_idx]
-    pred_mouse = predictions["mouse_delta"][frame_idx]
     source_idx = int(predictions["source_frame"][frame_idx])
 
     x = 18
@@ -458,19 +510,20 @@ def draw_overlay_frame(
     y = _put_text(panel, "Run metrics", x, y, color=(255, 230, 170), scale=0.6, thickness=2)
     y = _put_text(
         panel,
-        f"acc={summary['accuracy']:.3f} f1={summary['macro_f1']:.3f} "
+        f"control acc={summary['accuracy']:.3f} f1={summary['macro_f1']:.3f} "
         f"P={summary['precision']:.3f} R={summary['recall']:.3f}",
         x,
         y,
     )
-    y = _put_text(panel, f"mouse MAE={summary['mouse_mae']:.2f}px", x, y)
+    y = _put_text(
+        panel,
+        f"state-head acc={summary['state_head_accuracy']:.3f} f1={summary['state_head_macro_f1']:.3f}",
+        x,
+        y,
+    )
     y += 10
-    y = _put_text(panel, "Keys", x, y, color=(180, 255, 180), scale=0.6, thickness=2)
-    y = _draw_key_rows(panel, x, y, names, probs, pred_state, true_state, thresholds)
-    y += 10
-    y = _put_text(panel, "Mouse", x, y, color=(180, 220, 255), scale=0.6, thickness=2)
-    y = _put_text(panel, f"pred dx={pred_mouse[0]:.2f} dy={pred_mouse[1]:.2f}", x, y)
-    y = _put_text(panel, f"gt   dx={gt_mouse[0]:.2f} dy={gt_mouse[1]:.2f}", x, y)
+    y = _put_text(panel, "Actions", x, y, color=(180, 255, 180), scale=0.6, thickness=2)
+    y = _draw_key_rows(panel, x, y, names, probs, change_probs, pred_state, true_state, thresholds, change_thresholds)
 
     wrong = pred_state != true_state
     if bool(wrong.any()):
@@ -491,6 +544,7 @@ def write_overlay_video(
     cfg: ModelConfig,
     *,
     thresholds: np.ndarray,
+    change_thresholds: np.ndarray,
     command_horizon: int,
     action_label_offset: int,
     max_frames: Optional[int],
@@ -544,6 +598,7 @@ def write_overlay_video(
                 cfg=cfg,
                 names=names,
                 thresholds=thresholds,
+                change_thresholds=change_thresholds,
                 summary=summary,
                 command_horizon=command_horizon,
                 action_label_offset=action_label_offset,
@@ -565,15 +620,19 @@ def print_final_stats(
 ) -> None:
     summary = compute_summary_stats(predictions, gt, thresholds)
     names = list(cfg.key_names) + list(cfg.mouse_button_names)
-    per_key = compute_per_button_stats(predictions, gt, names, thresholds)
+    per_key = compute_per_button_stats(predictions, gt, names)
     print("\nPolicy test stats")
     print(
-        "Overall:",
+        "Control:",
         f"acc={summary['accuracy']:.4f}",
         f"macro_f1={summary['macro_f1']:.4f}",
         f"precision={summary['precision']:.4f}",
         f"recall={summary['recall']:.4f}",
-        f"mouse_mae={summary['mouse_mae']:.3f}px",
+    )
+    print(
+        "State head:",
+        f"acc={summary['state_head_accuracy']:.4f}",
+        f"macro_f1={summary['state_head_macro_f1']:.4f}",
     )
     print("Per key/button:")
     print("  name       acc     f1    prec    rec  support  pred  tp  fp  fn")
@@ -596,15 +655,16 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Overlay policy predictions vs CSV ground truth on a dataset video.")
     parser.add_argument("--checkpoint", default=None, help="Path to policy checkpoint. Defaults to ckpt dir best/latest.")
     parser.add_argument("--ckpt-dir", default="./checkpoints_rt", help="Checkpoint directory used when --checkpoint is omitted.")
-    parser.add_argument("--video", default=None, help="Input dataset video. Defaults to the first run_*.mp4 in --data-root.")
+    parser.add_argument("--video", default=r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\data\greenville\run_20260521_182038.mp4', help="Input dataset video. Defaults to the first run_*.mp4 in --data-root.")
     parser.add_argument("--labels", default=None, help="Ground-truth CSV. Defaults to the video path with .csv extension.")
     parser.add_argument("--data-root", default="./data/greenville", help="Dataset root used when --video is omitted.")
     parser.add_argument("--output", default="./data/test_model.mp4", help="Output annotated MP4 path.")
     parser.add_argument("--command-horizon", type=int, default=1, help="1-based horizon index to visualize.")
     parser.add_argument("--action-label-offset", type=int, default=None, help="Override checkpoint action_label_offset.")
     parser.add_argument("--threshold", type=float, default=None, help="Override button threshold. Defaults to checkpoint thresholds.")
+    parser.add_argument("--change-threshold", type=float, default=None, help="Override change-head threshold. Defaults to checkpoint value or 0.5.")
     parser.add_argument("--max-frames", type=int, default=None, help="Optional frame limit for quick tests.")
-    parser.add_argument("--panel-width", type=int, default=560, help="Width of the side stats panel.")
+    parser.add_argument("--panel-width", type=int, default=720, help="Width of the side stats panel.")
     parser.add_argument("--cpu", action="store_true", help="Force CPU inference.")
     parser.add_argument("--use-checkpoint-thresholds", action="store_true", help="Use saved button thresholds if present.")
     parser.add_argument("--ffmpeg-path", default=None, help="Optional explicit ffmpeg path.")
@@ -641,13 +701,13 @@ def main() -> None:
 
     gt = load_ground_truth(label_path, cfg, total_frames)
     thresholds = _resolve_thresholds(cfg, args.threshold)
+    change_thresholds = _resolve_change_thresholds(cfg, args.change_threshold, raw_config)
     print(
         "Loaded policy:",
         f"checkpoint={checkpoint_path}",
         f"video={video_path}",
         f"game={cfg.selected_game}",
-        "temporal=attention",
-        f"heads={cfg.temporal_heads}",
+        "temporal=convgru",
         f"seq={cfg.seq_len}",
         f"horizon={cfg.prediction_horizon}",
         f"command_horizon={args.command_horizon}",
@@ -664,6 +724,7 @@ def main() -> None:
         device,
         command_horizon=int(args.command_horizon),
         action_label_offset=action_label_offset,
+        change_thresholds=change_thresholds,
         max_frames=args.max_frames,
         use_autocast=use_autocast,
         inference_dtype=inference_dtype,
@@ -675,10 +736,11 @@ def main() -> None:
         gt,
         cfg,
         thresholds=thresholds,
+        change_thresholds=change_thresholds,
         command_horizon=int(args.command_horizon),
         action_label_offset=action_label_offset,
         max_frames=args.max_frames,
-        panel_width=max(360, int(args.panel_width)),
+        panel_width=max(520, int(args.panel_width)),
         ffmpeg_path=args.ffmpeg_path,
         codec=str(args.output_codec),
         quality=int(args.output_quality),

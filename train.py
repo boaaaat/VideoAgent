@@ -38,12 +38,12 @@ class TrainConfig(ModelConfig):
     batch_size: int = 4
     target_effective_batch: int = 32
     grad_accum: int = 8
-    num_epochs: int = 40
+    num_epochs: int = 100
 
-    lr: float = 2e-4
+    lr: float = 3e-4
     min_lr: float = 1e-5
-    warmup_steps: int = 300
-    weight_decay: float = 0.05
+    warmup_steps: int = 50
+    weight_decay: float = 0.01
     grad_clip: float = 1.0
 
     amp_dtype: str = "bf16"
@@ -54,9 +54,9 @@ class TrainConfig(ModelConfig):
     split_seed: int = 1337
     pos_weight_power: float = 0.5
     pos_weight_clamp: float = 8
-    button_threshold_from_pos_weight: bool = False
+    button_threshold_from_pos_weight: bool = True
     button_threshold_min: float = 0.5
-    button_threshold_max: float = 0.5
+    button_threshold_max: float = 0.9
 
     button_loss_weight: float = 1.0
     button_focal_gamma: float = 2.0
@@ -73,7 +73,7 @@ class TrainConfig(ModelConfig):
     aug_edges_crop_prob: float = 0.0
     aug_edges_crop_min_frac: float = 0.0
     aug_edges_crop_max_frac: float = 0.0
-    aug_cutout_prob: float = 0.10
+    aug_cutout_prob: float = 0.0
     aug_cutout_min_frac: float = 0.04
     aug_cutout_max_frac: float = 0.10
     aug_cutout_count: int = 1

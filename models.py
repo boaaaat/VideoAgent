@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -11,6 +11,17 @@ from action_space import (
     normalize_game_name,
     selected_game as ACTION_SELECTED_GAME,
 )
+
+
+CNN_FEATURE_CHANNELS = 64
+
+
+def _largest_valid_head_count(channels: int, requested_heads: int) -> int:
+    requested_heads = max(1, min(int(requested_heads), int(channels)))
+    for heads in range(requested_heads, 0, -1):
+        if channels % heads == 0:
+            return heads
+    return 1
 
 
 @dataclass
@@ -33,7 +44,8 @@ class ModelConfig:
     d_model: int = 192
     dropout: float = 0.10
 
-    pooling = (5, 5)
+    pooling: Tuple[int, int] = (5, 5)
+    pool_heads: int = 4
 
     button_state_threshold: float = 0.5
     button_state_thresholds: Optional[Sequence[float]] = None
@@ -53,6 +65,9 @@ class ModelConfig:
 
         self.d_model = max(64, int(self.d_model))
         self.dropout = float(min(max(self.dropout, 0.0), 0.9))
+        pool_h, pool_w = self.pooling
+        self.pooling = (max(1, int(pool_h)), max(1, int(pool_w)))
+        self.pool_heads = _largest_valid_head_count(CNN_FEATURE_CHANNELS, int(self.pool_heads))
 
         if self.key_names is None:
             self.key_names = get_key_names(self.selected_game)
@@ -111,7 +126,7 @@ class ResBlock(nn.Module):
 class CustomSpatialEncoder(nn.Module):
     """
     Downsamples the screen while embedding strong spatial features.
-    Outputs a feature map scale of (Batch, 48, H/16, W/16).
+    Outputs a feature map scale of (Batch, 64, H/16, W/16).
     """
     def __init__(self, in_channels: int = 3, dropout: float = 0.2):
         super().__init__()
@@ -130,9 +145,10 @@ class CustomSpatialEncoder(nn.Module):
             nn.ELU(inplace=True),
             ResBlock(48, dropout),
             
-            nn.Conv2d(48, 48, kernel_size=3, stride=2, padding=1, bias=False),          # /16
-            nn.BatchNorm2d(48),
-            nn.ELU(inplace=True)
+            nn.Conv2d(48, 64, kernel_size=3, stride=2, padding=1, bias=False),          # /16
+            nn.BatchNorm2d(64),
+            nn.ELU(inplace=True),
+            ResBlock(64, dropout)
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -180,6 +196,43 @@ class ConvGRUCell(nn.Module):
         return h_next
 
 
+class LearnedMultiHeadSpatialPool2d(nn.Module):
+    """
+    Learns spatial attention pools while preserving an AdaptiveAvgPool2d-style output shape.
+    """
+    def __init__(self, channels: int, output_size: Sequence[int], num_heads: int):
+        super().__init__()
+        output_h, output_w = output_size
+        self.channels = int(channels)
+        self.output_size = (max(1, int(output_h)), max(1, int(output_w)))
+        self.num_heads = _largest_valid_head_count(self.channels, int(num_heads))
+        self.head_dim = self.channels // self.num_heads
+        self.num_slots = self.output_size[0] * self.output_size[1]
+
+        self.attn_logits = nn.Conv2d(
+            self.channels,
+            self.num_heads * self.num_slots,
+            kernel_size=1,
+            bias=True,
+        )
+        nn.init.zeros_(self.attn_logits.weight)
+        nn.init.zeros_(self.attn_logits.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, spatial_h, spatial_w = x.shape
+        if c != self.channels:
+            raise ValueError(f"Expected {self.channels} channels, got {c}.")
+
+        spatial_size = spatial_h * spatial_w
+        logits = self.attn_logits(x).reshape(b, self.num_heads, self.num_slots, spatial_size)
+        weights = torch.softmax(logits, dim=-1)
+
+        values = x.reshape(b, self.num_heads, self.head_dim, spatial_size)
+        pooled = torch.einsum("bhsn,bhdn->bhsd", weights, values)
+        pooled = pooled.permute(0, 1, 3, 2).reshape(b, c, self.output_size[0], self.output_size[1])
+        return pooled
+
+
 class DrivingVideoPolicy(nn.Module):
     def __init__(self, cfg: ModelConfig):
         super().__init__()
@@ -194,11 +247,11 @@ class DrivingVideoPolicy(nn.Module):
         self.spatial_encoder = CustomSpatialEncoder(in_channels=3, dropout=cfg.dropout)
         
         # ConvGRU tracking state
-        self.feat_channels = 48
+        self.feat_channels = CNN_FEATURE_CHANNELS
         self.temporal_rnn = ConvGRUCell(input_dim=self.feat_channels, hidden_dim=self.feat_channels, kernel_size=3)
         
-        # Retain your custom 6x3 pooling layout for driving horizon bias
-        self.pool = nn.AdaptiveAvgPool2d(cfg.pooling)
+        # Learned multi-head pooling retains the configured spatial output layout for the classifier.
+        self.pool = LearnedMultiHeadSpatialPool2d(self.feat_channels, cfg.pooling, cfg.pool_heads)
         
         self.fc_features = nn.Sequential(
             nn.Linear(self.feat_channels * cfg.pooling[0] * cfg.pooling[1], self.cfg.d_model),
