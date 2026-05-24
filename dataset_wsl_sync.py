@@ -31,9 +31,11 @@ class SyncStats:
     files_seen: int = 0
     unchanged: int = 0
     copied: int = 0
+    moved: int = 0
     metadata_refreshed: int = 0
     deleted: int = 0
     bytes_copied: int = 0
+    bytes_moved: int = 0
 
 
 def find_run_pairs(data_root: Path, video_ext: str, csv_ext: str, max_videos: Optional[int]) -> List[Tuple[Path, Path]]:
@@ -89,12 +91,23 @@ def copy_file(source_path: Path, target_path: Path) -> int:
     return int(source_path.stat().st_size)
 
 
+def move_file(source_path: Path, target_path: Path) -> int:
+    bytes_moved = copy_file(source_path, target_path)
+    source_path.unlink()
+    return bytes_moved
+
+
+def feature_path_for_video(video_path: Path, feature_suffix: str) -> Path:
+    return video_path.with_name(f"{video_path.stem}{feature_suffix}")
+
+
 def sync_dataset(
     *,
     source_root: Path,
     target_root: Path,
     video_ext: str,
     csv_ext: str,
+    feature_suffix: str,
     max_videos: Optional[int],
     delete_stale: bool,
     hash_same_size: bool,
@@ -110,33 +123,50 @@ def sync_dataset(
         pass
 
     pairs = find_run_pairs(source_root, video_ext, csv_ext, max_videos)
-    files_to_sync: List[Tuple[Path, Path]] = []
+    files_to_sync: List[Tuple[Path, Path, bool]] = []
     expected_targets = set()
+    should_sync_features = bool(feature_suffix)
 
     for video_path, csv_path in pairs:
         for source_path in (video_path, csv_path):
             target_path = target_root / source_path.name
-            files_to_sync.append((source_path, target_path))
+            files_to_sync.append((source_path, target_path, False))
             expected_targets.add(target_path)
+        if should_sync_features:
+            source_feature_path = feature_path_for_video(video_path, feature_suffix)
+            target_feature_path = target_root / source_feature_path.name
+            expected_targets.add(target_feature_path)
+            if source_feature_path.exists():
+                files_to_sync.append((source_feature_path, target_feature_path, True))
 
     stats = SyncStats(files_seen=len(files_to_sync))
     desc = f"Syncing {source_root} -> {target_root}"
-    for source_path, target_path in tqdm(files_to_sync, desc=desc, unit="file", dynamic_ncols=True):
+    for source_path, target_path, move_source in tqdm(files_to_sync, desc=desc, unit="file", dynamic_ncols=True):
         if files_are_same(source_path, target_path, hash_same_size=hash_same_size):
             if target_path.exists() and source_path.stat().st_mtime_ns != target_path.stat().st_mtime_ns:
                 stats.metadata_refreshed += 1
                 if not dry_run:
                     shutil.copystat(source_path, target_path)
+            if move_source and not dry_run:
+                source_path.unlink()
             stats.unchanged += 1
             continue
 
-        stats.copied += 1
-        stats.bytes_copied += int(source_path.stat().st_size)
+        byte_count = int(source_path.stat().st_size)
+        if move_source:
+            stats.moved += 1
+            stats.bytes_moved += byte_count
+        else:
+            stats.copied += 1
+            stats.bytes_copied += byte_count
         if not dry_run:
-            copy_file(source_path, target_path)
+            if move_source:
+                move_file(source_path, target_path)
+            else:
+                copy_file(source_path, target_path)
 
     if delete_stale and target_root.exists():
-        stale_paths = stale_cached_paths(target_root, video_ext, csv_ext, expected_targets)
+        stale_paths = stale_cached_paths(target_root, video_ext, csv_ext, feature_suffix, expected_targets)
         for stale_path in stale_paths:
             stats.deleted += 1
             if not dry_run:
@@ -151,6 +181,7 @@ def sync_dataset_for_training(
     target_root: Optional[str],
     video_ext: str,
     csv_ext: str,
+    feature_suffix: str = "_features.pt",
     max_videos: Optional[int] = None,
     delete_stale: Optional[bool] = None,
     hash_same_size: bool = True,
@@ -173,6 +204,7 @@ def sync_dataset_for_training(
         target_root=cache_root,
         video_ext=video_ext,
         csv_ext=csv_ext,
+        feature_suffix=feature_suffix,
         max_videos=max_videos,
         delete_stale=bool(should_delete_stale),
         hash_same_size=bool(hash_same_size),
@@ -184,23 +216,39 @@ def sync_dataset_for_training(
     print(f"  target={cache_root.resolve()}")
     print(
         "  "
-        f"files={stats.files_seen} unchanged={stats.unchanged} copied={stats.copied} "
+        f"files={stats.files_seen} unchanged={stats.unchanged} copied={stats.copied} moved={stats.moved} "
         f"metadata_refreshed={stats.metadata_refreshed} deleted_stale={stats.deleted}"
     )
     return str(cache_root)
 
 
-def stale_cached_paths(target_root: Path, video_ext: str, csv_ext: str, expected_targets: Sequence[Path]) -> List[Path]:
+def stale_cached_paths(
+    target_root: Path,
+    video_ext: str,
+    csv_ext: str,
+    feature_suffix: str,
+    expected_targets: Sequence[Path],
+) -> List[Path]:
     expected = {path.resolve() for path in expected_targets}
     stale: List[Path] = []
     patterns = [f"run_*{video_ext}"]
     if csv_ext != video_ext:
         patterns.append(f"run_*{csv_ext}")
+    if feature_suffix:
+        patterns.append(f"run_*{feature_suffix}")
 
     for pattern in patterns:
         for path in target_root.glob(pattern):
-            if path.is_file() and path.resolve() not in expected:
+            if not path.is_file():
+                continue
+            resolved = path.resolve()
+            if resolved not in expected:
                 stale.append(path)
+                continue
+            if feature_suffix and path.name.endswith(feature_suffix):
+                video_name = f"{path.name[:-len(feature_suffix)]}{video_ext}"
+                if not (target_root / video_name).exists():
+                    stale.append(path)
 
     return sorted(set(stale))
 
@@ -221,6 +269,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--video-ext", default=".mp4")
     parser.add_argument("--csv-ext", default=".csv")
+    parser.add_argument(
+        "--feature-suffix",
+        default="_features.pt",
+        help="Feature cache suffix to move with each run. Use an empty string to disable feature-cache syncing.",
+    )
     parser.add_argument("--max-videos", type=int, default=None)
     parser.add_argument(
         "--delete-stale",
@@ -248,6 +301,7 @@ def main() -> None:
         target_root=target_root,
         video_ext=args.video_ext,
         csv_ext=args.csv_ext,
+        feature_suffix=str(args.feature_suffix),
         max_videos=args.max_videos,
         delete_stale=bool(delete_stale),
         hash_same_size=bool(args.hash_same_size),
@@ -260,9 +314,11 @@ def main() -> None:
     print(f"  files_seen={stats.files_seen}")
     print(f"  unchanged={stats.unchanged}")
     print(f"  copied={stats.copied}")
+    print(f"  moved={stats.moved}")
     print(f"  metadata_refreshed={stats.metadata_refreshed}")
     print(f"  deleted_stale={stats.deleted}")
     print(f"  bytes_copied={stats.bytes_copied}")
+    print(f"  bytes_moved={stats.bytes_moved}")
     print(f"\nUse this for training/benchmarking: --data-root {target_root}")
 
 

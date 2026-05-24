@@ -3,6 +3,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
+from torchvision import models as tv_models
 
 from action_space import (
     game_data_root,
@@ -13,7 +14,7 @@ from action_space import (
 )
 
 
-CNN_FEATURE_CHANNELS = 64
+CNN_FEATURE_CHANNELS = 48
 
 
 def _largest_valid_head_count(channels: int, requested_heads: int) -> int:
@@ -155,6 +156,69 @@ class CustomSpatialEncoder(nn.Module):
         return self.net(x)
 
 
+class PretrainedSpatialEncoder(nn.Module):
+    """
+    Frozen ResNet18 spatial backbone with a trainable 1x1 channel compressor.
+    Outputs a feature map scale of (Batch, out_channels, H/32, W/32).
+    """
+    def __init__(self, out_channels: int = CNN_FEATURE_CHANNELS):
+        super().__init__()
+        weights = None
+        try:
+            weights = tv_models.ResNet18_Weights.DEFAULT
+            backbone = tv_models.resnet18(weights=weights)
+        except AttributeError:
+            backbone = tv_models.resnet18(pretrained=True)
+
+        self.features = nn.Sequential(*list(backbone.children())[:-2])
+        for param in self.features.parameters():
+            param.requires_grad = False
+        self.features.eval()
+
+        if weights is not None:
+            mean = torch.tensor(weights.transforms().mean, dtype=torch.float32).view(1, 3, 1, 1)
+            std = torch.tensor(weights.transforms().std, dtype=torch.float32).view(1, 3, 1, 1)
+        else:
+            mean = torch.tensor((0.485, 0.456, 0.406), dtype=torch.float32).view(1, 3, 1, 1)
+            std = torch.tensor((0.229, 0.224, 0.225), dtype=torch.float32).view(1, 3, 1, 1)
+        self.register_buffer("imagenet_mean", mean, persistent=False)
+        self.register_buffer("imagenet_std", std, persistent=False)
+
+        self.channel_compressor = nn.Conv2d(512, out_channels, kernel_size=1)
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self.features.eval()
+        return self
+
+    def _normalize_for_backbone(self, x: torch.Tensor) -> torch.Tensor:
+        mean = self.imagenet_mean.to(device=x.device, dtype=x.dtype)
+        std = self.imagenet_std.to(device=x.device, dtype=x.dtype)
+        return (x - mean) / std
+
+    def extract_backbone_features(self, x: torch.Tensor) -> torch.Tensor:
+        x = self._normalize_for_backbone(x)
+        with torch.no_grad():
+            return self.features(x)
+
+    def backbone_stages(self, x: torch.Tensor) -> List[torch.Tensor]:
+        x = self._normalize_for_backbone(x)
+        with torch.no_grad():
+            y = x
+            stem_end_idx = 4
+            stages: List[torch.Tensor] = []
+            for idx, module in enumerate(self.features):
+                y = module(y)
+                if idx == stem_end_idx or idx > stem_end_idx:
+                    stages.append(y)
+        stages.append(self.channel_compressor(stages[-1]))
+        return stages
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        feat = self.extract_backbone_features(x)
+        return self.channel_compressor(feat)
+
+
 class ConvGRUCell(nn.Module):
     """
     A GRU cell that replaces standard Linear matrix multiplications with Conv2d loops,
@@ -244,7 +308,7 @@ class DrivingVideoPolicy(nn.Module):
         self.car_x_min_pct = 0.40
         self.car_x_max_pct = 0.60
         
-        self.spatial_encoder = CustomSpatialEncoder(in_channels=3, dropout=cfg.dropout)
+        self.spatial_encoder = PretrainedSpatialEncoder(out_channels=CNN_FEATURE_CHANNELS)
         
         # ConvGRU tracking state
         self.feat_channels = CNN_FEATURE_CHANNELS
@@ -292,7 +356,76 @@ class DrivingVideoPolicy(nn.Module):
 
         return masked_frames
 
-    def forward(self, frames: torch.Tensor, dt: torch.Tensor, state: Optional[TemporalState] = None, return_aux: bool = False):
+    def _forward_spatial_features(
+        self,
+        spatial_feats: torch.Tensor,
+        dt: torch.Tensor,
+        state: Optional[TemporalState] = None,
+        return_aux: bool = False,
+    ) -> PolicyOutput:
+        del dt, return_aux
+        b, t, cf, hf, wf = spatial_feats.shape
+        if cf != self.feat_channels:
+            raise ValueError(f"Expected {self.feat_channels} spatial channels, got {cf}.")
+
+        # 2. Temporal ConvGRU Rollout Loop
+        if state is not None and state.hidden_state is not None:
+            h_t = state.hidden_state
+        else:
+            h_t = torch.zeros(b, self.feat_channels, hf, wf, device=spatial_feats.device, dtype=spatial_feats.dtype)
+
+        temporal_outputs = []
+        for step in range(t):
+            h_t = self.temporal_rnn(spatial_feats[:, step], h_t)
+            temporal_outputs.append(h_t.unsqueeze(1))
+
+        temporal_out = torch.cat(temporal_outputs, dim=1)  # [B, T, C_feat, H_feat, W_feat]
+
+        # 3. Linear Downsampling for Classifier Heads
+        temporal_flat = temporal_out.reshape(b * t, cf, hf, wf)
+        pooled = self.pool(temporal_flat)
+        pooled_flat = pooled.reshape(pooled.shape[0], -1)
+
+        fc_out = self.fc_features(pooled_flat)
+        fc_out = fc_out.reshape(b, t, self.cfg.d_model)
+
+        # 4. Action Mapping Prediction
+        button = self.button_head(fc_out).reshape(b, t, self.cfg.prediction_horizon, self.cfg.num_bin)
+
+        step_button = button[:, :, 0]
+        return PolicyOutput(
+            button_logits=step_button,
+            horizon_button_logits=button,
+            future_button_logits={idx + 1: button[:, :, idx] for idx in range(self.cfg.prediction_horizon)},
+        )
+
+    def forward_from_cache(
+        self,
+        spatial_feats: torch.Tensor,
+        dt: torch.Tensor,
+        state: Optional[TemporalState] = None,
+        return_aux: bool = False,
+    ) -> PolicyOutput:
+        b, t, cf, hf, wf = spatial_feats.shape
+        if cf != 512:
+            raise ValueError(f"Expected cached ResNet18 backbone features with 512 channels, got {cf}.")
+        flat_feats = spatial_feats.reshape(b * t, cf, hf, wf)
+        compressed = self.spatial_encoder.channel_compressor(flat_feats)
+        _, cf, hf, wf = compressed.shape
+        spatial_feats = compressed.reshape(b, t, cf, hf, wf)
+        return self._forward_spatial_features(spatial_feats, dt, state=state, return_aux=return_aux)
+
+    def forward(
+        self,
+        frames: torch.Tensor,
+        dt: torch.Tensor,
+        state: Optional[TemporalState] = None,
+        return_aux: bool = False,
+        inputs_are_features: bool = False,
+    ):
+        if inputs_are_features:
+            return self.forward_from_cache(frames, dt, state=state, return_aux=return_aux)
+
         b, t, c, h, w = frames.shape
         
         frames = self._normalize_frames(frames)
@@ -303,38 +436,7 @@ class DrivingVideoPolicy(nn.Module):
         spatial_feats = self.spatial_encoder(x)
         _, cf, hf, wf = spatial_feats.shape
         spatial_feats = spatial_feats.reshape(b, t, cf, hf, wf)
-        
-        # 2. Temporal ConvGRU Rollout Loop
-        if state is not None and state.hidden_state is not None:
-            h_t = state.hidden_state
-        else:
-            h_t = torch.zeros(b, self.feat_channels, hf, wf, device=frames.device, dtype=spatial_feats.dtype)
-            
-        temporal_outputs = []
-        for step in range(t):
-            h_t = self.temporal_rnn(spatial_feats[:, step], h_t)
-            temporal_outputs.append(h_t.unsqueeze(1))
-            
-        temporal_out = torch.cat(temporal_outputs, dim=1)  # [B, T, C_feat, H_feat, W_feat]
-        
-        # 3. Linear Downsampling for Classifier Heads
-        temporal_flat = temporal_out.reshape(b * t, cf, hf, wf)
-        pooled = self.pool(temporal_flat)
-        pooled_flat = pooled.reshape(pooled.shape[0], -1)
-        
-        fc_out = self.fc_features(pooled_flat)
-        fc_out = fc_out.reshape(b, t, self.cfg.d_model)
-        
-        # 4. Action Mapping Prediction
-        button = self.button_head(fc_out).reshape(b, t, self.cfg.prediction_horizon, self.cfg.num_bin)
-        
-        step_button = button[:, :, 0]
-        output = PolicyOutput(
-            button_logits=step_button,
-            horizon_button_logits=button,
-            future_button_logits={idx + 1: button[:, :, idx] for idx in range(self.cfg.prediction_horizon)},
-        )
-        return output
+        return self._forward_spatial_features(spatial_feats, dt, state=state, return_aux=return_aux)
 
     def forward_step(self, frame: torch.Tensor, dt: torch.Tensor, state: TemporalState, return_aux: bool = False):
             b = frame.shape[0]

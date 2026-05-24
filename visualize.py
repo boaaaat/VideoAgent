@@ -30,7 +30,7 @@ from models import (  # noqa: E402
 )
 
 
-FeatureLayer = Literal["motion", "stage1", "stage2", "stage3", "stage4", "spatial", "tokens"]
+FeatureLayer = Literal["motion", "stage1", "stage2", "stage3", "stage4", "resnet", "learned", "spatial", "tokens"]
 ModelKind = Literal["auto", "policy", "inverse"]
 LoadedModelKind = Literal["policy", "inverse"]
 VisualModel = DrivingVideoPolicy | InverseDynamicsModel
@@ -361,13 +361,40 @@ def _compute_feature_map(
         x, current = _policy_encoder_input(model, frame_rgb, previous_frame_rgb)
         if layer == "motion":
             return x.abs(), current, policy_state
-        stages = _activation_stages(model.spatial_encoder.net, x)
+        if hasattr(model.spatial_encoder, "extract_backbone_features"):
+            resnet_feat = model.spatial_encoder.extract_backbone_features(x)
+            learned_feat = model.spatial_encoder.channel_compressor(resnet_feat)
+            if layer == "resnet":
+                return resnet_feat, current, policy_state
+            if layer in ("learned", "spatial"):
+                return learned_feat, current, policy_state
+            if layer == "tokens":
+                spatial_feat = learned_feat
+                if policy_state is not None and policy_state.hidden_state is not None:
+                    h_t = policy_state.hidden_state.to(device=spatial_feat.device, dtype=spatial_feat.dtype)
+                else:
+                    b, _, hf, wf = spatial_feat.shape
+                    h_t = torch.zeros(
+                        b,
+                        int(model.feat_channels),
+                        hf,
+                        wf,
+                        device=spatial_feat.device,
+                        dtype=spatial_feat.dtype,
+                    )
+                hidden = model.temporal_rnn(spatial_feat, h_t)
+                return hidden, current, TemporalState(hidden_state=hidden.detach())
+
+        if hasattr(model.spatial_encoder, "backbone_stages"):
+            stages = model.spatial_encoder.backbone_stages(x)
+        else:
+            stages = _activation_stages(model.spatial_encoder.net, x)
         if layer.startswith("stage"):
             stage_idx = int(layer.removeprefix("stage")) - 1
             if stage_idx < 0 or stage_idx >= len(stages):
                 raise ValueError(f"Policy ConvGRU encoder has {len(stages)} stages; cannot show {layer!r}.")
             return stages[stage_idx], current, policy_state
-        if layer == "spatial":
+        if layer in ("learned", "spatial"):
             return stages[-1], current, policy_state
         if layer == "tokens":
             spatial_feat = stages[-1]
@@ -390,7 +417,7 @@ def _compute_feature_map(
     x, current = _inverse_encoder_input(frame_rgb, previous_frame_rgb)
     if layer == "motion":
         return x[:, 3:6].abs(), current, policy_state
-    if layer in ("spatial", "tokens"):
+    if layer in ("resnet", "learned", "spatial", "tokens"):
         raise ValueError(f"Inverse dynamics CNN does not have a {layer!r} layer; use motion or stage1-stage4.")
     stages = _activation_stages(model.frame_encoder.net, x)
     if layer.startswith("stage"):
@@ -591,11 +618,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--layer",
-        choices=["motion", "stage1", "stage2", "stage3", "stage4", "spatial", "tokens"],
-        default="spatial",
+        choices=["motion", "stage1", "stage2", "stage3", "stage4", "resnet", "learned", "spatial", "tokens"],
+        default="resnet",
         help=(
             "CNN signal to visualize. Policy checkpoints use masked RGB for motion, stage1-stage4 for "
-            "the spatial encoder, final spatial features for spatial, and ConvGRU hidden features for tokens. "
+            "ResNet blocks, resnet for frozen 512-channel backbone features, learned/spatial for the "
+            "trainable 48-channel compressor output, and tokens for ConvGRU hidden features. "
             "Inverse checkpoints support "
             "motion and stage1-stage4."
         ),

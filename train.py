@@ -4,6 +4,7 @@ import glob
 import math
 import os
 import random
+from collections import OrderedDict
 from dataclasses import asdict, dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -12,6 +13,7 @@ from tqdm.auto import tqdm
 
 import torch
 import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
 
 # WSL:
 #   cd ~/ai
@@ -19,9 +21,26 @@ import torch.nn.functional as F
 #   cd /mnt/c/Users/Abhil/Desktop/Github_Projects/VideoAgent/
 #   python train.py
 
-from nvidia.dali import pipeline_def, types
-import nvidia.dali.fn as fn
-from nvidia.dali.plugin.pytorch import DALIGenericIterator, LastBatchPolicy
+try:
+    from nvidia.dali import pipeline_def, types
+    import nvidia.dali.fn as fn
+    from nvidia.dali.plugin.pytorch import DALIGenericIterator, LastBatchPolicy
+    DALI_AVAILABLE = True
+except ImportError:
+    DALI_AVAILABLE = False
+    types = None
+    fn = None
+    DALIGenericIterator = None
+
+    def pipeline_def(func=None, **kwargs):
+        del kwargs
+        if func is None:
+            return lambda wrapped: wrapped
+        return func
+
+    class LastBatchPolicy:
+        DROP = "drop"
+        PARTIAL = "partial"
 
 from action_space import game_data_root
 from augmentations import augment_frames
@@ -94,6 +113,11 @@ class TrainConfig(ModelConfig):
     dataset_cache_root: Optional[str] = None
     dataset_sync_delete_stale: Optional[bool] = None
     dataset_sync_hash_same_size: bool = True
+    use_cached_features: bool = True
+    cached_feature_suffix: str = "_features.pt"
+    cached_feature_num_workers: int = 4
+    cached_feature_lru_size: int = 2
+    cached_feature_mmap: bool = True
 
     resume: bool = True
     resume_path: Optional[str] = None
@@ -157,6 +181,11 @@ class TrainConfig(ModelConfig):
                 f"got {self.dali_resize_mode!r}."
             )
         self.dali_num_threads = max(1, int(self.dali_num_threads))
+        self.use_cached_features = bool(self.use_cached_features)
+        self.cached_feature_suffix = str(self.cached_feature_suffix)
+        self.cached_feature_num_workers = max(0, int(self.cached_feature_num_workers))
+        self.cached_feature_lru_size = max(1, int(self.cached_feature_lru_size))
+        self.cached_feature_mmap = bool(self.cached_feature_mmap)
         self.max_train_batches = None if self.max_train_batches is None else max(1, int(self.max_train_batches))
         self.max_val_batches = None if self.max_val_batches is None else max(1, int(self.max_val_batches))
         if not os.path.isabs(self.ckpt_dir):
@@ -170,6 +199,16 @@ class WindowTargets:
     button_horizon: torch.Tensor
     horizon_valid: torch.Tensor
     meta: Optional[List[Tuple[str, int, int]]] = None
+
+
+@dataclass
+class CachedFeatureWindow:
+    feature_path: str
+    start: int
+    end: int
+    dt: torch.Tensor
+    button_horizon: torch.Tensor
+    horizon_valid: torch.Tensor
 
 
 @dataclass
@@ -366,6 +405,125 @@ def build_window_targets(
         horizon_valid=stack(valid_windows),
         meta=meta if return_meta else None,
     )
+
+
+class CachedFeatureDataset(Dataset):
+    def __init__(self, pairs: Sequence[Tuple[str, str]], cfg: TrainConfig, stride: int):
+        self.windows: List[CachedFeatureWindow] = []
+        self.meta: List[Tuple[str, int, int]] = []
+        self.feature_lru_size = int(cfg.cached_feature_lru_size)
+        self.use_mmap = bool(cfg.cached_feature_mmap)
+        self._feature_cache: OrderedDict[str, torch.Tensor] = OrderedDict()
+
+        horizon = int(cfg.prediction_horizon)
+        step = max(1, int(stride))
+        for video_path, csv_path in pairs:
+            feature_path = os.path.splitext(video_path)[0] + str(cfg.cached_feature_suffix)
+            if not os.path.exists(feature_path):
+                raise FileNotFoundError(
+                    f"Missing cached features for {video_path!r}: expected {feature_path!r}. "
+                    "Run cache_features.py first or train without --use-cached-features."
+                )
+
+            features = self._load_feature_tensor(feature_path)
+            feature_frames = int(features.size(0))
+            del features
+
+            run_arrays = load_run_arrays(csv_path, cfg)
+            buttons = torch.from_numpy(run_arrays["buttons"]).float()
+            dt = torch.from_numpy(run_arrays["dt"]).float()
+            frame_count = min(feature_frames, int(buttons.size(0)), int(dt.size(0)))
+            if frame_count < int(cfg.seq_len):
+                continue
+
+            buttons = buttons[:frame_count]
+            dt = dt[:frame_count]
+            max_start = frame_count - int(cfg.seq_len)
+            for start in range(0, max_start + 1, step):
+                end = start + int(cfg.seq_len)
+                button_target = torch.zeros((cfg.seq_len, horizon, cfg.num_bin), dtype=torch.float32)
+                valid_target = torch.zeros((cfg.seq_len, horizon), dtype=torch.float32)
+
+                frame_indices = torch.arange(start, end)
+                for h in range(1, horizon + 1):
+                    target_indices = frame_indices + h + int(cfg.action_label_offset)
+                    prev_indices = target_indices - 1
+                    valid = (target_indices >= 0) & (target_indices < frame_count) & (prev_indices >= 0)
+                    if bool(valid.any()):
+                        button_target[valid, h - 1] = buttons[target_indices[valid]]
+                        valid_target[valid, h - 1] = 1.0
+
+                self.windows.append(
+                    CachedFeatureWindow(
+                        feature_path=feature_path,
+                        start=start,
+                        end=end,
+                        dt=dt[start:end],
+                        button_horizon=button_target,
+                        horizon_valid=valid_target,
+                    )
+                )
+                self.meta.append((video_path, start, end))
+
+        if not self.windows:
+            raise RuntimeError("No cached feature windows found. Check feature files, seq_len, and stride.")
+        self._feature_cache.clear()
+
+    def _load_feature_tensor(self, feature_path: str) -> torch.Tensor:
+        if self.use_mmap:
+            try:
+                loaded = torch.load(feature_path, map_location="cpu", mmap=True)
+            except TypeError:
+                loaded = torch.load(feature_path, map_location="cpu")
+            except RuntimeError:
+                loaded = torch.load(feature_path, map_location="cpu")
+        else:
+            loaded = torch.load(feature_path, map_location="cpu")
+
+        features = loaded["features"] if isinstance(loaded, dict) and "features" in loaded else loaded
+        if not isinstance(features, torch.Tensor):
+            raise RuntimeError(f"Cached feature file must contain a tensor: {feature_path}")
+        if features.dim() != 4 or int(features.size(1)) != 512:
+            raise RuntimeError(
+                f"Expected cached features shaped [T,512,H,W], got {tuple(features.shape)} in {feature_path}."
+            )
+        if features.dtype != torch.float32:
+            raise RuntimeError(f"Expected float32 cached features, got {features.dtype} in {feature_path}.")
+        return features.detach()
+
+    def _features_for_path(self, feature_path: str) -> torch.Tensor:
+        cached = self._feature_cache.get(feature_path)
+        if cached is not None:
+            self._feature_cache.move_to_end(feature_path)
+            return cached
+
+        features = self._load_feature_tensor(feature_path)
+        self._feature_cache[feature_path] = features
+        self._feature_cache.move_to_end(feature_path)
+        while len(self._feature_cache) > self.feature_lru_size:
+            self._feature_cache.popitem(last=False)
+        return features
+
+    def __len__(self) -> int:
+        return len(self.windows)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        window = self.windows[int(idx)]
+        features = self._features_for_path(window.feature_path)[window.start:window.end]
+        return {
+            "features": features,
+            "dt": window.dt,
+            "buttons": window.button_horizon,
+            "valid": window.horizon_valid,
+        }
+
+    def targets(self) -> WindowTargets:
+        return WindowTargets(
+            dt=torch.stack([item.dt for item in self.windows], dim=0),
+            button_horizon=torch.stack([item.button_horizon for item in self.windows], dim=0),
+            horizon_valid=torch.stack([item.horizon_valid for item in self.windows], dim=0),
+            meta=list(self.meta),
+        )
 
 
 def write_window_file_list(
@@ -756,6 +914,8 @@ def make_dali_iterator(
     random_shuffle: bool,
     last_batch_policy,
 ):
+    if not DALI_AVAILABLE or DALIGenericIterator is None:
+        raise RuntimeError("DALI is required for video training. Use --use-cached-features or install nvidia-dali.")
     pipe = video_pipeline(
         batch_size=batch_size,
         num_threads=int(cfg.dali_num_threads),
@@ -804,6 +964,22 @@ def load_batch(iterator, targets: WindowTargets, device: torch.device, cfg: Trai
     return frames, target
 
 
+def load_cached_batch(batch: Dict[str, torch.Tensor], device: torch.device, cfg: TrainConfig) -> Tuple[torch.Tensor, WindowTargets]:
+    features = batch["features"].to(device, non_blocking=True)
+    amp_name = str(cfg.amp_dtype).strip().lower()
+    if amp_name == "bf16" and features.dtype != torch.bfloat16:
+        features = features.to(dtype=torch.bfloat16)
+    elif amp_name in {"fp32", "float32", "none"} and features.dtype != torch.float32:
+        features = features.float()
+    target = WindowTargets(
+        dt=batch["dt"].to(device, non_blocking=True),
+        button_horizon=batch["buttons"].to(device, non_blocking=True),
+        horizon_valid=batch["valid"].to(device, non_blocking=True),
+        meta=None,
+    )
+    return features, target
+
+
 
 def run_epoch(
     *,
@@ -820,6 +996,7 @@ def run_epoch(
     optimizer: Optional[torch.optim.Optimizer] = None,
     total_steps: int = 1,
     global_step: int = 0,
+    use_cached_features: bool = False,
 ) -> Tuple[Dict[str, float], int]:
     is_train = optimizer is not None
     model.train(is_train)
@@ -835,12 +1012,15 @@ def run_epoch(
     iterator_it = iter(iterator)
     pbar = tqdm(range(int(batches)), desc=desc, dynamic_ncols=True)
     for batch_idx in pbar:
-        frames, batch_targets = load_batch(iterator_it, targets, device, cfg)
-        if is_train:
+        if use_cached_features:
+            frames, batch_targets = load_cached_batch(next(iterator_it), device, cfg)
+        else:
+            frames, batch_targets = load_batch(iterator_it, targets, device, cfg)
+        if is_train and not use_cached_features:
             frames = augment_frames(frames, cfg)
         with torch.set_grad_enabled(is_train):
-            with torch.amp.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_autocast):
-                output = model(frames, dt=batch_targets.dt)
+            with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_autocast):
+                output = model(frames, dt=batch_targets.dt, inputs_are_features=use_cached_features)
                 loss, details = compute_losses(
                     output,
                     batch_targets,
@@ -885,7 +1065,8 @@ def run_epoch(
                     "btn": float((detail_sums["button"] / max(1, steps)).item()),
                 }
             )
-    iterator.reset()
+    if hasattr(iterator, "reset"):
+        iterator.reset()
 
     step1 = step1_stats.compute()
     final = final_stats.compute()
@@ -1038,6 +1219,13 @@ def parse_args() -> TrainConfig:
     add("--dataset-sync-keep-stale", dest="dataset_sync_delete_stale", action="store_false")
     add("--dataset-sync-hash-same-size", dest="dataset_sync_hash_same_size", action="store_true")
     add("--dataset-sync-no-hash-same-size", dest="dataset_sync_hash_same_size", action="store_false")
+    add("--use-cached-features", dest="use_cached_features", action="store_true", default=None)
+    add("--no-cached-features", dest="use_cached_features", action="store_false")
+    add("--cached-feature-suffix", default=None)
+    add("--cached-feature-num-workers", type=int, default=None)
+    add("--cached-feature-lru-size", type=int, default=None)
+    add("--cached-feature-mmap", dest="cached_feature_mmap", action="store_true", default=None)
+    add("--no-cached-feature-mmap", dest="cached_feature_mmap", action="store_false")
     parser.set_defaults(
         dali_read_ahead=None,
         dali_dont_use_mmap=None,
@@ -1106,6 +1294,11 @@ def parse_args() -> TrainConfig:
         "sync_dataset",
         "dataset_sync_delete_stale",
         "dataset_sync_hash_same_size",
+        "use_cached_features",
+        "cached_feature_suffix",
+        "cached_feature_num_workers",
+        "cached_feature_lru_size",
+        "cached_feature_mmap",
     ):
         value = args_by_name[key]
         if value is not None:
@@ -1124,14 +1317,15 @@ def train() -> None:
     if cfg.data_root is None:
         cfg.data_root = game_data_root(cfg.selected_game)
 
-    if not torch.cuda.is_available():
+    if not cfg.use_cached_features and not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for DALI video training.")
 
-    device = torch.device("cuda")
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    torch.backends.cudnn.benchmark = True
-    torch.set_float32_matmul_precision("high")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision("high")
 
     if cfg.sync_dataset:
         cfg.data_root = sync_dataset_for_training(
@@ -1139,6 +1333,7 @@ def train() -> None:
             target_root=cfg.dataset_cache_root,
             video_ext=cfg.video_ext,
             csv_ext=cfg.csv_ext,
+            feature_suffix=cfg.cached_feature_suffix,
             delete_stale=cfg.dataset_sync_delete_stale,
             hash_same_size=bool(cfg.dataset_sync_hash_same_size),
         )
@@ -1152,8 +1347,16 @@ def train() -> None:
         print(f"Skipping action keys for this training run: {', '.join(cfg.skipped_key_names)}")
     print(f"Training action keys: {', '.join(cfg.key_names + cfg.mouse_button_names)}")
 
-    train_targets = build_window_targets(train_pairs, cfg, stride=cfg.train_seq_stride, return_meta=True)
-    val_targets = build_window_targets(val_pairs, cfg, stride=cfg.val_seq_stride, return_meta=True) if val_pairs else None
+    train_dataset = None
+    val_dataset = None
+    if cfg.use_cached_features:
+        train_dataset = CachedFeatureDataset(train_pairs, cfg, stride=cfg.train_seq_stride)
+        train_targets = train_dataset.targets()
+        val_dataset = CachedFeatureDataset(val_pairs, cfg, stride=cfg.val_seq_stride) if val_pairs else None
+        val_targets = val_dataset.targets() if val_dataset is not None else None
+    else:
+        train_targets = build_window_targets(train_pairs, cfg, stride=cfg.train_seq_stride, return_meta=True)
+        val_targets = build_window_targets(val_pairs, cfg, stride=cfg.val_seq_stride, return_meta=True) if val_pairs else None
     print(
         "Windows:",
         f"train={tuple(train_targets.button_horizon.shape)}",
@@ -1174,13 +1377,14 @@ def train() -> None:
 
     train_file_list = os.path.join(cfg.ckpt_dir, "train_file_list.txt")
     val_file_list = os.path.join(cfg.ckpt_dir, "val_file_list.txt")
-    if train_targets.meta is None:
-        raise RuntimeError("Training window metadata is required for DALI file list generation.")
-    write_window_file_list(train_targets.meta, train_file_list)
-    if val_targets is not None:
-        if val_targets.meta is None:
-            raise RuntimeError("Validation window metadata is required for DALI file list generation.")
-        write_window_file_list(val_targets.meta, val_file_list)
+    if not cfg.use_cached_features:
+        if train_targets.meta is None:
+            raise RuntimeError("Training window metadata is required for DALI file list generation.")
+        write_window_file_list(train_targets.meta, train_file_list)
+        if val_targets is not None:
+            if val_targets.meta is None:
+                raise RuntimeError("Validation window metadata is required for DALI file list generation.")
+            write_window_file_list(val_targets.meta, val_file_list)
 
     button_pos_weight = compute_pos_weight(
         train_targets.button_horizon,
@@ -1201,18 +1405,32 @@ def train() -> None:
     ]
     print("Button decision thresholds:", " ".join(threshold_parts))
 
-    train_targets = move_bundle_to_device(train_targets, device)
-    if val_targets is not None:
-        val_targets = move_bundle_to_device(val_targets, device)
+    if not cfg.use_cached_features:
+        train_targets = move_bundle_to_device(train_targets, device)
+        if val_targets is not None:
+            val_targets = move_bundle_to_device(val_targets, device)
 
-    train_iter = make_dali_iterator(
-        train_file_list,
-        cfg,
-        batch_size=cfg.batch_size,
-        random_shuffle=cfg.dali_train_random_shuffle,
-        last_batch_policy=LastBatchPolicy.DROP,
-    )
-    train_batches = int(train_targets.button_horizon.shape[0]) // int(cfg.batch_size)
+    if cfg.use_cached_features:
+        if train_dataset is None:
+            raise RuntimeError("Cached training dataset was not initialized.")
+        train_iter = DataLoader(
+            train_dataset,
+            batch_size=cfg.batch_size,
+            shuffle=bool(cfg.dali_train_random_shuffle),
+            drop_last=True,
+            num_workers=cfg.cached_feature_num_workers,
+            pin_memory=(device.type == "cuda"),
+        )
+        train_batches = len(train_iter)
+    else:
+        train_iter = make_dali_iterator(
+            train_file_list,
+            cfg,
+            batch_size=cfg.batch_size,
+            random_shuffle=cfg.dali_train_random_shuffle,
+            last_batch_policy=LastBatchPolicy.DROP,
+        )
+        train_batches = int(train_targets.button_horizon.shape[0]) // int(cfg.batch_size)
     if cfg.max_train_batches is not None:
         train_batches = min(train_batches, cfg.max_train_batches)
     if train_batches <= 0:
@@ -1222,14 +1440,27 @@ def train() -> None:
     val_batches = 0
     if val_targets is not None:
         val_batch_size = min(max(1, cfg.batch_size), int(val_targets.button_horizon.shape[0]))
-        val_iter = make_dali_iterator(
-            val_file_list,
-            cfg,
-            batch_size=val_batch_size,
-            random_shuffle=cfg.dali_val_random_shuffle,
-            last_batch_policy=LastBatchPolicy.PARTIAL,
-        )
-        val_batches = int(math.ceil(int(val_targets.button_horizon.shape[0]) / float(val_batch_size)))
+        if cfg.use_cached_features:
+            if val_dataset is None:
+                raise RuntimeError("Cached validation dataset was not initialized.")
+            val_iter = DataLoader(
+                val_dataset,
+                batch_size=val_batch_size,
+                shuffle=False,
+                drop_last=False,
+                num_workers=cfg.cached_feature_num_workers,
+                pin_memory=(device.type == "cuda"),
+            )
+            val_batches = len(val_iter)
+        else:
+            val_iter = make_dali_iterator(
+                val_file_list,
+                cfg,
+                batch_size=val_batch_size,
+                random_shuffle=cfg.dali_val_random_shuffle,
+                last_batch_policy=LastBatchPolicy.PARTIAL,
+            )
+            val_batches = int(math.ceil(int(val_targets.button_horizon.shape[0]) / float(val_batch_size)))
         if cfg.max_val_batches is not None:
             val_batches = min(val_batches, cfg.max_val_batches)
 
@@ -1240,7 +1471,13 @@ def train() -> None:
 
     base_model: torch.nn.Module = DrivingVideoPolicy(cfg).to(device)
     base_model = base_model.to(memory_format=torch.channels_last)
-    optimizer = torch.optim.AdamW(base_model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay, fused=True)
+    trainable_params = [param for param in base_model.parameters() if param.requires_grad]
+    optimizer = torch.optim.AdamW(
+        trainable_params,
+        lr=cfg.lr,
+        weight_decay=cfg.weight_decay,
+        fused=(device.type == "cuda"),
+    )
     print(f"Parameters: {sum(p.numel() for p in base_model.parameters()) / 1e6:.4f}M")
     start_epoch, global_step, best_score = maybe_resume(base_model, optimizer, cfg, device)
 
@@ -1272,6 +1509,7 @@ def train() -> None:
             optimizer=optimizer,
             total_steps=total_steps,
             global_step=global_step,
+            use_cached_features=cfg.use_cached_features,
         )
 
         val_metrics = None
@@ -1289,6 +1527,7 @@ def train() -> None:
                     amp_dtype=amp_dtype,
                     use_autocast=use_autocast,
                     button_pos_weight=button_pos_weight,
+                    use_cached_features=cfg.use_cached_features,
                 )
             score = driving_score(val_metrics, cfg)
 
