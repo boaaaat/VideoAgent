@@ -42,7 +42,7 @@ class TrainConfig(ModelConfig):
 
     lr: float = 1e-4
     min_lr: float = 1e-5
-    warmup_steps: int = 300
+    warmup_steps: int = 25
     weight_decay: float = 0.08
     grad_clip: float = 1.0
 
@@ -54,7 +54,7 @@ class TrainConfig(ModelConfig):
     split_seed: int = 1337
     pos_weight_power: float = 0.5
     pos_weight_clamp: float = 8.0
-    button_threshold_from_pos_weight: bool = True
+    button_threshold_from_pos_weight: bool = False
     button_threshold_min: float = 0.5
     button_threshold_max: float = 0.80
 
@@ -70,7 +70,7 @@ class TrainConfig(ModelConfig):
     aug_translate_frac: float = 0.0
     aug_scale_frac: float = 0.0
 
-    early_stop_patience: int = 5
+    early_stop_patience: int = 0
 
     dali_num_threads: int = 6
     dali_prefetch_queue_depth: int = 4
