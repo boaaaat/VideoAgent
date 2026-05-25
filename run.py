@@ -51,7 +51,7 @@ class RuntimeConfig(ModelConfig):
     ckpt_path: Optional[str] = r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\checkpoints_rt\model_latest.pt'
     pos_weight_power: float = 0.5
     pos_weight_clamp: float = 8.0
-    button_threshold_from_pos_weight: bool = True
+    button_threshold_from_pos_weight: bool = False
     button_threshold_min: float = 0.5  # Lowered to help sensitivity sliders
     button_threshold_max: float = 0.9
     use_checkpoint_button_thresholds: bool = False

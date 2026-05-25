@@ -14,6 +14,7 @@ from action_space import (
 
 
 CNN_FEATURE_CHANNELS = 64
+TEMPORAL_RNN_LAYERS = 1
 
 
 def _largest_valid_head_count(channels: int, requested_heads: int) -> int:
@@ -41,7 +42,7 @@ class ModelConfig:
     key_names: Optional[List[str]] = None
     mouse_button_names: Optional[List[str]] = None
 
-    d_model: int = 192
+    d_model: int = 256
     dropout: float = 0.10
 
     pooling: Tuple[int, int] = (5, 5)
@@ -131,7 +132,7 @@ class CustomSpatialEncoder(nn.Module):
     def __init__(self, in_channels: int = 3, dropout: float = 0.2):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv2d(in_channels, 16, kernel_size=7, stride=2, padding=3, bias=False),  # /2
+            nn.Conv2d(in_channels, 16, kernel_size=5, stride=2, padding=2, bias=False),  # /2
             nn.BatchNorm2d(16),
             nn.ELU(inplace=True),
             
@@ -248,7 +249,12 @@ class DrivingVideoPolicy(nn.Module):
         
         # ConvGRU tracking state
         self.feat_channels = CNN_FEATURE_CHANNELS
-        self.temporal_rnn = ConvGRUCell(input_dim=self.feat_channels, hidden_dim=self.feat_channels, kernel_size=3)
+        self.temporal_rnns = nn.ModuleList(
+            [
+                ConvGRUCell(input_dim=self.feat_channels, hidden_dim=self.feat_channels, kernel_size=3)
+                for _ in range(TEMPORAL_RNN_LAYERS)
+            ]
+        )
         
         # Learned multi-head pooling retains the configured spatial output layout for the classifier.
         self.pool = LearnedMultiHeadSpatialPool2d(self.feat_channels, cfg.pooling, cfg.pool_heads)
@@ -261,6 +267,56 @@ class DrivingVideoPolicy(nn.Module):
         
         self.button_head = nn.Linear(self.cfg.d_model, self.cfg.prediction_horizon * self.cfg.num_bin)
         nn.init.constant_(self.button_head.bias, -1.0)
+
+    def _initial_temporal_state(
+        self,
+        batch_size: int,
+        height: int,
+        width: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        return torch.zeros(
+            len(self.temporal_rnns),
+            batch_size,
+            self.feat_channels,
+            height,
+            width,
+            device=device,
+            dtype=dtype,
+        )
+
+    def _prepare_temporal_state(
+        self,
+        state: Optional[TemporalState],
+        batch_size: int,
+        height: int,
+        width: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if state is None or state.hidden_state is None:
+            return self._initial_temporal_state(batch_size, height, width, device=device, dtype=dtype)
+
+        hidden = state.hidden_state.to(device=device, dtype=dtype)
+        if hidden.dim() == 4:
+            first = hidden
+            remaining = self._initial_temporal_state(batch_size, height, width, device=device, dtype=dtype)[1:]
+            return torch.cat([first.unsqueeze(0), remaining], dim=0)
+        if hidden.dim() != 5:
+            raise ValueError(f"Expected temporal hidden state [L,B,C,H,W], got {tuple(hidden.shape)}.")
+        if hidden.size(0) != len(self.temporal_rnns):
+            raise ValueError(f"Expected {len(self.temporal_rnns)} temporal layers, got {hidden.size(0)}.")
+        return hidden
+
+    def _temporal_step(self, x_t: torch.Tensor, hidden_state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        next_states = []
+        for layer_idx, rnn in enumerate(self.temporal_rnns):
+            x_t = rnn(x_t, hidden_state[layer_idx])
+            next_states.append(x_t)
+        return x_t, torch.stack(next_states, dim=0)
 
     def _normalize_frames(self, frames: torch.Tensor) -> torch.Tensor:
         if frames.dtype == torch.uint8:
@@ -305,15 +361,19 @@ class DrivingVideoPolicy(nn.Module):
         spatial_feats = spatial_feats.reshape(b, t, cf, hf, wf)
         
         # 2. Temporal ConvGRU Rollout Loop
-        if state is not None and state.hidden_state is not None:
-            h_t = state.hidden_state
-        else:
-            h_t = torch.zeros(b, self.feat_channels, hf, wf, device=frames.device, dtype=spatial_feats.dtype)
+        h_t = self._prepare_temporal_state(
+            state,
+            b,
+            hf,
+            wf,
+            device=frames.device,
+            dtype=spatial_feats.dtype,
+        )
             
         temporal_outputs = []
         for step in range(t):
-            h_t = self.temporal_rnn(spatial_feats[:, step], h_t)
-            temporal_outputs.append(h_t.unsqueeze(1))
+            temporal_feat, h_t = self._temporal_step(spatial_feats[:, step], h_t)
+            temporal_outputs.append(temporal_feat.unsqueeze(1))
             
         temporal_out = torch.cat(temporal_outputs, dim=1)  # [B, T, C_feat, H_feat, W_feat]
         
@@ -348,15 +408,19 @@ class DrivingVideoPolicy(nn.Module):
             cf, hf, wf = spatial_feat.shape[1:]
             
             # 3. Evaluate a single temporal rollout transition step
-            if state is not None and state.hidden_state is not None:
-                h_t = state.hidden_state
-            else:
-                h_t = torch.zeros(b, self.feat_channels, hf, wf, device=frame.device, dtype=spatial_feat.dtype)
+            h_t = self._prepare_temporal_state(
+                state,
+                b,
+                hf,
+                wf,
+                device=frame.device,
+                dtype=spatial_feat.dtype,
+            )
                 
-            new_hidden = self.temporal_rnn(spatial_feat, h_t)
+            temporal_feat, new_hidden = self._temporal_step(spatial_feat, h_t)
             
             # 4. Map the new hidden states through your 5x5 pooling layout
-            pooled = self.pool(new_hidden)
+            pooled = self.pool(temporal_feat)
             pooled_flat = pooled.reshape(b, -1)
             
             fc_out = self.fc_features(pooled_flat)

@@ -371,10 +371,21 @@ def _compute_feature_map(
             return stages[-1], current, policy_state
         if layer == "tokens":
             spatial_feat = stages[-1]
+            b, _, hf, wf = spatial_feat.shape
+            if hasattr(model, "_prepare_temporal_state") and hasattr(model, "_temporal_step"):
+                h_t = model._prepare_temporal_state(
+                    policy_state,
+                    b,
+                    hf,
+                    wf,
+                    device=spatial_feat.device,
+                    dtype=spatial_feat.dtype,
+                )
+                hidden, new_state = model._temporal_step(spatial_feat, h_t)
+                return hidden, current, TemporalState(hidden_state=new_state.detach())
             if policy_state is not None and policy_state.hidden_state is not None:
                 h_t = policy_state.hidden_state.to(device=spatial_feat.device, dtype=spatial_feat.dtype)
             else:
-                b, _, hf, wf = spatial_feat.shape
                 h_t = torch.zeros(
                     b,
                     int(model.feat_channels),
