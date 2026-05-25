@@ -14,7 +14,10 @@ from action_space import (
 
 
 CNN_FEATURE_CHANNELS = 64
+POLICY_INPUT_CHANNELS = 6
 TEMPORAL_RNN_LAYERS = 1
+LAST_ACTION_EMBEDDING_DROPOUT = 0.25
+LAST_ACTION_RESIDUAL_SCALE = 0.25
 
 
 def _largest_valid_head_count(channels: int, requested_heads: int) -> int:
@@ -43,7 +46,9 @@ class ModelConfig:
     mouse_button_names: Optional[List[str]] = None
 
     d_model: int = 256
-    dropout: float = 0.10
+    spatial_dropout: float = 0.15
+    head_dropout: float = 0.40
+    zoneout: float = 0.2
 
     pooling: Tuple[int, int] = (5, 5)
     pool_heads: int = 4
@@ -65,7 +70,9 @@ class ModelConfig:
         self.prediction_horizon = max(1, int(self.prediction_horizon))
 
         self.d_model = max(64, int(self.d_model))
-        self.dropout = float(min(max(self.dropout, 0.0), 0.9))
+        self.spatial_dropout = float(min(max(self.spatial_dropout, 0.0), 0.9))
+        self.head_dropout = float(min(max(self.head_dropout, 0.0), 0.9))
+        self.zoneout = float(min(max(self.zoneout, 0.0), 0.9))
         pool_h, pool_w = self.pooling
         self.pooling = (max(1, int(pool_h)), max(1, int(pool_w)))
         self.pool_heads = _largest_valid_head_count(CNN_FEATURE_CHANNELS, int(self.pool_heads))
@@ -104,6 +111,7 @@ class PolicyOutput:
 @dataclass
 class TemporalState:
     hidden_state: Optional[torch.Tensor] = None
+    previous_frame: Optional[torch.Tensor] = None
 
 
 class ResBlock(nn.Module):
@@ -161,10 +169,11 @@ class ConvGRUCell(nn.Module):
     A GRU cell that replaces standard Linear matrix multiplications with Conv2d loops,
     preserving structural 2D coordinates across time.
     """
-    def __init__(self, input_dim: int, hidden_dim: int, kernel_size: int = 3):
+    def __init__(self, input_dim: int, hidden_dim: int, kernel_size: int = 3, zoneout: float = 0.0):
         super().__init__()
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
+        self.zoneout = float(min(max(zoneout, 0.0), 0.9))
         padding = kernel_size // 2
         
         self.gates_conv = nn.Conv2d(
@@ -194,7 +203,12 @@ class ConvGRUCell(nn.Module):
         candidate = torch.tanh(self.candidate_conv(combined_candidate))
         
         h_next = (1.0 - z_gate) * h_prev + z_gate * candidate
-        return h_next
+        if self.zoneout <= 0.0:
+            return h_next
+        if self.training:
+            keep_previous = torch.rand_like(h_next) < self.zoneout
+            return torch.where(keep_previous, h_prev, h_next)
+        return (1.0 - self.zoneout) * h_next + self.zoneout * h_prev
 
 
 class LearnedMultiHeadSpatialPool2d(nn.Module):
@@ -245,13 +259,18 @@ class DrivingVideoPolicy(nn.Module):
         self.car_x_min_pct = 0.40
         self.car_x_max_pct = 0.60
         
-        self.spatial_encoder = CustomSpatialEncoder(in_channels=3, dropout=cfg.dropout)
+        self.spatial_encoder = CustomSpatialEncoder(in_channels=POLICY_INPUT_CHANNELS, dropout=cfg.spatial_dropout)
         
         # ConvGRU tracking state
         self.feat_channels = CNN_FEATURE_CHANNELS
         self.temporal_rnns = nn.ModuleList(
             [
-                ConvGRUCell(input_dim=self.feat_channels, hidden_dim=self.feat_channels, kernel_size=3)
+                ConvGRUCell(
+                    input_dim=self.feat_channels,
+                    hidden_dim=self.feat_channels,
+                    kernel_size=5,
+                    zoneout=cfg.zoneout,
+                )
                 for _ in range(TEMPORAL_RNN_LAYERS)
             ]
         )
@@ -262,8 +281,23 @@ class DrivingVideoPolicy(nn.Module):
         self.fc_features = nn.Sequential(
             nn.Linear(self.feat_channels * cfg.pooling[0] * cfg.pooling[1], self.cfg.d_model),
             nn.ELU(inplace=True),
-            nn.Dropout(cfg.dropout)
+            nn.Dropout(cfg.head_dropout)
         )
+        self.dt_encoder = nn.Linear(1, self.cfg.d_model)
+        nn.init.zeros_(self.dt_encoder.weight)
+        nn.init.zeros_(self.dt_encoder.bias)
+
+        action_hidden = max(4, min(32, cfg.num_bin * 2, self.cfg.d_model // 4))
+        self.last_action_encoder = nn.Sequential(
+            nn.Linear(cfg.num_bin, action_hidden),
+            nn.ELU(inplace=True),
+            nn.Dropout(LAST_ACTION_EMBEDDING_DROPOUT),
+            nn.Linear(action_hidden, self.cfg.d_model),
+        )
+        final_action_layer = self.last_action_encoder[-1]
+        if isinstance(final_action_layer, nn.Linear):
+            nn.init.zeros_(final_action_layer.weight)
+            nn.init.zeros_(final_action_layer.bias)
         
         self.button_head = nn.Linear(self.cfg.d_model, self.cfg.prediction_horizon * self.cfg.num_bin)
         nn.init.constant_(self.button_head.bias, -1.0)
@@ -323,6 +357,103 @@ class DrivingVideoPolicy(nn.Module):
             frames = frames.float() / 255.0
         return frames.clamp(0.0, 1.0)
 
+    def _dt_features(
+        self,
+        dt: Optional[torch.Tensor],
+        batch_size: int,
+        time_steps: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if dt is None:
+            dt_values = torch.full((batch_size, time_steps), float(self.cfg.prediction_dt), device=device, dtype=dtype)
+        else:
+            dt_values = dt.to(device=device, dtype=dtype)
+            if dt_values.dim() == 0:
+                dt_values = dt_values.reshape(1, 1).expand(batch_size, time_steps)
+            elif dt_values.dim() == 1:
+                if int(dt_values.numel()) == batch_size and time_steps == 1:
+                    dt_values = dt_values.view(batch_size, 1)
+                elif int(dt_values.numel()) == time_steps and batch_size == 1:
+                    dt_values = dt_values.view(1, time_steps)
+                elif int(dt_values.numel()) == batch_size:
+                    dt_values = dt_values.view(batch_size, 1).expand(batch_size, time_steps)
+                else:
+                    raise ValueError(f"Expected dt with {batch_size} or {time_steps} values, got {tuple(dt_values.shape)}.")
+            elif dt_values.dim() == 2:
+                if tuple(dt_values.shape) != (batch_size, time_steps):
+                    raise ValueError(f"Expected dt shape {(batch_size, time_steps)}, got {tuple(dt_values.shape)}.")
+            else:
+                raise ValueError(f"Expected scalar, [B], [T], or [B,T] dt, got {tuple(dt_values.shape)}.")
+
+        base_dt = max(float(self.cfg.prediction_dt), 1.0 / 240.0)
+        dt_scaled = (dt_values / base_dt).clamp(0.25, 4.0) - 1.0
+        return self.dt_encoder(dt_scaled.reshape(batch_size, time_steps, 1)).to(dtype=dtype)
+
+    def _last_action_features(
+        self,
+        prev_action: Optional[torch.Tensor],
+        batch_size: int,
+        time_steps: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if prev_action is None:
+            action_values = torch.zeros((batch_size, time_steps, self.cfg.num_bin), device=device, dtype=dtype)
+        else:
+            action_values = prev_action.to(device=device, dtype=dtype)
+            if action_values.dim() == 2:
+                if tuple(action_values.shape) != (batch_size, self.cfg.num_bin):
+                    raise ValueError(
+                        f"Expected prev_action shape {(batch_size, self.cfg.num_bin)} or "
+                        f"{(batch_size, time_steps, self.cfg.num_bin)}, got {tuple(action_values.shape)}."
+                    )
+                action_values = action_values.view(batch_size, 1, self.cfg.num_bin).expand(batch_size, time_steps, self.cfg.num_bin)
+            elif action_values.dim() == 3:
+                if tuple(action_values.shape) != (batch_size, time_steps, self.cfg.num_bin):
+                    raise ValueError(
+                        f"Expected prev_action shape {(batch_size, time_steps, self.cfg.num_bin)}, "
+                        f"got {tuple(action_values.shape)}."
+                    )
+            else:
+                raise ValueError(f"Expected prev_action with 2 or 3 dims, got {tuple(action_values.shape)}.")
+
+        action_values = action_values.clamp(0.0, 1.0).reshape(batch_size * time_steps, self.cfg.num_bin)
+        features = self.last_action_encoder(action_values).reshape(batch_size, time_steps, self.cfg.d_model)
+        return features.to(dtype=dtype) * LAST_ACTION_RESIDUAL_SCALE
+
+    def _motion_input_from_masked_sequence(self, masked_frames: torch.Tensor) -> torch.Tensor:
+        if masked_frames.dim() != 5 or masked_frames.size(2) != 3:
+            raise ValueError(f"Expected masked RGB frames [B,T,3,H,W], got {tuple(masked_frames.shape)}.")
+        prev = torch.cat([masked_frames[:, :1], masked_frames[:, :-1]], dim=1)
+        motion = masked_frames - prev
+        return torch.cat([masked_frames, motion], dim=2)
+
+    def _previous_frame_for_step(
+        self,
+        state: Optional[TemporalState],
+        masked_frame: torch.Tensor,
+    ) -> torch.Tensor:
+        if state is None or state.previous_frame is None:
+            return masked_frame
+        previous = state.previous_frame.to(device=masked_frame.device, dtype=masked_frame.dtype)
+        if tuple(previous.shape) != tuple(masked_frame.shape):
+            return masked_frame
+        return previous
+
+    def _motion_input_for_step(
+        self,
+        masked_frame: torch.Tensor,
+        state: Optional[TemporalState],
+    ) -> torch.Tensor:
+        if masked_frame.dim() != 4 or masked_frame.size(1) != 3:
+            raise ValueError(f"Expected masked RGB frame [B,3,H,W], got {tuple(masked_frame.shape)}.")
+        previous = self._previous_frame_for_step(state, masked_frame)
+        motion = masked_frame - previous
+        return torch.cat([masked_frame, motion], dim=1)
+
     def _apply_masks(self, frames: torch.Tensor) -> torch.Tensor:
         h, w = frames.shape[-2:]
         masked_frames = frames.clone()
@@ -348,14 +479,25 @@ class DrivingVideoPolicy(nn.Module):
 
         return masked_frames
 
-    def forward(self, frames: torch.Tensor, dt: torch.Tensor, state: Optional[TemporalState] = None, return_aux: bool = False):
+    def forward(
+        self,
+        frames: torch.Tensor,
+        dt: torch.Tensor,
+        state: Optional[TemporalState] = None,
+        return_aux: bool = False,
+        prev_action: Optional[torch.Tensor] = None,
+    ):
         b, t, c, h, w = frames.shape
+        if c != 3:
+            raise ValueError(f"Expected RGB frames with shape [B,T,3,H,W], got {tuple(frames.shape)}.")
         
         frames = self._normalize_frames(frames)
         frames = self._apply_masks(frames)
         
         # 1. Spatial Processing
-        x = frames.reshape(b * t, c, h, w)
+        x = self._motion_input_from_masked_sequence(frames).reshape(b * t, POLICY_INPUT_CHANNELS, h, w)
+        if x.is_cuda:
+            x = x.contiguous(memory_format=torch.channels_last)
         spatial_feats = self.spatial_encoder(x)
         _, cf, hf, wf = spatial_feats.shape
         spatial_feats = spatial_feats.reshape(b, t, cf, hf, wf)
@@ -384,6 +526,8 @@ class DrivingVideoPolicy(nn.Module):
         
         fc_out = self.fc_features(pooled_flat)
         fc_out = fc_out.reshape(b, t, self.cfg.d_model)
+        fc_out = fc_out + self._dt_features(dt, b, t, device=frames.device, dtype=fc_out.dtype)
+        fc_out = fc_out + self._last_action_features(prev_action, b, t, device=frames.device, dtype=fc_out.dtype)
         
         # 4. Action Mapping Prediction
         button = self.button_head(fc_out).reshape(b, t, self.cfg.prediction_horizon, self.cfg.num_bin)
@@ -396,46 +540,59 @@ class DrivingVideoPolicy(nn.Module):
         )
         return output
 
-    def forward_step(self, frame: torch.Tensor, dt: torch.Tensor, state: TemporalState, return_aux: bool = False):
-            b = frame.shape[0]
-            
-            # 1. Normalize and mask out the car layout exactly once
-            frame_norm = self._normalize_frames(frame)
-            masked_frame = self._apply_masks(frame_norm)
-            
-            # 2. Extract spatial primitives
-            spatial_feat = self.spatial_encoder(masked_frame)
-            cf, hf, wf = spatial_feat.shape[1:]
-            
-            # 3. Evaluate a single temporal rollout transition step
-            h_t = self._prepare_temporal_state(
-                state,
-                b,
-                hf,
-                wf,
-                device=frame.device,
-                dtype=spatial_feat.dtype,
-            )
-                
-            temporal_feat, new_hidden = self._temporal_step(spatial_feat, h_t)
-            
-            # 4. Map the new hidden states through your 5x5 pooling layout
-            pooled = self.pool(temporal_feat)
-            pooled_flat = pooled.reshape(b, -1)
-            
-            fc_out = self.fc_features(pooled_flat)
-            
-            # 5. Project to action space values
-            button = self.button_head(fc_out).reshape(b, self.cfg.prediction_horizon, self.cfg.num_bin)
-            
-            squeezed = PolicyOutput(
-                button_logits=button[:, 0],
-                horizon_button_logits=button,
-                future_button_logits={idx + 1: button[:, idx] for idx in range(self.cfg.prediction_horizon)},
-            )
-            
-            # 6. Detach hidden state to prevent backpropagation graph memory leaks
-            new_state = TemporalState(
-                hidden_state=new_hidden.detach(),
-            )
-            return squeezed, new_state
+    def forward_step(
+        self,
+        frame: torch.Tensor,
+        dt: torch.Tensor,
+        state: TemporalState,
+        return_aux: bool = False,
+        prev_action: Optional[torch.Tensor] = None,
+    ):
+        b = frame.shape[0]
+
+        # 1. Normalize and mask out the car layout exactly once
+        frame_norm = self._normalize_frames(frame)
+        masked_frame = self._apply_masks(frame_norm)
+
+        # 2. Extract spatial primitives
+        x = self._motion_input_for_step(masked_frame, state)
+        if x.is_cuda:
+            x = x.contiguous(memory_format=torch.channels_last)
+        spatial_feat = self.spatial_encoder(x)
+        cf, hf, wf = spatial_feat.shape[1:]
+
+        # 3. Evaluate a single temporal rollout transition step
+        h_t = self._prepare_temporal_state(
+            state,
+            b,
+            hf,
+            wf,
+            device=frame.device,
+            dtype=spatial_feat.dtype,
+        )
+
+        temporal_feat, new_hidden = self._temporal_step(spatial_feat, h_t)
+
+        # 4. Map the new hidden states through your 5x5 pooling layout
+        pooled = self.pool(temporal_feat)
+        pooled_flat = pooled.reshape(b, -1)
+
+        fc_out = self.fc_features(pooled_flat)
+        fc_out = fc_out + self._dt_features(dt, b, 1, device=frame.device, dtype=fc_out.dtype).reshape(b, self.cfg.d_model)
+        fc_out = fc_out + self._last_action_features(prev_action, b, 1, device=frame.device, dtype=fc_out.dtype).reshape(b, self.cfg.d_model)
+
+        # 5. Project to action space values
+        button = self.button_head(fc_out).reshape(b, self.cfg.prediction_horizon, self.cfg.num_bin)
+
+        squeezed = PolicyOutput(
+            button_logits=button[:, 0],
+            horizon_button_logits=button,
+            future_button_logits={idx + 1: button[:, idx] for idx in range(self.cfg.prediction_horizon)},
+        )
+
+        # 6. Detach hidden state to prevent backpropagation graph memory leaks
+        new_state = TemporalState(
+            hidden_state=new_hidden.detach(),
+            previous_frame=masked_frame.detach(),
+        )
+        return squeezed, new_state

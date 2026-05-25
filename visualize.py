@@ -320,11 +320,17 @@ def _policy_encoder_input(
     frame_rgb: torch.Tensor,
     previous_frame_rgb: Optional[torch.Tensor],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    del previous_frame_rgb
     if frame_rgb.dim() != 4 or frame_rgb.size(1) != 3:
         raise ValueError(f"Expected current frame [B,3,H,W], got {tuple(frame_rgb.shape)}.")
     frame_rgb = model._normalize_frames(frame_rgb)
-    x = model._apply_masks(frame_rgb)
+    masked_frame = model._apply_masks(frame_rgb)
+    if previous_frame_rgb is None:
+        state = TemporalState()
+    else:
+        prev_frame_rgb = previous_frame_rgb.to(device=frame_rgb.device, dtype=frame_rgb.dtype)
+        prev_frame_rgb = model._normalize_frames(prev_frame_rgb)
+        state = TemporalState(previous_frame=model._apply_masks(prev_frame_rgb))
+    x = model._motion_input_for_step(masked_frame, state)
     if x.is_cuda:
         x = x.contiguous(memory_format=torch.channels_last)
     return x, frame_rgb.detach()
@@ -360,7 +366,7 @@ def _compute_feature_map(
     if isinstance(model, DrivingVideoPolicy):
         x, current = _policy_encoder_input(model, frame_rgb, previous_frame_rgb)
         if layer == "motion":
-            return x.abs(), current, policy_state
+            return x[:, 3:].abs(), current, policy_state
         stages = _activation_stages(model.spatial_encoder.net, x)
         if layer.startswith("stage"):
             stage_idx = int(layer.removeprefix("stage")) - 1

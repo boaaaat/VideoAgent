@@ -232,7 +232,7 @@ def infer_video(
     *,
     command_horizon: int,
     action_label_offset: int,
-    change_thresholds: np.ndarray,
+    thresholds: np.ndarray,
     max_frames: Optional[int],
     use_autocast: bool,
     inference_dtype: torch.dtype,
@@ -250,7 +250,6 @@ def infer_video(
 
     predictions = {
         "button_logits": np.zeros((total_frames, cfg.num_bin), dtype=np.float32),
-        "change_logits": np.zeros((total_frames, cfg.num_bin), dtype=np.float32),
         "button_state": np.zeros((total_frames, cfg.num_bin), dtype=np.float32),
         "source_frame": np.full((total_frames,), -1, dtype=np.int32),
         "valid_mask": np.zeros((total_frames,), dtype=bool),
@@ -260,8 +259,8 @@ def infer_video(
     prev_action = torch.zeros((1, cfg.num_bin), device=device, dtype=inference_dtype)
     h_idx = max(0, min(int(command_horizon) - 1, int(cfg.prediction_horizon) - 1))
     target_offset = h_idx + 1 + int(action_label_offset)
-    change_threshold_tensor = torch.tensor(
-        list(change_thresholds),
+    threshold_tensor = torch.tensor(
+        list(thresholds),
         device=device,
         dtype=torch.float32,
     )
@@ -283,21 +282,21 @@ def infer_video(
 
             with torch.inference_mode():
                 with torch.amp.autocast(device_type=device.type, dtype=inference_dtype, enabled=use_autocast):
-                    output, state = model.forward_step(frame, dt, state, prev_action=prev_action)
-                    if output.change_logits is None:
-                        raise RuntimeError("Current DrivingVideoPolicy checkpoints must return change_logits.")
-                    change_pred = torch.sigmoid(output.change_logits.float()) >= change_threshold_tensor.view(1, -1)
-                    predicted_action = torch.where(
-                        change_pred,
-                        1.0 - prev_action.to(dtype=output.change_logits.dtype),
-                        prev_action.to(dtype=output.change_logits.dtype),
+                    output, state = model.forward_step(
+                        frame,
+                        dt,
+                        state,
+                        prev_action=prev_action,
+                    )
+                    button_logits = output.horizon_button_logits[:, h_idx]
+                    predicted_action = (torch.sigmoid(button_logits.float()) >= threshold_tensor.view(1, -1)).to(
+                        dtype=inference_dtype
                     )
                     prev_action = predicted_action.detach().to(dtype=inference_dtype)
 
             target_idx = source_idx + target_offset
             if 0 <= target_idx < total_frames:
                 predictions["button_logits"][target_idx] = output.horizon_button_logits[0, h_idx].detach().cpu().float().numpy()
-                predictions["change_logits"][target_idx] = output.change_logits[0].detach().cpu().float().numpy()
                 predictions["button_state"][target_idx] = predicted_action[0].detach().cpu().float().numpy()
                 predictions["source_frame"][target_idx] = source_idx
                 predictions["valid_mask"][target_idx] = True
@@ -427,11 +426,9 @@ def _draw_key_rows(
     y: int,
     names: Sequence[str],
     probs: np.ndarray,
-    change_probs: np.ndarray,
     pred_state: np.ndarray,
     true_state: np.ndarray,
     thresholds: np.ndarray,
-    change_thresholds: np.ndarray,
 ) -> int:
     for idx, name in enumerate(names):
         pred_on = bool(pred_state[idx])
@@ -451,7 +448,7 @@ def _draw_key_rows(
         y = _put_text(
             panel,
             f"{name:>6s}  state={float(probs[idx]):.3f}/{float(thresholds[idx]):.2f}  "
-            f"chg={float(change_probs[idx]):.3f}/{float(change_thresholds[idx]):.2f}  gt={int(true_on)}  {status}",
+            f"gt={int(true_on)}  {status}",
             x,
             y,
             color=color,
@@ -468,7 +465,6 @@ def draw_overlay_frame(
     cfg: ModelConfig,
     names: Sequence[str],
     thresholds: np.ndarray,
-    change_thresholds: np.ndarray,
     summary: Dict[str, float],
     command_horizon: int,
     action_label_offset: int,
@@ -484,7 +480,6 @@ def draw_overlay_frame(
     panel[:] = (18, 20, 24)
 
     probs = sigmoid_np(predictions["button_logits"][frame_idx])
-    change_probs = sigmoid_np(predictions["change_logits"][frame_idx])
     pred_state = predictions["button_state"][frame_idx] >= 0.5
     true_state = gt["button_state"][frame_idx].astype(bool)
     source_idx = int(predictions["source_frame"][frame_idx])
@@ -523,7 +518,7 @@ def draw_overlay_frame(
     )
     y += 10
     y = _put_text(panel, "Actions", x, y, color=(180, 255, 180), scale=0.6, thickness=2)
-    y = _draw_key_rows(panel, x, y, names, probs, change_probs, pred_state, true_state, thresholds, change_thresholds)
+    y = _draw_key_rows(panel, x, y, names, probs, pred_state, true_state, thresholds)
 
     wrong = pred_state != true_state
     if bool(wrong.any()):
@@ -544,7 +539,6 @@ def write_overlay_video(
     cfg: ModelConfig,
     *,
     thresholds: np.ndarray,
-    change_thresholds: np.ndarray,
     command_horizon: int,
     action_label_offset: int,
     max_frames: Optional[int],
@@ -598,7 +592,6 @@ def write_overlay_video(
                 cfg=cfg,
                 names=names,
                 thresholds=thresholds,
-                change_thresholds=change_thresholds,
                 summary=summary,
                 command_horizon=command_horizon,
                 action_label_offset=action_label_offset,
@@ -662,7 +655,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--command-horizon", type=int, default=1, help="1-based horizon index to visualize.")
     parser.add_argument("--action-label-offset", type=int, default=None, help="Override checkpoint action_label_offset.")
     parser.add_argument("--threshold", type=float, default=None, help="Override button threshold. Defaults to checkpoint thresholds.")
-    parser.add_argument("--change-threshold", type=float, default=None, help="Override change-head threshold. Defaults to checkpoint value or 0.5.")
+    parser.add_argument("--change-threshold", type=float, default=None, help="Ignored for current direct-state policy checkpoints.")
     parser.add_argument("--max-frames", type=int, default=None, help="Optional frame limit for quick tests.")
     parser.add_argument("--panel-width", type=int, default=720, help="Width of the side stats panel.")
     parser.add_argument("--cpu", action="store_true", help="Force CPU inference.")
@@ -701,7 +694,6 @@ def main() -> None:
 
     gt = load_ground_truth(label_path, cfg, total_frames)
     thresholds = _resolve_thresholds(cfg, args.threshold)
-    change_thresholds = _resolve_change_thresholds(cfg, args.change_threshold, raw_config)
     print(
         "Loaded policy:",
         f"checkpoint={checkpoint_path}",
@@ -724,7 +716,7 @@ def main() -> None:
         device,
         command_horizon=int(args.command_horizon),
         action_label_offset=action_label_offset,
-        change_thresholds=change_thresholds,
+        thresholds=thresholds,
         max_frames=args.max_frames,
         use_autocast=use_autocast,
         inference_dtype=inference_dtype,
@@ -736,7 +728,6 @@ def main() -> None:
         gt,
         cfg,
         thresholds=thresholds,
-        change_thresholds=change_thresholds,
         command_horizon=int(args.command_horizon),
         action_label_offset=action_label_offset,
         max_frames=args.max_frames,

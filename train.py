@@ -54,13 +54,16 @@ class TrainConfig(ModelConfig):
     split_seed: int = 1337
     pos_weight_power: float = 0.5
     pos_weight_clamp: float = 8
-    button_threshold_from_pos_weight: bool = True
+    button_threshold_from_pos_weight: bool = False
     button_threshold_min: float = 0.5
     button_threshold_max: float = 0.9
 
     button_loss_weight: float = 1.0
     button_focal_gamma: float = 2.0
     action_label_offset: int = 0
+    last_action_sequence_dropout: float = 0.20
+    last_action_key_dropout: float = 0.25
+    last_action_corruption_prob: float = 0.10
     skipped_key_names: Optional[Sequence[str]] = ("e", "q", "c", "z")
     button_label_smoothing: float = 0.02
 
@@ -135,6 +138,9 @@ class TrainConfig(ModelConfig):
         self.grad_clip = max(0.0, float(self.grad_clip))
         self.button_focal_gamma = max(0.0, float(self.button_focal_gamma))
         self.action_label_offset = int(self.action_label_offset)
+        self.last_action_sequence_dropout = float(min(max(self.last_action_sequence_dropout, 0.0), 1.0))
+        self.last_action_key_dropout = float(min(max(self.last_action_key_dropout, 0.0), 1.0))
+        self.last_action_corruption_prob = float(min(max(self.last_action_corruption_prob, 0.0), 1.0))
         self.button_label_smoothing = float(min(max(self.button_label_smoothing, 0.0), 0.2))
         self.aug_brightness = float(min(max(self.aug_brightness, 0.0), 0.5))
         self.aug_contrast = float(min(max(self.aug_contrast, 0.0), 0.5))
@@ -169,6 +175,7 @@ class WindowTargets:
     dt: torch.Tensor
     button_horizon: torch.Tensor
     horizon_valid: torch.Tensor
+    last_action: torch.Tensor
     meta: Optional[List[Tuple[str, int, int]]] = None
 
 
@@ -321,6 +328,7 @@ def build_window_targets(
 ) -> WindowTargets:
     button_windows: List[np.ndarray] = []
     valid_windows: List[np.ndarray] = []
+    last_action_windows: List[np.ndarray] = []
     dt_windows: List[np.ndarray] = []
     meta: List[Tuple[str, int, int]] = []
 
@@ -337,8 +345,13 @@ def build_window_targets(
             end = start + cfg.seq_len
             button_target = np.zeros((cfg.seq_len, horizon, cfg.num_bin), dtype=np.float32)
             valid_target = np.zeros((cfg.seq_len, horizon), dtype=np.float32)
+            last_action = np.zeros((cfg.seq_len, cfg.num_bin), dtype=np.float32)
 
             frame_indices = np.arange(start, end)
+            context_indices = frame_indices + int(cfg.action_label_offset)
+            context_valid = (context_indices >= 0) & (context_indices < buttons.shape[0])
+            if np.any(context_valid):
+                last_action[context_valid] = buttons[context_indices[context_valid]]
             for h in range(1, horizon + 1):
                 target_indices = frame_indices + h + int(cfg.action_label_offset)
                 prev_indices = target_indices - 1
@@ -350,6 +363,7 @@ def build_window_targets(
 
             button_windows.append(button_target)
             valid_windows.append(valid_target)
+            last_action_windows.append(last_action)
             dt_windows.append(dt[start:end])
             if return_meta:
                 meta.append((video_path, start, end))
@@ -364,6 +378,7 @@ def build_window_targets(
         dt=stack(dt_windows),
         button_horizon=stack(button_windows),
         horizon_valid=stack(valid_windows),
+        last_action=stack(last_action_windows),
         meta=meta if return_meta else None,
     )
 
@@ -598,6 +613,7 @@ def bundle_index(bundle: WindowTargets, indices: torch.Tensor) -> WindowTargets:
         dt=bundle.dt[indices],
         button_horizon=bundle.button_horizon[indices],
         horizon_valid=bundle.horizon_valid[indices],
+        last_action=bundle.last_action[indices],
         meta=None,
     )
 
@@ -607,6 +623,7 @@ def move_bundle_to_device(bundle: WindowTargets, device: torch.device) -> Window
         dt=bundle.dt.to(device, non_blocking=True),
         button_horizon=bundle.button_horizon.to(device, non_blocking=True),
         horizon_valid=bundle.horizon_valid.to(device, non_blocking=True),
+        last_action=bundle.last_action.to(device, non_blocking=True),
         meta=bundle.meta,
     )
 
@@ -616,6 +633,7 @@ def pin_bundle(bundle: WindowTargets) -> WindowTargets:
         dt=bundle.dt.pin_memory(),
         button_horizon=bundle.button_horizon.pin_memory(),
         horizon_valid=bundle.horizon_valid.pin_memory(),
+        last_action=bundle.last_action.pin_memory(),
         meta=bundle.meta,
     )
 
@@ -649,6 +667,37 @@ def compute_losses(
     return total, {
         "button": button_loss.detach(),
     }
+
+
+def regularize_last_action_context(last_action: torch.Tensor, cfg: TrainConfig) -> torch.Tensor:
+    prev_action = last_action.float()
+    if prev_action.dim() != 3:
+        raise ValueError(f"Expected last_action [B,T,C], got {tuple(prev_action.shape)}.")
+
+    batch_size = int(prev_action.size(0))
+    if batch_size > 1 and float(cfg.last_action_corruption_prob) > 0.0:
+        replace = (
+            torch.rand((batch_size, 1, 1), device=prev_action.device)
+            < float(cfg.last_action_corruption_prob)
+        )
+        permuted = prev_action[torch.randperm(batch_size, device=prev_action.device)]
+        prev_action = torch.where(replace, permuted, prev_action)
+
+    if float(cfg.last_action_sequence_dropout) > 0.0:
+        keep_sequence = (
+            torch.rand((batch_size, 1, 1), device=prev_action.device)
+            >= float(cfg.last_action_sequence_dropout)
+        ).to(dtype=prev_action.dtype)
+        prev_action = prev_action * keep_sequence
+
+    if float(cfg.last_action_key_dropout) > 0.0:
+        keep_key = (
+            torch.rand((batch_size, 1, int(prev_action.size(-1))), device=prev_action.device)
+            >= float(cfg.last_action_key_dropout)
+        ).to(dtype=prev_action.dtype)
+        prev_action = prev_action * keep_key
+
+    return prev_action
 
 
 @torch.no_grad()
@@ -799,6 +848,7 @@ def load_batch(iterator, targets: WindowTargets, device: torch.device, cfg: Trai
         dt=targets.dt[labels],
         button_horizon=targets.button_horizon[labels],
         horizon_valid=targets.horizon_valid[labels],
+        last_action=targets.last_action[labels],
         meta=None,
     )
     return frames, target
@@ -840,7 +890,12 @@ def run_epoch(
             frames = augment_frames(frames, cfg)
         with torch.set_grad_enabled(is_train):
             with torch.amp.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_autocast):
-                output = model(frames, dt=batch_targets.dt)
+                prev_action = (
+                    regularize_last_action_context(batch_targets.last_action, cfg)
+                    if is_train
+                    else batch_targets.last_action
+                )
+                output = model(frames, dt=batch_targets.dt, prev_action=prev_action)
                 loss, details = compute_losses(
                     output,
                     batch_targets,
@@ -983,7 +1038,9 @@ def parse_args() -> TrainConfig:
     add("--prediction-horizon", type=int, default=None)
     add("--model-size", type=int, default=None)
     add("--d-model", type=int, default=None)
-    add("--dropout", type=float, default=None)
+    add("--spatial-dropout", type=float, default=None)
+    add("--head-dropout", type=float, default=None)
+    add("--zoneout", type=float, default=None)
     add("--train-seq-stride", type=int, default=None)
     add("--val-seq-stride", type=int, default=None)
     add("--target-effective-batch", type=int, default=None)
@@ -999,6 +1056,9 @@ def parse_args() -> TrainConfig:
     add("--button-threshold-min", type=float, default=None)
     add("--button-threshold-max", type=float, default=None)
     add("--action-label-offset", type=int, default=None)
+    add("--last-action-sequence-dropout", type=float, default=None)
+    add("--last-action-key-dropout", type=float, default=None)
+    add("--last-action-corruption-prob", type=float, default=None)
     add("--skip-key-names", default=None, help="Comma-separated key names to exclude from training labels.")
     add("--train-all-keys", action="store_true", help="Disable the default Greenville test filter for e,q,c,z.")
     add("--button-focal-gamma", type=float, default=None)
@@ -1060,7 +1120,9 @@ def parse_args() -> TrainConfig:
         "prediction_horizon",
         "model_size",
         "d_model",
-        "dropout",
+        "spatial_dropout",
+        "head_dropout",
+        "zoneout",
         "train_seq_stride",
         "val_seq_stride",
         "target_effective_batch",
@@ -1075,6 +1137,9 @@ def parse_args() -> TrainConfig:
         "button_threshold_min",
         "button_threshold_max",
         "action_label_offset",
+        "last_action_sequence_dropout",
+        "last_action_key_dropout",
+        "last_action_corruption_prob",
         "button_focal_gamma",
         "button_label_smoothing",
         "aug_brightness",
@@ -1165,6 +1230,13 @@ def train() -> None:
         "Loss supervision:",
         f"frames={supervised_start}-{supervised_end}",
         f"focal_gamma={cfg.button_focal_gamma:.1f}",
+    )
+    print(
+        "Last action conditioning:",
+        "enabled=True",
+        f"seq_drop={cfg.last_action_sequence_dropout:.2f}",
+        f"key_drop={cfg.last_action_key_dropout:.2f}",
+        f"corrupt={cfg.last_action_corruption_prob:.2f}",
     )
     train_persist = persistence_baseline_metrics(train_targets, cfg)
     print(f"Persistence baseline: train_f1@1={train_persist['macro_f1']:.4f}")

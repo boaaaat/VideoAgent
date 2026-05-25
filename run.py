@@ -440,7 +440,7 @@ def main() -> None:
         f"command_horizon={cfg.command_horizon}",
         f"d_model={cfg.d_model}",
         "temporal=convgru",
-        "input=masked_full_frame",
+        "input=masked_full_frame+rgb_motion+last_action",
     )
     print(
         "Button thresholds:",
@@ -461,6 +461,7 @@ def main() -> None:
     controller = ActionController(cfg)
 
     temporal_state = TemporalState()
+    prev_action = torch.zeros((1, cfg.num_bin), device=device, dtype=inference_dtype)
     was_autopilot = False
 
     print("=" * 60)
@@ -473,10 +474,12 @@ def main() -> None:
 
             if autopilot and not was_autopilot:
                 temporal_state = TemporalState()
+                prev_action = torch.zeros((1, cfg.num_bin), device=device, dtype=inference_dtype)
                 print("Autopilot ENABLED - temporal state reset")
 
             if (not autopilot) and was_autopilot:
                 temporal_state = TemporalState()
+                prev_action = torch.zeros((1, cfg.num_bin), device=device, dtype=inference_dtype)
                 release_all()
                 print("Autopilot DISABLED - temporal state reset")
 
@@ -491,7 +494,12 @@ def main() -> None:
                     with torch.inference_mode():
                         frame_batch = frame.unsqueeze(0)
                         dt = torch.tensor([float(cfg.prediction_dt)], device=device, dtype=frame_batch.dtype)
-                        output, temporal_state = model.forward_step(frame_batch, dt, temporal_state)
+                        output, temporal_state = model.forward_step(
+                            frame_batch,
+                            dt,
+                            temporal_state,
+                            prev_action=prev_action,
+                        )
                         button_logits = output.horizon_button_logits
                     command_idx = max(0, min(int(cfg.command_horizon) - 1, int(cfg.prediction_horizon) - 1))
                     button_probs = torch.sigmoid(button_logits[0, command_idx])
@@ -502,10 +510,11 @@ def main() -> None:
                     )
                     predicted_buttons = (button_probs >= thresholds).to(dtype=button_logits.dtype)
 
-                    controller.apply(
+                    applied_buttons = controller.apply(
                         predicted_buttons,
                         button_probs=button_probs,
                     )
+                    prev_action = applied_buttons.detach().reshape(1, cfg.num_bin).to(device=device, dtype=inference_dtype)
 
                 elapsed = time.perf_counter() - loop_start
                 remaining = float(cfg.decision_interval) - elapsed
