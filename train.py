@@ -61,9 +61,9 @@ class TrainConfig(ModelConfig):
     button_loss_weight: float = 1.0
     button_focal_gamma: float = 2.0
     action_label_offset: int = 0
-    last_action_sequence_dropout: float = 0.20
-    last_action_key_dropout: float = 0.25
-    last_action_corruption_prob: float = 0.10
+    last_action_sequence_dropout: float = 0.50
+    last_action_key_dropout: float = 0.35
+    last_action_corruption_prob: float = 0.15
     skipped_key_names: Optional[Sequence[str]] = ("e", "q", "c", "z")
     button_label_smoothing: float = 0.02
 
