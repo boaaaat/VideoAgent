@@ -145,6 +145,15 @@ def _coerce_config_types(cfg: ModelConfig) -> ModelConfig:
             )
         cfg.prediction_horizon = len(cfg.prediction_horizon_offsets)
     cfg.d_model = int(cfg.d_model)
+    cfg.fastvit_depth = max(0, int(cfg.fastvit_depth))
+    cfg.fastvit_kernel_size = max(3, int(cfg.fastvit_kernel_size))
+    if cfg.fastvit_kernel_size % 2 == 0:
+        cfg.fastvit_kernel_size += 1
+    cfg.temporal_layers = max(1, int(cfg.temporal_layers))
+    cfg.temporal_heads = max(1, int(cfg.temporal_heads))
+    cfg.temporal_context = max(1, int(cfg.temporal_context))
+    pooling = tuple(int(value) for value in cfg.pooling)
+    cfg.pooling = (max(1, pooling[0]), max(1, pooling[1]))
     cfg.num_bin = len(cfg.key_names) + len(cfg.mouse_button_names)
     return cfg
 
@@ -177,7 +186,7 @@ def _detect_checkpoint_kind(state) -> LoadedModelKind:
     inverse_keys = {field.name for field in fields(InverseDynamicsConfig)}
     policy_keys = {field.name for field in fields(ModelConfig)}
 
-    inverse_markers = {"output_seq_len", "visual_encoder_name", "cnn_channels", "gru_hidden_size", "gru_layers"}
+    inverse_markers = {"output_seq_len", "visual_encoder_name", "cnn_channels"}
     policy_markers = {"prediction_horizon", "model_size", "d_model"}
     if any(key in config_dict for key in inverse_markers):
         return "inverse"
@@ -384,38 +393,13 @@ def _compute_feature_map(
         if layer.startswith("stage"):
             stage_idx = int(layer.removeprefix("stage")) - 1
             if stage_idx < 0 or stage_idx >= len(stages):
-                raise ValueError(f"Policy ConvGRU encoder has {len(stages)} stages; cannot show {layer!r}.")
+                raise ValueError(f"Policy encoder has {len(stages)} stages; cannot show {layer!r}.")
             return stages[stage_idx], current, policy_state
         if layer == "spatial":
             return stages[-1], current, policy_state
         if layer == "tokens":
-            spatial_feat = stages[-1]
-            b, _, hf, wf = spatial_feat.shape
-            if hasattr(model, "_prepare_temporal_state") and hasattr(model, "_temporal_step"):
-                h_t = model._prepare_temporal_state(
-                    policy_state,
-                    b,
-                    hf,
-                    wf,
-                    device=spatial_feat.device,
-                    dtype=spatial_feat.dtype,
-                )
-                hidden, new_state = model._temporal_step(spatial_feat, h_t)
-                return hidden, current, TemporalState(hidden_state=new_state.detach())
-            if policy_state is not None and policy_state.hidden_state is not None:
-                h_t = policy_state.hidden_state.to(device=spatial_feat.device, dtype=spatial_feat.dtype)
-            else:
-                h_t = torch.zeros(
-                    b,
-                    int(model.feat_channels),
-                    hf,
-                    wf,
-                    device=spatial_feat.device,
-                    dtype=spatial_feat.dtype,
-                )
-            hidden = model.temporal_rnn(spatial_feat, h_t)
-            return hidden, current, TemporalState(hidden_state=hidden.detach())
-        raise ValueError(f"Unknown policy ConvGRU layer {layer!r}.")
+            return model.fastvit_mixer(stages[-1]), current, policy_state
+        raise ValueError(f"Unknown policy layer {layer!r}.")
 
     x, current = _inverse_encoder_input(frame_rgb, previous_frame_rgb)
     if layer == "motion":
@@ -654,67 +638,48 @@ def _policy_visuals_for_frame(
                 if layer.startswith("stage"):
                     stage_idx = int(layer.removeprefix("stage")) - 1
                     if stage_idx < 0 or stage_idx >= len(stages):
-                        raise ValueError(f"Policy ConvGRU encoder has {len(stages)} stages; cannot show {layer!r}.")
+                        raise ValueError(f"Policy encoder has {len(stages)} stages; cannot show {layer!r}.")
                     feat = stages[stage_idx]
                 elif layer == "spatial":
                     feat = stages[-1]
                 elif layer == "tokens":
-                    feat = None
+                    feat = model.fastvit_mixer(stages[-1])
                 else:
-                    raise ValueError(f"Unknown policy ConvGRU layer {layer!r}.")
+                    raise ValueError(f"Unknown policy layer {layer!r}.")
 
-            needs_temporal = bool(need_trajectory) or layer == "tokens"
+            needs_temporal = bool(need_trajectory)
             if needs_temporal:
                 if stages is None:
                     if hasattr(model.spatial_encoder, "feature_stages"):
                         stages = model.spatial_encoder.feature_stages(masked_frame)
                     else:
                         stages = _activation_stages(model.spatial_encoder.net, masked_frame)
-                spatial_feat = stages[-1]
-                b, _, hf, wf = spatial_feat.shape
-                h_t = model._prepare_temporal_state(
+                b = int(masked_frame.size(0))
+                dt = torch.tensor([float(cfg.prediction_dt)], device=masked_frame.device, dtype=masked_frame.dtype)
+                if prev_action is None:
+                    prev_for_head = torch.zeros((b, int(cfg.num_bin)), device=masked_frame.device, dtype=masked_frame.dtype)
+                else:
+                    prev_for_head = prev_action.to(device=masked_frame.device, dtype=masked_frame.dtype)
+                frame_tokens = model._fused_frame_tokens(masked_frame.unsqueeze(1), dt, prev_for_head)
+                prior_tokens = model._prepare_temporal_state(
                     state,
                     b,
-                    hf,
-                    wf,
-                    device=spatial_feat.device,
-                    dtype=spatial_feat.dtype,
+                    device=frame_tokens.device,
+                    dtype=frame_tokens.dtype,
                 )
-                temporal_feat, new_hidden = model._temporal_step(spatial_feat, h_t)
-                state = TemporalState(hidden_state=new_hidden.detach())
-                if layer == "tokens":
-                    feat = temporal_feat
+                token_memory = torch.cat([prior_tokens, frame_tokens], dim=1)
+                token_memory = token_memory[:, -int(cfg.temporal_context):]
+                temporal_feat = model._encode_temporal_tokens(token_memory)[:, -1]
+                state = TemporalState(hidden_state=token_memory.detach())
 
                 if bool(need_trajectory):
-                    pooled = model.pool(temporal_feat)
-                    visual_feat = model.fc_features(pooled.reshape(b, -1))
-                    dt = torch.tensor([float(cfg.prediction_dt)], device=visual_feat.device, dtype=visual_feat.dtype)
-                    dt_feat = model._dt_features(
-                        dt,
-                        b,
-                        1,
-                        device=visual_feat.device,
-                        dtype=visual_feat.dtype,
-                    ).reshape(b, cfg.d_model)
-                    if prev_action is None:
-                        prev_for_head = torch.zeros((b, int(cfg.num_bin)), device=visual_feat.device, dtype=visual_feat.dtype)
-                    else:
-                        prev_for_head = prev_action.to(device=visual_feat.device, dtype=visual_feat.dtype)
-                    action_feat = model._last_action_features(
-                        prev_for_head,
-                        b,
-                        1,
-                        device=visual_feat.device,
-                        dtype=visual_feat.dtype,
-                    ).reshape(b, cfg.d_model)
-                    fc_out = model.head_fusion(torch.cat([visual_feat, dt_feat, action_feat], dim=-1))
-                    logits = model._horizon_button_logits(fc_out)[0].detach().float()
+                    logits = model._horizon_button_logits(temporal_feat)[0].detach().float()
                     trajectory_probs = torch.sigmoid(logits).detach().cpu().numpy().astype(np.float32)
                     command_idx = min(int(cfg.prediction_horizon) - 1, 9)
                     thresholds = _button_thresholds(cfg, device=logits.device, dtype=logits.dtype)
                     next_action = (
                         torch.sigmoid(logits[command_idx]) >= thresholds
-                    ).to(dtype=visual_feat.dtype).reshape(1, int(cfg.num_bin)).detach()
+                    ).to(dtype=frame_tokens.dtype).reshape(1, int(cfg.num_bin)).detach()
 
             if feat is None:
                 raise RuntimeError(f"Policy layer {layer!r} did not produce a feature map.")
@@ -1019,7 +984,7 @@ def process_video_cnn(
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     if max_frames is not None:
         total_frames = min(max(0, total_frames), max(0, int(max_frames)))
-    pbar = tqdm(total=max(0, total_frames), desc=f"CNN vis [{model_kind}] ({layer}, {mode})")
+    pbar = tqdm(total=max(0, total_frames), desc=f"Encoder vis [{model_kind}] ({layer}, {mode})")
     frame_idx = 0
     previous_frame_rgb: Optional[torch.Tensor] = None
     policy_state: Optional[TemporalState] = None
@@ -1041,7 +1006,7 @@ def process_video_cnn(
         if resolved_csv_path is not None:
             real_buttons = _load_real_button_sequence(resolved_csv_path, trajectory_cfg)
         else:
-            print("[CNN] No matching CSV found; left-side real trajectory will be omitted.")
+            print("[Encoder] No matching CSV found; left-side real trajectory will be omitted.")
 
     try:
         while True:
@@ -1150,11 +1115,11 @@ def process_video_cnn(
         writer.release()
         cap.release()
 
-    print(f"[CNN] Done. Wrote {frame_idx} frames to {output_path}")
+    print(f"[Encoder] Done. Wrote {frame_idx} frames to {output_path}")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Visualize feature-energy heatmaps from the current CNN encoders.")
+    parser = argparse.ArgumentParser(description="Visualize feature-energy heatmaps from the current visual encoders.")
     parser.add_argument("--input", default=r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\data\greenville\run_20260521_182038.mp4', help="Input video path. Defaults to the newest run in cfg.data_root.")
     parser.add_argument("--output", default=None, help="Output video path (.mp4). Default auto-names next to input.")
     parser.add_argument("--csv", default=None, help="CSV labels for the input video. Default auto-detects next to --input.")
@@ -1179,8 +1144,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=["motion", "stage1", "stage2", "stage3", "stage4", "spatial", "tokens"],
         default="spatial",
         help=(
-            "CNN signal to visualize. Policy checkpoints use masked RGB input for motion, stage1-stage4 for "
-            "the spatial encoder blocks, final spatial features for spatial, and ConvGRU hidden features for tokens. "
+            "Encoder signal to visualize. Policy checkpoints use masked RGB input for motion, stage1-stage4 for "
+            "the spatial encoder blocks, final pre-FastViT features for spatial, and FastViT-mixed features for tokens. "
             "Inverse checkpoints support "
             "motion and stage1-stage4."
         ),

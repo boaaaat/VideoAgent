@@ -62,7 +62,6 @@ class RuntimeConfig(ModelConfig):
     print_prob_decimals: int = 3
 
     mouse_buttons_enabled: bool = False
-    gru_memory_frames: int = 80
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -75,7 +74,6 @@ class RuntimeConfig(ModelConfig):
         self.button_threshold_min = float(np.clip(float(self.button_threshold_min), 0.0, 1.0))
         self.button_threshold_max = float(np.clip(float(self.button_threshold_max), self.button_threshold_min, 1.0))
         self.mouse_buttons_enabled = bool(self.mouse_buttons_enabled)
-        self.gru_memory_frames = max(1, int(self.gru_memory_frames))
 
 
 RUNTIME_CFG = RuntimeConfig()
@@ -225,9 +223,17 @@ def _coerce_config_types(cfg: RuntimeConfig) -> RuntimeConfig:
         cfg.prediction_horizon = len(cfg.prediction_horizon_offsets)
     cfg.command_horizon = max(1, min(int(cfg.command_horizon), int(cfg.prediction_horizon)))
     cfg.d_model = int(cfg.d_model)
+    cfg.fastvit_depth = max(0, int(cfg.fastvit_depth))
+    cfg.fastvit_kernel_size = max(3, int(cfg.fastvit_kernel_size))
+    if cfg.fastvit_kernel_size % 2 == 0:
+        cfg.fastvit_kernel_size += 1
+    cfg.temporal_layers = max(1, int(cfg.temporal_layers))
+    cfg.temporal_heads = max(1, int(cfg.temporal_heads))
+    cfg.temporal_context = max(1, int(cfg.temporal_context))
+    pooling = tuple(int(value) for value in cfg.pooling)
+    cfg.pooling = (max(1, pooling[0]), max(1, pooling[1]))
     cfg.prediction_dt = float(cfg.prediction_dt)
     cfg.mouse_buttons_enabled = bool(cfg.mouse_buttons_enabled)
-    cfg.gru_memory_frames = max(1, int(getattr(cfg, "gru_memory_frames", 80)))
     cfg.num_bin = len(cfg.key_names) + len(cfg.mouse_button_names)
     cfg.button_state_threshold = float(np.clip(float(cfg.button_state_threshold), 0.0, 1.0))
     cfg.use_checkpoint_button_thresholds = bool(getattr(cfg, "use_checkpoint_button_thresholds", False))
@@ -454,7 +460,12 @@ def main() -> None:
         f"command_horizon={cfg.command_horizon}",
         f"command_offset=+{int(cfg.prediction_horizon_offsets[cfg.command_horizon - 1])}",
         f"d_model={cfg.d_model}",
-        "temporal=convgru",
+        "architecture=fastvit_temporal_transformer",
+        f"fastvit_depth={cfg.fastvit_depth}",
+        f"fastvit_kernel={cfg.fastvit_kernel_size}",
+        f"temporal_layers={cfg.temporal_layers}",
+        f"temporal_context={cfg.temporal_context}",
+        f"pooling={cfg.pooling[0]}x{cfg.pooling[1]}",
         "input=masked_full_frame+last_action",
     )
     print(

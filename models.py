@@ -15,7 +15,6 @@ from action_space import (
 
 CNN_FEATURE_CHANNELS = 72
 POLICY_INPUT_CHANNELS = 3
-TEMPORAL_RNN_LAYERS = 1
 LAST_ACTION_EMBEDDING_DROPOUT = 0.25
 LAST_ACTION_FEATURE_SCALE = 1.0
 GROUP_NORM_GROUPS = 8
@@ -66,11 +65,16 @@ class ModelConfig:
     mouse_button_names: Optional[List[str]] = None
 
     d_model: int = 256
-    spatial_dropout = 0.10
-    head_dropout = 0.20
-    zoneout = 0.10
+    spatial_dropout: float = 0.10
+    head_dropout: float = 0.20
 
-    pooling: Tuple[int, int] = (5, 5)
+    fastvit_depth: int = 2
+    fastvit_kernel_size: int = 3
+    temporal_layers: int = 2
+    temporal_heads: int = 4
+    temporal_context: int = 80
+
+    pooling: Tuple[int, int] = (3, 3)
     pool_heads: int = 4
 
     button_state_threshold: float = 0.5
@@ -104,7 +108,13 @@ class ModelConfig:
         self.d_model = max(64, int(self.d_model))
         self.spatial_dropout = float(min(max(self.spatial_dropout, 0.0), 0.9))
         self.head_dropout = float(min(max(self.head_dropout, 0.0), 0.9))
-        self.zoneout = float(min(max(self.zoneout, 0.0), 0.9))
+        self.fastvit_depth = max(0, int(self.fastvit_depth))
+        self.fastvit_kernel_size = max(3, int(self.fastvit_kernel_size))
+        if self.fastvit_kernel_size % 2 == 0:
+            self.fastvit_kernel_size += 1
+        self.temporal_layers = max(1, int(self.temporal_layers))
+        self.temporal_heads = _largest_valid_head_count(self.d_model, int(self.temporal_heads))
+        self.temporal_context = max(1, int(self.temporal_context))
         pool_h, pool_w = self.pooling
         self.pooling = (max(1, int(pool_h)), max(1, int(pool_w)))
         self.pool_heads = _largest_valid_head_count(CNN_FEATURE_CHANNELS, int(self.pool_heads))
@@ -213,51 +223,51 @@ class CustomSpatialEncoder(nn.Module):
         return self.feature_stages(x)[-1]
 
 
-class ConvGRUCell(nn.Module):
+class FastVitStyleBlock(nn.Module):
     """
-    A GRU cell that replaces standard Linear matrix multiplications with Conv2d loops,
-    preserving structural 2D coordinates across time.
+    Compact FastViT-style local token mixer for post-CNN feature maps.
     """
-    def __init__(self, input_dim: int, hidden_dim: int, kernel_size: int = 3, zoneout: float = 0.0):
+    def __init__(self, channels: int, kernel_size: int, dropout: float):
         super().__init__()
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        self.zoneout = float(min(max(zoneout, 0.0), 0.9))
+        kernel_size = max(3, int(kernel_size))
+        if kernel_size % 2 == 0:
+            kernel_size += 1
         padding = kernel_size // 2
-        
-        self.gates_conv = nn.Conv2d(
-            in_channels=input_dim + hidden_dim,
-            out_channels=2 * hidden_dim,
-            kernel_size=kernel_size,
-            padding=padding,
-            bias=True
+        hidden_channels = max(int(channels) * 2, int(channels))
+
+        self.token_mixer = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=kernel_size, padding=padding, groups=channels, bias=False),
+            _group_norm(channels),
+            nn.GELU(),
+            nn.Dropout2d(dropout * 0.5),
         )
-        self.candidate_conv = nn.Conv2d(
-            in_channels=input_dim + hidden_dim,
-            out_channels=hidden_dim,
-            kernel_size=kernel_size,
-            padding=padding,
-            bias=True
+        self.channel_mixer = nn.Sequential(
+            nn.Conv2d(channels, hidden_channels, kernel_size=1, bias=False),
+            _group_norm(hidden_channels),
+            nn.GELU(),
+            nn.Dropout2d(dropout),
+            nn.Conv2d(hidden_channels, channels, kernel_size=1, bias=False),
+            _group_norm(channels),
+            nn.Dropout2d(dropout),
         )
 
-    def forward(self, x: torch.Tensor, h_prev: torch.Tensor) -> torch.Tensor:
-        combined = torch.cat([x, h_prev], dim=1)
-        gates = self.gates_conv(combined)
-        r_gate, z_gate = torch.chunk(gates, 2, dim=1)
-        
-        r_gate = torch.sigmoid(r_gate)
-        z_gate = torch.sigmoid(z_gate)
-        
-        combined_candidate = torch.cat([x, r_gate * h_prev], dim=1)
-        candidate = torch.tanh(self.candidate_conv(combined_candidate))
-        
-        h_next = (1.0 - z_gate) * h_prev + z_gate * candidate
-        if self.zoneout <= 0.0:
-            return h_next
-        if self.training:
-            keep_previous = torch.rand_like(h_next) < self.zoneout
-            return torch.where(keep_previous, h_prev, h_next)
-        return (1.0 - self.zoneout) * h_next + self.zoneout * h_prev
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.token_mixer(x)
+        return x + self.channel_mixer(x)
+
+
+class FastVitSpatialMixer(nn.Module):
+    def __init__(self, channels: int, depth: int, kernel_size: int, dropout: float):
+        super().__init__()
+        self.blocks = nn.Sequential(
+            *[
+                FastVitStyleBlock(channels, kernel_size=kernel_size, dropout=dropout)
+                for _ in range(max(0, int(depth)))
+            ]
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.blocks(x)
 
 
 class LearnedMultiHeadSpatialPool2d(nn.Module):
@@ -309,19 +319,12 @@ class DrivingVideoPolicy(nn.Module):
         self.car_x_max_pct = 0.60
         
         self.spatial_encoder = CustomSpatialEncoder(in_channels=POLICY_INPUT_CHANNELS, dropout=cfg.spatial_dropout)
-        
-        # ConvGRU tracking state
         self.feat_channels = CNN_FEATURE_CHANNELS
-        self.temporal_rnns = nn.ModuleList(
-            [
-                ConvGRUCell(
-                    input_dim=self.feat_channels,
-                    hidden_dim=self.feat_channels,
-                    kernel_size=3,
-                    zoneout=cfg.zoneout,
-                )
-                for _ in range(TEMPORAL_RNN_LAYERS)
-            ]
+        self.fastvit_mixer = FastVitSpatialMixer(
+            self.feat_channels,
+            depth=cfg.fastvit_depth,
+            kernel_size=cfg.fastvit_kernel_size,
+            dropout=cfg.spatial_dropout,
         )
         
         # Learned multi-head pooling retains the configured spatial output layout for the classifier.
@@ -353,6 +356,26 @@ class DrivingVideoPolicy(nn.Module):
             nn.Linear(self.cfg.d_model * 3, self.cfg.d_model),
             nn.ELU(inplace=True),
         )
+
+        self.temporal_position_count = max(int(self.cfg.seq_len), int(self.cfg.temporal_context))
+        self.temporal_pos_embed = nn.Parameter(torch.empty(1, self.temporal_position_count, self.cfg.d_model))
+        nn.init.normal_(self.temporal_pos_embed, mean=0.0, std=0.02)
+        temporal_heads = _largest_valid_head_count(self.cfg.d_model, self.cfg.temporal_heads)
+        temporal_layer = nn.TransformerEncoderLayer(
+            d_model=self.cfg.d_model,
+            nhead=temporal_heads,
+            dim_feedforward=max(self.cfg.d_model * 4, 512),
+            dropout=cfg.head_dropout * 0.5,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.temporal_encoder = nn.TransformerEncoder(
+            temporal_layer,
+            num_layers=self.cfg.temporal_layers,
+            norm=nn.LayerNorm(self.cfg.d_model),
+        )
+        self.temporal_norm = nn.LayerNorm(self.cfg.d_model)
         
         self.horizon_queries = nn.Parameter(torch.empty(self.cfg.prediction_horizon, self.cfg.d_model))
         nn.init.normal_(self.horizon_queries, mean=0.0, std=0.02)
@@ -386,18 +409,14 @@ class DrivingVideoPolicy(nn.Module):
     def _initial_temporal_state(
         self,
         batch_size: int,
-        height: int,
-        width: int,
-        *,
+        *unused_spatial_shape: int,
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor:
         return torch.zeros(
-            len(self.temporal_rnns),
             batch_size,
-            self.feat_channels,
-            height,
-            width,
+            0,
+            self.cfg.d_model,
             device=device,
             dtype=dtype,
         )
@@ -406,32 +425,66 @@ class DrivingVideoPolicy(nn.Module):
         self,
         state: Optional[TemporalState],
         batch_size: int,
-        height: int,
-        width: int,
-        *,
+        *unused_spatial_shape: int,
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor:
         if state is None or state.hidden_state is None:
-            return self._initial_temporal_state(batch_size, height, width, device=device, dtype=dtype)
+            return self._initial_temporal_state(batch_size, device=device, dtype=dtype)
 
         hidden = state.hidden_state.to(device=device, dtype=dtype)
-        if hidden.dim() == 4:
-            first = hidden
-            remaining = self._initial_temporal_state(batch_size, height, width, device=device, dtype=dtype)[1:]
-            return torch.cat([first.unsqueeze(0), remaining], dim=0)
-        if hidden.dim() != 5:
-            raise ValueError(f"Expected temporal hidden state [L,B,C,H,W], got {tuple(hidden.shape)}.")
-        if hidden.size(0) != len(self.temporal_rnns):
-            raise ValueError(f"Expected {len(self.temporal_rnns)} temporal layers, got {hidden.size(0)}.")
+        if hidden.dim() == 2:
+            hidden = hidden.unsqueeze(1)
+        if hidden.dim() != 3:
+            raise ValueError(f"Expected temporal token state [B,N,D], got {tuple(hidden.shape)}.")
+        if hidden.size(0) != batch_size:
+            raise ValueError(f"Expected temporal state batch {batch_size}, got {hidden.size(0)}.")
+        if hidden.size(-1) != self.cfg.d_model:
+            raise ValueError(f"Expected temporal token dim {self.cfg.d_model}, got {hidden.size(-1)}.")
+        if hidden.size(1) > self.cfg.temporal_context:
+            hidden = hidden[:, -int(self.cfg.temporal_context):]
         return hidden
 
-    def _temporal_step(self, x_t: torch.Tensor, hidden_state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        next_states = []
-        for layer_idx, rnn in enumerate(self.temporal_rnns):
-            x_t = rnn(x_t, hidden_state[layer_idx])
-            next_states.append(x_t)
-        return x_t, torch.stack(next_states, dim=0)
+    def _causal_attention_mask(self, time_steps: int, device: torch.device) -> torch.Tensor:
+        return torch.ones(time_steps, time_steps, device=device, dtype=torch.bool).triu(1)
+
+    def _encode_temporal_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
+        if tokens.dim() != 3:
+            raise ValueError(f"Expected temporal tokens [B,T,D], got {tuple(tokens.shape)}.")
+        time_steps = int(tokens.size(1))
+        if time_steps <= 0:
+            raise ValueError("Temporal transformer requires at least one token.")
+        if time_steps > self.temporal_position_count:
+            raise ValueError(
+                f"Temporal token length {time_steps} exceeds configured position capacity "
+                f"{self.temporal_position_count}."
+            )
+        pos = self.temporal_pos_embed[:, :time_steps].to(device=tokens.device, dtype=tokens.dtype)
+        causal_mask = self._causal_attention_mask(time_steps, tokens.device)
+        encoded = self.temporal_encoder(tokens + pos, mask=causal_mask, is_causal=True)
+        return self.temporal_norm(encoded)
+
+    def _visual_tokens_from_masked_frames(self, frames: torch.Tensor) -> torch.Tensor:
+        b, t, c, h, w = frames.shape
+        x = frames.reshape(b * t, c, h, w)
+        if x.is_cuda:
+            x = x.contiguous(memory_format=torch.channels_last)
+        spatial_feats = self.fastvit_mixer(self.spatial_encoder(x))
+        pooled = self.pool(spatial_feats)
+        pooled_flat = pooled.reshape(pooled.shape[0], -1)
+        return self.fc_features(pooled_flat).reshape(b, t, self.cfg.d_model)
+
+    def _fused_frame_tokens(
+        self,
+        frames: torch.Tensor,
+        dt: Optional[torch.Tensor],
+        prev_action: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        b, t = int(frames.size(0)), int(frames.size(1))
+        visual_feat = self._visual_tokens_from_masked_frames(frames)
+        dt_feat = self._dt_features(dt, b, t, device=frames.device, dtype=visual_feat.dtype)
+        action_feat = self._last_action_features(prev_action, b, t, device=frames.device, dtype=visual_feat.dtype)
+        return self.head_fusion(torch.cat([visual_feat, dt_feat, action_feat], dim=-1))
 
     def _horizon_button_logits(self, features: torch.Tensor) -> torch.Tensor:
         if features.size(-1) != self.cfg.d_model:
@@ -555,44 +608,25 @@ class DrivingVideoPolicy(nn.Module):
         
         frames = self._normalize_frames(frames)
         frames = self._apply_masks(frames)
-        
-        # 1. Spatial Processing
-        x = frames.reshape(b * t, POLICY_INPUT_CHANNELS, h, w)
-        if x.is_cuda:
-            x = x.contiguous(memory_format=torch.channels_last)
-        spatial_feats = self.spatial_encoder(x)
-        _, cf, hf, wf = spatial_feats.shape
-        spatial_feats = spatial_feats.reshape(b, t, cf, hf, wf)
-        
-        # 2. Temporal ConvGRU Rollout Loop
-        h_t = self._prepare_temporal_state(
+
+        frame_tokens = self._fused_frame_tokens(frames, dt, prev_action)
+        prior_tokens = self._prepare_temporal_state(
             state,
             b,
-            hf,
-            wf,
             device=frames.device,
-            dtype=spatial_feats.dtype,
+            dtype=frame_tokens.dtype,
         )
-            
-        temporal_outputs = []
-        for step in range(t):
-            temporal_feat, h_t = self._temporal_step(spatial_feats[:, step], h_t)
-            temporal_outputs.append(temporal_feat.unsqueeze(1))
-            
-        temporal_out = torch.cat(temporal_outputs, dim=1)  # [B, T, C_feat, H_feat, W_feat]
+        if t > self.temporal_position_count:
+            raise ValueError(
+                f"Input sequence length {t} exceeds temporal position capacity {self.temporal_position_count}."
+            )
+        if prior_tokens.size(1) > 0:
+            keep_prior = max(0, self.temporal_position_count - t)
+            prior_tokens = prior_tokens[:, -keep_prior:] if keep_prior > 0 else prior_tokens[:, :0]
+            frame_tokens = torch.cat([prior_tokens, frame_tokens], dim=1)
+        temporal_out = self._encode_temporal_tokens(frame_tokens)[:, -t:]
         
-        # 3. Linear Downsampling for Classifier Heads
-        temporal_flat = temporal_out.reshape(b * t, cf, hf, wf)
-        pooled = self.pool(temporal_flat)
-        pooled_flat = pooled.reshape(pooled.shape[0], -1)
-        
-        visual_feat = self.fc_features(pooled_flat).reshape(b, t, self.cfg.d_model)
-        dt_feat = self._dt_features(dt, b, t, device=frames.device, dtype=visual_feat.dtype)
-        action_feat = self._last_action_features(prev_action, b, t, device=frames.device, dtype=visual_feat.dtype)
-        fc_out = self.head_fusion(torch.cat([visual_feat, dt_feat, action_feat], dim=-1))
-        
-        # 4. Action Mapping Prediction
-        button = self._horizon_button_logits(fc_out)
+        button = self._horizon_button_logits(temporal_out)
         
         step_button = button[:, :, 0]
         output = PolicyOutput(
@@ -619,39 +653,19 @@ class DrivingVideoPolicy(nn.Module):
         frame_norm = self._normalize_frames(frame)
         masked_frame = self._apply_masks(frame_norm)
 
-        # 2. Extract spatial primitives
-        x = masked_frame
-        if x.is_cuda:
-            x = x.contiguous(memory_format=torch.channels_last)
-        spatial_feat = self.spatial_encoder(x)
-        cf, hf, wf = spatial_feat.shape[1:]
-
-        # 3. Evaluate a single temporal rollout transition step
-        h_t = self._prepare_temporal_state(
+        frame_tokens = self._fused_frame_tokens(masked_frame.unsqueeze(1), dt, prev_action)
+        prior_tokens = self._prepare_temporal_state(
             state,
             b,
-            hf,
-            wf,
             device=frame.device,
-            dtype=spatial_feat.dtype,
+            dtype=frame_tokens.dtype,
         )
-
-        temporal_feat, new_hidden = self._temporal_step(spatial_feat, h_t)
-
-        # 4. Map the new hidden states through the learned spatial pooling layout
-        pooled = self.pool(temporal_feat)
-        pooled_flat = pooled.reshape(b, -1)
-
-        visual_feat = self.fc_features(pooled_flat)
-        dt_feat = self._dt_features(dt, b, 1, device=frame.device, dtype=visual_feat.dtype).reshape(b, self.cfg.d_model)
-        action_feat = self._last_action_features(prev_action, b, 1, device=frame.device, dtype=visual_feat.dtype).reshape(
-            b,
-            self.cfg.d_model,
-        )
-        fc_out = self.head_fusion(torch.cat([visual_feat, dt_feat, action_feat], dim=-1))
+        token_memory = torch.cat([prior_tokens, frame_tokens], dim=1)
+        token_memory = token_memory[:, -int(self.cfg.temporal_context):]
+        temporal_feat = self._encode_temporal_tokens(token_memory)[:, -1]
 
         # 5. Project to action space values
-        button = self._horizon_button_logits(fc_out)
+        button = self._horizon_button_logits(temporal_feat)
 
         squeezed = PolicyOutput(
             button_logits=button[:, 0],
@@ -664,7 +678,7 @@ class DrivingVideoPolicy(nn.Module):
 
         # 6. Detach hidden state to prevent backpropagation graph memory leaks
         new_state = TemporalState(
-            hidden_state=new_hidden.detach(),
+            hidden_state=token_memory.detach(),
             previous_frame=None,
         )
         return squeezed, new_state

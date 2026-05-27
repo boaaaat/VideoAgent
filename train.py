@@ -1035,7 +1035,7 @@ def maybe_resume(
             )
             return 0, 0, -1e9
         raise RuntimeError(
-            f"Cannot resume checkpoint {ckpt_path}: it does not match the current CNN+temporal model. "
+            f"Cannot resume checkpoint {ckpt_path}: it does not match the current policy model. "
             "Start a fresh run or pass --no-resume."
         ) from exc
     optimizer.load_state_dict(state["optimizer_state"])
@@ -1043,7 +1043,7 @@ def maybe_resume(
 
 
 def parse_args() -> TrainConfig:
-    parser = argparse.ArgumentParser(description="Train the CNN+temporal behavioral cloning policy.")
+    parser = argparse.ArgumentParser(description="Train the FastViT + temporal Transformer behavioral cloning policy.")
     add = parser.add_argument
     add("--data-root", default=None)
     add("--ckpt-dir", default=None)
@@ -1059,7 +1059,12 @@ def parse_args() -> TrainConfig:
     add("--d-model", type=int, default=None)
     add("--spatial-dropout", type=float, default=None)
     add("--head-dropout", type=float, default=None)
-    add("--zoneout", type=float, default=None)
+    add("--fastvit-depth", type=int, default=None)
+    add("--fastvit-kernel-size", type=int, default=None)
+    add("--temporal-layers", type=int, default=None)
+    add("--temporal-heads", type=int, default=None)
+    add("--temporal-context", type=int, default=None)
+    add("--pooling", choices=["3x3", "5x5"], default=None)
     add("--train-seq-stride", type=int, default=None)
     add("--val-seq-stride", type=int, default=None)
     add("--target-effective-batch", type=int, default=None)
@@ -1142,7 +1147,11 @@ def parse_args() -> TrainConfig:
         "d_model",
         "spatial_dropout",
         "head_dropout",
-        "zoneout",
+        "fastvit_depth",
+        "fastvit_kernel_size",
+        "temporal_layers",
+        "temporal_heads",
+        "temporal_context",
         "train_seq_stride",
         "val_seq_stride",
         "target_effective_batch",
@@ -1195,6 +1204,9 @@ def parse_args() -> TrainConfig:
         value = args_by_name[key]
         if value is not None:
             kwargs[key] = value
+    if args.pooling is not None:
+        pool_parts = tuple(int(part) for part in str(args.pooling).lower().split("x"))
+        kwargs["pooling"] = pool_parts
     if args.train_all_keys:
         kwargs["skipped_key_names"] = ()
     elif args.skip_key_names is not None:
@@ -1242,6 +1254,16 @@ def train() -> None:
     if cfg.skipped_key_names:
         print(f"Skipping action keys for this training run: {', '.join(cfg.skipped_key_names)}")
     print(f"Training action keys: {', '.join(cfg.key_names + cfg.mouse_button_names)}")
+    print(
+        "Policy architecture:",
+        "fastvit_temporal_transformer",
+        f"fastvit_depth={cfg.fastvit_depth}",
+        f"fastvit_kernel={cfg.fastvit_kernel_size}",
+        f"temporal_layers={cfg.temporal_layers}",
+        f"temporal_heads={cfg.temporal_heads}",
+        f"temporal_context={cfg.temporal_context}",
+        f"pooling={cfg.pooling[0]}x{cfg.pooling[1]}",
+    )
     horizon_offsets = tuple(int(offset) for offset in cfg.prediction_horizon_offsets)
     first_horizon_offset = int(horizon_offsets[0])
     print(f"Horizon frame offsets: {', '.join(str(offset) for offset in horizon_offsets)}")
