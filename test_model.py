@@ -258,7 +258,8 @@ def infer_video(
     state = TemporalState()
     prev_action = torch.zeros((1, cfg.num_bin), device=device, dtype=inference_dtype)
     h_idx = max(0, min(int(command_horizon) - 1, int(cfg.prediction_horizon) - 1))
-    target_offset = h_idx + 1 + int(action_label_offset)
+    horizon_offsets = tuple(int(offset) for offset in cfg.prediction_horizon_offsets)
+    target_offset = horizon_offsets[h_idx] + int(action_label_offset)
     threshold_tensor = torch.tensor(
         list(thresholds),
         device=device,
@@ -483,13 +484,15 @@ def draw_overlay_frame(
     pred_state = predictions["button_state"][frame_idx] >= 0.5
     true_state = gt["button_state"][frame_idx].astype(bool)
     source_idx = int(predictions["source_frame"][frame_idx])
+    h_idx = max(0, min(int(command_horizon) - 1, int(cfg.prediction_horizon) - 1))
+    horizon_offset = int(tuple(cfg.prediction_horizon_offsets)[h_idx])
 
     x = 18
     y = 30
     y = _put_text(panel, f"Frame {frame_idx}", x, y, color=(255, 255, 255), scale=0.72, thickness=2)
     y = _put_text(
         panel,
-        f"pred source={source_idx}  horizon={int(command_horizon)}  offset={int(action_label_offset)}",
+        f"pred source={source_idx}  horizon={int(command_horizon)} frame_offset=+{horizon_offset} label_offset={int(action_label_offset)}",
         x,
         y,
         color=(190, 200, 210),
@@ -652,7 +655,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--labels", default=None, help="Ground-truth CSV. Defaults to the video path with .csv extension.")
     parser.add_argument("--data-root", default="./data/greenville", help="Dataset root used when --video is omitted.")
     parser.add_argument("--output", default="./data/test_model.mp4", help="Output annotated MP4 path.")
-    parser.add_argument("--command-horizon", type=int, default=1, help="1-based horizon index to visualize.")
+    parser.add_argument("--command-horizon", type=int, default=10, help="1-based horizon index to visualize.")
     parser.add_argument("--action-label-offset", type=int, default=None, help="Override checkpoint action_label_offset.")
     parser.add_argument("--threshold", type=float, default=None, help="Override button threshold. Defaults to checkpoint thresholds.")
     parser.add_argument("--change-threshold", type=float, default=None, help="Ignored for current direct-state policy checkpoints.")
@@ -694,6 +697,7 @@ def main() -> None:
 
     gt = load_ground_truth(label_path, cfg, total_frames)
     thresholds = _resolve_thresholds(cfg, args.threshold)
+    command_idx = max(0, min(int(args.command_horizon) - 1, int(cfg.prediction_horizon) - 1))
     print(
         "Loaded policy:",
         f"checkpoint={checkpoint_path}",
@@ -702,7 +706,9 @@ def main() -> None:
         "temporal=convgru",
         f"seq={cfg.seq_len}",
         f"horizon={cfg.prediction_horizon}",
+        f"horizon_offsets={','.join(str(int(offset)) for offset in cfg.prediction_horizon_offsets)}",
         f"command_horizon={args.command_horizon}",
+        f"command_offset=+{int(tuple(cfg.prediction_horizon_offsets)[command_idx])}",
         f"offset={action_label_offset}",
         f"actions={','.join(cfg.key_names + cfg.mouse_button_names)}",
         f"device={device}",

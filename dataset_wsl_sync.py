@@ -22,8 +22,8 @@ def is_wsl() -> bool:
 
 def default_target_root() -> Path:
     if is_wsl():
-        return Path.home() / "ai" / "dataset"
-    return Path("./dataset")
+        return Path.home() / "ai" / "data"
+    return Path("./data")
 
 
 @dataclass
@@ -217,7 +217,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--target-root",
         default=None,
-        help="Cached dataset directory to pass as --data-root. Defaults to ~/ai/dataset in WSL, ./dataset elsewhere.",
+        help="Cached dataset directory to pass as --data-root. Defaults to ~/ai/data in WSL, ./data elsewhere.",
     )
     parser.add_argument("--video-ext", default=".mp4")
     parser.add_argument("--csv-ext", default=".csv")

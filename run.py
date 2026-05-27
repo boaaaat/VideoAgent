@@ -57,7 +57,7 @@ class RuntimeConfig(ModelConfig):
     use_checkpoint_button_thresholds: bool = False
 
     decision_interval: float = 1.0 / 20.0
-    command_horizon: int = 1
+    command_horizon: int = 10
     print_every: int = 2
     print_prob_decimals: int = 3
 
@@ -209,6 +209,20 @@ def _coerce_config_types(cfg: RuntimeConfig) -> RuntimeConfig:
     cfg.val_seq_stride = int(cfg.val_seq_stride)
     cfg.model_size = int(cfg.model_size)
     cfg.prediction_horizon = int(cfg.prediction_horizon)
+    offsets = getattr(cfg, "prediction_horizon_offsets", None)
+    if offsets is None:
+        cfg.prediction_horizon_offsets = tuple(range(1, cfg.prediction_horizon + 1))
+    else:
+        cfg.prediction_horizon_offsets = tuple(int(offset) for offset in offsets)
+        if not cfg.prediction_horizon_offsets:
+            cfg.prediction_horizon_offsets = tuple(range(1, cfg.prediction_horizon + 1))
+        if any(offset <= 0 for offset in cfg.prediction_horizon_offsets):
+            raise ValueError(f"prediction_horizon_offsets must be positive, got {cfg.prediction_horizon_offsets}.")
+        if any(curr <= prev for prev, curr in zip(cfg.prediction_horizon_offsets, cfg.prediction_horizon_offsets[1:])):
+            raise ValueError(
+                f"prediction_horizon_offsets must be strictly increasing, got {cfg.prediction_horizon_offsets}."
+            )
+        cfg.prediction_horizon = len(cfg.prediction_horizon_offsets)
     cfg.command_horizon = max(1, min(int(cfg.command_horizon), int(cfg.prediction_horizon)))
     cfg.d_model = int(cfg.d_model)
     cfg.prediction_dt = float(cfg.prediction_dt)
@@ -438,9 +452,10 @@ def main() -> None:
         f"size={cfg.model_size}",
         f"horizon={cfg.prediction_horizon}",
         f"command_horizon={cfg.command_horizon}",
+        f"command_offset=+{int(cfg.prediction_horizon_offsets[cfg.command_horizon - 1])}",
         f"d_model={cfg.d_model}",
         "temporal=convgru",
-        "input=masked_full_frame+rgb_motion+last_action",
+        "input=masked_full_frame+last_action",
     )
     print(
         "Button thresholds:",

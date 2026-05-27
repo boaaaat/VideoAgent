@@ -13,11 +13,13 @@ from action_space import (
 )
 
 
-CNN_FEATURE_CHANNELS = 64
-POLICY_INPUT_CHANNELS = 6
+CNN_FEATURE_CHANNELS = 72
+POLICY_INPUT_CHANNELS = 3
 TEMPORAL_RNN_LAYERS = 1
 LAST_ACTION_EMBEDDING_DROPOUT = 0.25
-LAST_ACTION_RESIDUAL_SCALE = 0.1
+LAST_ACTION_FEATURE_SCALE = 1.0
+GROUP_NORM_GROUPS = 8
+DEFAULT_HORIZON_OFFSETS = (1, 2, 3, 5, 7, 10, 13, 16, 20, 24)
 
 
 def _largest_valid_head_count(channels: int, requested_heads: int) -> int:
@@ -26,6 +28,23 @@ def _largest_valid_head_count(channels: int, requested_heads: int) -> int:
         if channels % heads == 0:
             return heads
     return 1
+
+
+def _group_norm(channels: int) -> nn.GroupNorm:
+    groups = max(1, min(int(GROUP_NORM_GROUPS), int(channels)))
+    while int(channels) % groups != 0:
+        groups -= 1
+    return nn.GroupNorm(groups, int(channels))
+
+
+def _default_horizon_offsets(prediction_horizon: int) -> Tuple[int, ...]:
+    horizon = max(1, int(prediction_horizon))
+    if horizon <= len(DEFAULT_HORIZON_OFFSETS):
+        return tuple(DEFAULT_HORIZON_OFFSETS[:horizon])
+    offsets = list(DEFAULT_HORIZON_OFFSETS)
+    while len(offsets) < horizon:
+        offsets.append(offsets[-1] + 4)
+    return tuple(offsets)
 
 
 @dataclass
@@ -40,15 +59,16 @@ class ModelConfig:
     train_seq_stride: int = 40
     val_seq_stride: int = 80
     prediction_dt: float = 1.0 / 20.0
-    prediction_horizon: int = 1
+    prediction_horizon: int = 10
+    prediction_horizon_offsets: Optional[Sequence[int]] = None
 
     key_names: Optional[List[str]] = None
     mouse_button_names: Optional[List[str]] = None
 
     d_model: int = 256
-    spatial_dropout: float = 0.15
-    head_dropout: float = 0.40
-    zoneout: float = 0.2
+    spatial_dropout = 0.10
+    head_dropout = 0.20
+    zoneout = 0.10
 
     pooling: Tuple[int, int] = (5, 5)
     pool_heads: int = 4
@@ -68,6 +88,18 @@ class ModelConfig:
         self.val_seq_stride = max(1, int(self.val_seq_stride))
         self.prediction_dt = max(1.0 / 240.0, float(self.prediction_dt))
         self.prediction_horizon = max(1, int(self.prediction_horizon))
+        if self.prediction_horizon_offsets is None:
+            self.prediction_horizon_offsets = _default_horizon_offsets(self.prediction_horizon)
+        else:
+            offsets = tuple(int(offset) for offset in self.prediction_horizon_offsets)
+            if not offsets:
+                raise ValueError("prediction_horizon_offsets must contain at least one frame offset.")
+            if any(offset <= 0 for offset in offsets):
+                raise ValueError(f"prediction_horizon_offsets must be positive, got {offsets}.")
+            if any(curr <= prev for prev, curr in zip(offsets, offsets[1:])):
+                raise ValueError(f"prediction_horizon_offsets must be strictly increasing, got {offsets}.")
+            self.prediction_horizon_offsets = offsets
+            self.prediction_horizon = len(offsets)
 
         self.d_model = max(64, int(self.d_model))
         self.spatial_dropout = float(min(max(self.spatial_dropout, 0.0), 0.9))
@@ -120,10 +152,10 @@ class ResBlock(nn.Module):
         super().__init__()
         self.conv = nn.Sequential(
             nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(channels),
+            _group_norm(channels),
             nn.ELU(inplace=True),
             nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(channels),
+            _group_norm(channels),
             nn.Dropout2d(dropout)
         )
         self.elu = nn.ELU(inplace=True)
@@ -134,34 +166,51 @@ class ResBlock(nn.Module):
 
 class CustomSpatialEncoder(nn.Module):
     """
-    Downsamples the screen while embedding strong spatial features.
-    Outputs a feature map scale of (Batch, 64, H/16, W/16).
+    Preserves /4 detail features and fuses them into /8 semantic features.
+    Outputs a feature map scale of [B, CNN_FEATURE_CHANNELS, H/8, W/8].
     """
     def __init__(self, in_channels: int = 3, dropout: float = 0.2):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(in_channels, 16, kernel_size=5, stride=2, padding=2, bias=False),  # /2
-            nn.BatchNorm2d(16),
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, 24, kernel_size=5, stride=2, padding=2, bias=False),  # /2
+            _group_norm(24),
             nn.ELU(inplace=True),
-            
-            nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1, bias=False),          # /4
-            nn.BatchNorm2d(32),
-            nn.ELU(inplace=True),
-            ResBlock(32, dropout),
-            
-            nn.Conv2d(32, 48, kernel_size=3, stride=2, padding=1, bias=False),          # /8
-            nn.BatchNorm2d(48),
+        )
+        self.detail = nn.Sequential(
+            nn.Conv2d(24, 48, kernel_size=3, stride=2, padding=1, bias=False),          # /4
+            _group_norm(48),
             nn.ELU(inplace=True),
             ResBlock(48, dropout),
-            
-            nn.Conv2d(48, 64, kernel_size=3, stride=2, padding=1, bias=False),          # /16
-            nn.BatchNorm2d(64),
+        )
+        self.semantic = nn.Sequential(
+            nn.Conv2d(48, CNN_FEATURE_CHANNELS, kernel_size=3, stride=2, padding=1, bias=False),          # /8
+            _group_norm(CNN_FEATURE_CHANNELS),
             nn.ELU(inplace=True),
-            ResBlock(64, dropout)
+            ResBlock(CNN_FEATURE_CHANNELS, dropout),
+        )
+        self.detail_to_semantic = nn.Sequential(
+            nn.Conv2d(48, 48, kernel_size=3, stride=2, padding=1, bias=False),          # /4 -> /8
+            _group_norm(48),
+            nn.ELU(inplace=True),
+            ResBlock(48, dropout * 0.5),
+        )
+        self.fuse = nn.Sequential(
+            nn.Conv2d(CNN_FEATURE_CHANNELS + 48, CNN_FEATURE_CHANNELS, kernel_size=1, bias=False),
+            _group_norm(CNN_FEATURE_CHANNELS),
+            nn.ELU(inplace=True),
+            ResBlock(CNN_FEATURE_CHANNELS, dropout)
         )
 
+    def feature_stages(self, x: torch.Tensor) -> List[torch.Tensor]:
+        stem = self.stem(x)
+        detail = self.detail(stem)
+        semantic = self.semantic(detail)
+        detail_semantic = self.detail_to_semantic(detail)
+        fused = self.fuse(torch.cat([semantic, detail_semantic], dim=1))
+        return [stem, detail, semantic, fused]
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        return self.feature_stages(x)[-1]
 
 
 class ConvGRUCell(nn.Module):
@@ -268,7 +317,7 @@ class DrivingVideoPolicy(nn.Module):
                 ConvGRUCell(
                     input_dim=self.feat_channels,
                     hidden_dim=self.feat_channels,
-                    kernel_size=5,
+                    kernel_size=3,
                     zoneout=cfg.zoneout,
                 )
                 for _ in range(TEMPORAL_RNN_LAYERS)
@@ -298,9 +347,41 @@ class DrivingVideoPolicy(nn.Module):
         if isinstance(final_action_layer, nn.Linear):
             nn.init.zeros_(final_action_layer.weight)
             nn.init.zeros_(final_action_layer.bias)
+
+        self.head_fusion = nn.Sequential(
+            nn.LayerNorm(self.cfg.d_model * 3),
+            nn.Linear(self.cfg.d_model * 3, self.cfg.d_model),
+            nn.ELU(inplace=True),
+        )
         
-        self.button_head = nn.Linear(self.cfg.d_model, self.cfg.prediction_horizon * self.cfg.num_bin)
-        nn.init.constant_(self.button_head.bias, -1.0)
+        self.horizon_queries = nn.Parameter(torch.empty(self.cfg.prediction_horizon, self.cfg.d_model))
+        nn.init.normal_(self.horizon_queries, mean=0.0, std=0.02)
+        decoder_heads = _largest_valid_head_count(self.cfg.d_model, 4)
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=self.cfg.d_model,
+            nhead=decoder_heads,
+            dim_feedforward=max(self.cfg.d_model * 4, 512),
+            dropout=cfg.head_dropout * 0.5,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.horizon_decoder = nn.TransformerDecoder(
+            decoder_layer,
+            num_layers=2,
+            norm=nn.LayerNorm(self.cfg.d_model),
+        )
+        horizon_hidden = max(64, self.cfg.d_model // 2)
+        self.button_head = nn.Sequential(
+            nn.LayerNorm(self.cfg.d_model),
+            nn.Linear(self.cfg.d_model, horizon_hidden),
+            nn.ELU(inplace=True),
+            nn.Dropout(cfg.head_dropout * 0.5),
+            nn.Linear(horizon_hidden, self.cfg.num_bin),
+        )
+        final_button_layer = self.button_head[-1]
+        if isinstance(final_button_layer, nn.Linear):
+            nn.init.constant_(final_button_layer.bias, -1.0)
 
     def _initial_temporal_state(
         self,
@@ -351,6 +432,17 @@ class DrivingVideoPolicy(nn.Module):
             x_t = rnn(x_t, hidden_state[layer_idx])
             next_states.append(x_t)
         return x_t, torch.stack(next_states, dim=0)
+
+    def _horizon_button_logits(self, features: torch.Tensor) -> torch.Tensor:
+        if features.size(-1) != self.cfg.d_model:
+            raise ValueError(f"Expected final feature dim {self.cfg.d_model}, got {features.size(-1)}.")
+        leading_shape = tuple(features.shape[:-1])
+        memory = features.reshape(-1, 1, self.cfg.d_model)
+        queries = self.horizon_queries.to(device=features.device, dtype=features.dtype)
+        queries = queries.unsqueeze(0).expand(memory.size(0), -1, -1)
+        decoded = self.horizon_decoder(tgt=queries, memory=memory)
+        logits = self.button_head(decoded)
+        return logits.reshape(*leading_shape, self.cfg.prediction_horizon, self.cfg.num_bin)
 
     def _normalize_frames(self, frames: torch.Tensor) -> torch.Tensor:
         if frames.dtype == torch.uint8:
@@ -422,37 +514,7 @@ class DrivingVideoPolicy(nn.Module):
 
         action_values = action_values.clamp(0.0, 1.0).reshape(batch_size * time_steps, self.cfg.num_bin)
         features = self.last_action_encoder(action_values).reshape(batch_size, time_steps, self.cfg.d_model)
-        return features.to(dtype=dtype) * LAST_ACTION_RESIDUAL_SCALE
-
-    def _motion_input_from_masked_sequence(self, masked_frames: torch.Tensor) -> torch.Tensor:
-        if masked_frames.dim() != 5 or masked_frames.size(2) != 3:
-            raise ValueError(f"Expected masked RGB frames [B,T,3,H,W], got {tuple(masked_frames.shape)}.")
-        prev = torch.cat([masked_frames[:, :1], masked_frames[:, :-1]], dim=1)
-        motion = masked_frames - prev
-        return torch.cat([masked_frames, motion], dim=2)
-
-    def _previous_frame_for_step(
-        self,
-        state: Optional[TemporalState],
-        masked_frame: torch.Tensor,
-    ) -> torch.Tensor:
-        if state is None or state.previous_frame is None:
-            return masked_frame
-        previous = state.previous_frame.to(device=masked_frame.device, dtype=masked_frame.dtype)
-        if tuple(previous.shape) != tuple(masked_frame.shape):
-            return masked_frame
-        return previous
-
-    def _motion_input_for_step(
-        self,
-        masked_frame: torch.Tensor,
-        state: Optional[TemporalState],
-    ) -> torch.Tensor:
-        if masked_frame.dim() != 4 or masked_frame.size(1) != 3:
-            raise ValueError(f"Expected masked RGB frame [B,3,H,W], got {tuple(masked_frame.shape)}.")
-        previous = self._previous_frame_for_step(state, masked_frame)
-        motion = masked_frame - previous
-        return torch.cat([masked_frame, motion], dim=1)
+        return features.to(dtype=dtype) * LAST_ACTION_FEATURE_SCALE
 
     def _apply_masks(self, frames: torch.Tensor) -> torch.Tensor:
         h, w = frames.shape[-2:]
@@ -495,7 +557,7 @@ class DrivingVideoPolicy(nn.Module):
         frames = self._apply_masks(frames)
         
         # 1. Spatial Processing
-        x = self._motion_input_from_masked_sequence(frames).reshape(b * t, POLICY_INPUT_CHANNELS, h, w)
+        x = frames.reshape(b * t, POLICY_INPUT_CHANNELS, h, w)
         if x.is_cuda:
             x = x.contiguous(memory_format=torch.channels_last)
         spatial_feats = self.spatial_encoder(x)
@@ -524,19 +586,22 @@ class DrivingVideoPolicy(nn.Module):
         pooled = self.pool(temporal_flat)
         pooled_flat = pooled.reshape(pooled.shape[0], -1)
         
-        fc_out = self.fc_features(pooled_flat)
-        fc_out = fc_out.reshape(b, t, self.cfg.d_model)
-        fc_out = fc_out + self._dt_features(dt, b, t, device=frames.device, dtype=fc_out.dtype)
-        fc_out = fc_out + self._last_action_features(prev_action, b, t, device=frames.device, dtype=fc_out.dtype)
+        visual_feat = self.fc_features(pooled_flat).reshape(b, t, self.cfg.d_model)
+        dt_feat = self._dt_features(dt, b, t, device=frames.device, dtype=visual_feat.dtype)
+        action_feat = self._last_action_features(prev_action, b, t, device=frames.device, dtype=visual_feat.dtype)
+        fc_out = self.head_fusion(torch.cat([visual_feat, dt_feat, action_feat], dim=-1))
         
         # 4. Action Mapping Prediction
-        button = self.button_head(fc_out).reshape(b, t, self.cfg.prediction_horizon, self.cfg.num_bin)
+        button = self._horizon_button_logits(fc_out)
         
         step_button = button[:, :, 0]
         output = PolicyOutput(
             button_logits=step_button,
             horizon_button_logits=button,
-            future_button_logits={idx + 1: button[:, :, idx] for idx in range(self.cfg.prediction_horizon)},
+            future_button_logits={
+                int(offset): button[:, :, idx]
+                for idx, offset in enumerate(self.cfg.prediction_horizon_offsets)
+            },
         )
         return output
 
@@ -555,7 +620,7 @@ class DrivingVideoPolicy(nn.Module):
         masked_frame = self._apply_masks(frame_norm)
 
         # 2. Extract spatial primitives
-        x = self._motion_input_for_step(masked_frame, state)
+        x = masked_frame
         if x.is_cuda:
             x = x.contiguous(memory_format=torch.channels_last)
         spatial_feat = self.spatial_encoder(x)
@@ -573,26 +638,33 @@ class DrivingVideoPolicy(nn.Module):
 
         temporal_feat, new_hidden = self._temporal_step(spatial_feat, h_t)
 
-        # 4. Map the new hidden states through your 5x5 pooling layout
+        # 4. Map the new hidden states through the learned spatial pooling layout
         pooled = self.pool(temporal_feat)
         pooled_flat = pooled.reshape(b, -1)
 
-        fc_out = self.fc_features(pooled_flat)
-        fc_out = fc_out + self._dt_features(dt, b, 1, device=frame.device, dtype=fc_out.dtype).reshape(b, self.cfg.d_model)
-        fc_out = fc_out + self._last_action_features(prev_action, b, 1, device=frame.device, dtype=fc_out.dtype).reshape(b, self.cfg.d_model)
+        visual_feat = self.fc_features(pooled_flat)
+        dt_feat = self._dt_features(dt, b, 1, device=frame.device, dtype=visual_feat.dtype).reshape(b, self.cfg.d_model)
+        action_feat = self._last_action_features(prev_action, b, 1, device=frame.device, dtype=visual_feat.dtype).reshape(
+            b,
+            self.cfg.d_model,
+        )
+        fc_out = self.head_fusion(torch.cat([visual_feat, dt_feat, action_feat], dim=-1))
 
         # 5. Project to action space values
-        button = self.button_head(fc_out).reshape(b, self.cfg.prediction_horizon, self.cfg.num_bin)
+        button = self._horizon_button_logits(fc_out)
 
         squeezed = PolicyOutput(
             button_logits=button[:, 0],
             horizon_button_logits=button,
-            future_button_logits={idx + 1: button[:, idx] for idx in range(self.cfg.prediction_horizon)},
+            future_button_logits={
+                int(offset): button[:, idx]
+                for idx, offset in enumerate(self.cfg.prediction_horizon_offsets)
+            },
         )
 
         # 6. Detach hidden state to prevent backpropagation graph memory leaks
         new_state = TemporalState(
             hidden_state=new_hidden.detach(),
-            previous_frame=masked_frame.detach(),
+            previous_frame=None,
         )
         return squeezed, new_state

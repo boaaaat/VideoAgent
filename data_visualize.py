@@ -228,7 +228,7 @@ def draw_overlay(
     label_str = f"{label_idx}" if label_idx is not None else "N/A"
     cv2.putText(
         frame,
-        f"Target idx: {label_str} = frame + horizon + offset",
+        f"Target idx: {label_str} = frame + frame_offset + label_offset",
         (x0 + 10, y),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.5,
@@ -239,7 +239,7 @@ def draw_overlay(
 
     cv2.putText(
         frame,
-        f"Horizon: {prediction_horizon:+d}  action_label_offset: {action_label_offset:+d}",
+        f"Frame offset: {prediction_horizon:+d}  label_offset: {action_label_offset:+d}",
         (x0 + 10, y),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.5,
@@ -377,14 +377,25 @@ def main() -> int:
     parser.add_argument(
         "--prediction-horizon",
         type=int,
-        default=1,
-        help="Training prediction horizon h. Target idx = frame + h + action_label_offset.",
+        default=None,
+        help="Direct future frame offset override. Target idx = frame + offset + action_label_offset.",
+    )
+    parser.add_argument(
+        "--prediction-horizon-offsets",
+        default="1,2,3,5,7,10,13,16,20,24",
+        help="Comma-separated training horizon frame offsets.",
+    )
+    parser.add_argument(
+        "--command-horizon",
+        type=int,
+        default=10,
+        help="1-based horizon head to visualize when --prediction-horizon is omitted.",
     )
     parser.add_argument(
         "--action-label-offset",
         type=int,
         default=0,
-        help="Same offset used by train.py. Target idx = frame + horizon + offset.",
+        help="Same offset used by train.py. Target idx = frame + frame_offset + label_offset.",
     )
     parser.add_argument(
         "--max-frames",
@@ -484,7 +495,19 @@ def main() -> int:
                     desc="Writing",
                 )
 
-            prediction_horizon = max(1, int(args.prediction_horizon))
+            horizon_offsets = tuple(
+                int(part.strip())
+                for part in str(args.prediction_horizon_offsets).split(",")
+                if part.strip()
+            )
+            if not horizon_offsets:
+                raise ValueError("--prediction-horizon-offsets must contain at least one frame offset.")
+            command_idx = max(0, min(int(args.command_horizon) - 1, len(horizon_offsets) - 1))
+            prediction_horizon = (
+                max(1, int(args.prediction_horizon))
+                if args.prediction_horizon is not None
+                else int(horizon_offsets[command_idx])
+            )
             if args.label_shift is None:
                 action_label_offset = int(args.action_label_offset)
                 label_idx = current_idx + prediction_horizon + action_label_offset

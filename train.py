@@ -40,30 +40,30 @@ class TrainConfig(ModelConfig):
     grad_accum: int = 8
     num_epochs: int = 100
 
-    lr: float = 3e-4
+    lr: float = 2e-4
     min_lr: float = 1e-5
     warmup_steps: int = 50
-    weight_decay: float = 0.01
+    weight_decay: float = 0.03
     grad_clip: float = 1.0
 
     amp_dtype: str = "bf16"
     compile_model: bool = True
     compile_mode: str = "default"
 
-    train_split: float = 0.9
+    train_split: float = 0.8
     split_seed: int = 1337
-    pos_weight_power: float = 0.5
+    pos_weight_power: float = 0.25
     pos_weight_clamp: float = 8
     button_threshold_from_pos_weight: bool = False
     button_threshold_min: float = 0.5
     button_threshold_max: float = 0.9
 
     button_loss_weight: float = 1.0
-    button_focal_gamma: float = 2.0
+    button_focal_gamma: float = 1.0
     action_label_offset: int = 0
-    last_action_sequence_dropout: float = 0.50
-    last_action_key_dropout: float = 0.35
-    last_action_corruption_prob: float = 0.15
+    last_action_sequence_dropout: float = 0.15
+    last_action_key_dropout: float = 0.3
+    last_action_corruption_prob: float = 0.1
     skipped_key_names: Optional[Sequence[str]] = ("e", "q", "c", "z")
     button_label_smoothing: float = 0.02
 
@@ -332,7 +332,8 @@ def build_window_targets(
     dt_windows: List[np.ndarray] = []
     meta: List[Tuple[str, int, int]] = []
 
-    horizon = int(cfg.prediction_horizon)
+    horizon_offsets = tuple(int(offset) for offset in cfg.prediction_horizon_offsets)
+    horizon = len(horizon_offsets)
     for video_path, csv_path in pairs:
         run = load_run_arrays(csv_path, cfg)
         buttons = run["buttons"]
@@ -352,14 +353,14 @@ def build_window_targets(
             context_valid = (context_indices >= 0) & (context_indices < buttons.shape[0])
             if np.any(context_valid):
                 last_action[context_valid] = buttons[context_indices[context_valid]]
-            for h in range(1, horizon + 1):
-                target_indices = frame_indices + h + int(cfg.action_label_offset)
+            for horizon_idx, horizon_offset in enumerate(horizon_offsets):
+                target_indices = frame_indices + horizon_offset + int(cfg.action_label_offset)
                 prev_indices = target_indices - 1
                 valid = (target_indices >= 0) & (target_indices < buttons.shape[0]) & (prev_indices >= 0)
                 if np.any(valid):
                     valid_target_indices = target_indices[valid]
-                    button_target[valid, h - 1] = buttons[valid_target_indices]
-                    valid_target[valid, h - 1] = 1.0
+                    button_target[valid, horizon_idx] = buttons[valid_target_indices]
+                    valid_target[valid, horizon_idx] = 1.0
 
             button_windows.append(button_target)
             valid_windows.append(valid_target)
@@ -553,7 +554,7 @@ def compute_pos_weight(
 
 
 def supervised_start_frame(seq_len: int) -> int:
-    return max(0, int(seq_len) // 2)
+    return max(0, int(seq_len) // 4)
 
 
 def supervised_frame_range(seq_len: int) -> Tuple[int, int]:
@@ -661,7 +662,18 @@ def compute_losses(
     button_prob = torch.sigmoid(button_logits)
     p_t = button_prob * button_target + (1.0 - button_prob) * (1.0 - button_target)
     button_loss_raw = button_loss_raw * (1.0 - p_t).clamp(min=0.0, max=1.0).pow(float(cfg.button_focal_gamma))
-    button_loss = (button_loss_raw * valid_4d).sum() / (valid_4d.sum() * cfg.num_bin).clamp(min=1.0)
+    loss_weight = valid_4d
+    horizon_count = int(button_logits.size(2))
+    if horizon_count > 1:
+        horizon_weight = torch.linspace(
+            0.5,
+            1.5,
+            horizon_count,
+            device=button_logits.device,
+            dtype=button_logits.dtype,
+        ).view(1, 1, horizon_count, 1)
+        loss_weight = loss_weight * horizon_weight
+    button_loss = (button_loss_raw * loss_weight).sum() / (loss_weight.sum() * cfg.num_bin).clamp(min=1.0)
 
     total = cfg.button_loss_weight * button_loss
     return total, {
@@ -765,18 +777,24 @@ def persistence_baseline_metrics(targets: WindowTargets, cfg: TrainConfig) -> Di
 
 
 def driving_score(metrics: Dict[str, float], cfg: TrainConfig) -> float:
-    rows = metrics.get("step1_button_rows", [])
-    if not isinstance(rows, list):
-        return metrics["step1_button_macro_f1"]
-    by_name = {str(row.get("name")): row for row in rows if isinstance(row, dict)}
-    weights = {"w": 3.0, "a": 1.5, "d": 1.5, "s": 0.75}
-    state_total = 0.0
-    total_weight = 0.0
-    for name, weight in weights.items():
-        row = by_name.get(name)
-        state_total += float((row or {}).get("f1", 0.0)) * float(weight)
-        total_weight += float(weight)
-    return state_total / max(total_weight, 1.0)
+    def score_rows(rows: object, fallback: float) -> float:
+        if not isinstance(rows, list):
+            return float(fallback)
+        by_name = {str(row.get("name")): row for row in rows if isinstance(row, dict)}
+        weights = {"w": 3.0, "a": 1.5, "d": 1.5, "s": 0.75}
+        state_total = 0.0
+        total_weight = 0.0
+        for name, weight in weights.items():
+            row = by_name.get(name)
+            state_total += float((row or {}).get("f1", 0.0)) * float(weight)
+            total_weight += float(weight)
+        return state_total / max(total_weight, 1.0)
+
+    step1_score = score_rows(metrics.get("step1_button_rows", []), metrics["step1_button_macro_f1"])
+    if int(cfg.prediction_horizon) <= 1:
+        return step1_score
+    final_score = score_rows(metrics.get("final_button_rows", []), metrics["final_button_macro_f1"])
+    return 0.2 * step1_score + 0.8 * final_score
 
 
 def print_button_stats_table(title: str, rows: Sequence[Dict[str, float | int | str]]) -> None:
@@ -1036,6 +1054,7 @@ def parse_args() -> TrainConfig:
     add("--batch-size", type=int, default=None)
     add("--seq-len", type=int, default=None)
     add("--prediction-horizon", type=int, default=None)
+    add("--prediction-horizon-offsets", default=None, help="Comma-separated future frame offsets for horizon heads.")
     add("--model-size", type=int, default=None)
     add("--d-model", type=int, default=None)
     add("--spatial-dropout", type=float, default=None)
@@ -1118,6 +1137,7 @@ def parse_args() -> TrainConfig:
         "batch_size",
         "seq_len",
         "prediction_horizon",
+        "prediction_horizon_offsets",
         "model_size",
         "d_model",
         "spatial_dropout",
@@ -1181,6 +1201,12 @@ def parse_args() -> TrainConfig:
         kwargs["skipped_key_names"] = tuple(
             name.strip() for name in str(args.skip_key_names).split(",") if name.strip()
         )
+    if args.prediction_horizon_offsets is not None:
+        kwargs["prediction_horizon_offsets"] = tuple(
+            int(part.strip())
+            for part in str(args.prediction_horizon_offsets).split(",")
+            if part.strip()
+        )
     return TrainConfig(**kwargs)
 
 
@@ -1216,6 +1242,9 @@ def train() -> None:
     if cfg.skipped_key_names:
         print(f"Skipping action keys for this training run: {', '.join(cfg.skipped_key_names)}")
     print(f"Training action keys: {', '.join(cfg.key_names + cfg.mouse_button_names)}")
+    horizon_offsets = tuple(int(offset) for offset in cfg.prediction_horizon_offsets)
+    first_horizon_offset = int(horizon_offsets[0])
+    print(f"Horizon frame offsets: {', '.join(str(offset) for offset in horizon_offsets)}")
 
     train_targets = build_window_targets(train_pairs, cfg, stride=cfg.train_seq_stride, return_meta=True)
     val_targets = build_window_targets(val_pairs, cfg, stride=cfg.val_seq_stride, return_meta=True) if val_pairs else None
@@ -1224,6 +1253,7 @@ def train() -> None:
         f"train={tuple(train_targets.button_horizon.shape)}",
         f"val={(tuple(val_targets.button_horizon.shape) if val_targets is not None else None)}",
         f"action_label_offset={cfg.action_label_offset}",
+        f"horizon_offsets={horizon_offsets}",
     )
     supervised_start, supervised_end = supervised_frame_range(cfg.seq_len)
     print(
@@ -1239,10 +1269,10 @@ def train() -> None:
         f"corrupt={cfg.last_action_corruption_prob:.2f}",
     )
     train_persist = persistence_baseline_metrics(train_targets, cfg)
-    print(f"Persistence baseline: train_f1@1={train_persist['macro_f1']:.4f}")
+    print(f"Persistence baseline: train_f1@+{first_horizon_offset}={train_persist['macro_f1']:.4f}")
     if val_targets is not None:
         val_persist = persistence_baseline_metrics(val_targets, cfg)
-        print(f"Persistence baseline: val_f1@1={val_persist['macro_f1']:.4f} {val_persist['per_class_summary']}")
+        print(f"Persistence baseline: val_f1@+{first_horizon_offset}={val_persist['macro_f1']:.4f} {val_persist['per_class_summary']}")
 
     train_file_list = os.path.join(cfg.ckpt_dir, "train_file_list.txt")
     val_file_list = os.path.join(cfg.ckpt_dir, "val_file_list.txt")
@@ -1328,6 +1358,7 @@ def train() -> None:
     optimizer_steps_per_epoch = int(math.ceil(train_batches / float(cfg.grad_accum)))
     total_steps = max(1, optimizer_steps_per_epoch * cfg.num_epochs)
     epochs_without_improvement = 0
+    final_horizon_offset = int(horizon_offsets[-1])
 
     for epoch in range(start_epoch, cfg.num_epochs):
         train_metrics, global_step = run_epoch(
@@ -1403,63 +1434,63 @@ def train() -> None:
         parts = [
             f"Epoch {epoch + 1}/{cfg.num_epochs}",
             f"tr_loss={train_metrics['loss']:.4f}",
-            f"tr_f1@1={train_metrics['step1_button_macro_f1']:.4f}",
+            f"tr_f1@+{first_horizon_offset}={train_metrics['step1_button_macro_f1']:.4f}",
         ]
         if int(cfg.prediction_horizon) > 1:
-            parts.append(f"tr_f1@{cfg.prediction_horizon}={train_metrics['final_button_macro_f1']:.4f}")
+            parts.append(f"tr_f1@+{final_horizon_offset}={train_metrics['final_button_macro_f1']:.4f}")
         if val_metrics is not None:
             parts.extend(
                 [
                     f"va_loss={val_metrics['loss']:.4f}",
-                    f"va_f1@1={val_metrics['step1_button_macro_f1']:.4f}",
+                    f"va_f1@+{first_horizon_offset}={val_metrics['step1_button_macro_f1']:.4f}",
                     f"best={best_score:.4f}",
                     val_metrics["per_class_summary"],
                 ]
             )
             if int(cfg.prediction_horizon) > 1:
-                parts.insert(-3, f"va_f1@{cfg.prediction_horizon}={val_metrics['final_button_macro_f1']:.4f}")
+                parts.insert(-3, f"va_f1@+{final_horizon_offset}={val_metrics['final_button_macro_f1']:.4f}")
         else:
             parts.append(train_metrics["per_class_summary"])
         print(" | ".join(part for part in parts if part))
         train_stats = (
             f"Epoch {epoch + 1} train stats: "
-            f"f1@1={train_metrics['step1_button_macro_f1']:.4f} "
-            f"prec@1={train_metrics['step1_button_macro_precision']:.4f} "
-            f"rec@1={train_metrics['step1_button_macro_recall']:.4f}"
+            f"f1@+{first_horizon_offset}={train_metrics['step1_button_macro_f1']:.4f} "
+            f"prec@+{first_horizon_offset}={train_metrics['step1_button_macro_precision']:.4f} "
+            f"rec@+{first_horizon_offset}={train_metrics['step1_button_macro_recall']:.4f}"
         )
         if int(cfg.prediction_horizon) > 1:
             train_stats += (
-                f" f1@{cfg.prediction_horizon}={train_metrics['final_button_macro_f1']:.4f}"
+                f" f1@+{final_horizon_offset}={train_metrics['final_button_macro_f1']:.4f}"
             )
         print(train_stats)
         print_button_stats_table(
-            f"Epoch {epoch + 1} train per-key/button @1:",
+            f"Epoch {epoch + 1} train per-key/button @+{first_horizon_offset}:",
             train_metrics["step1_button_rows"],
         )
         if int(cfg.prediction_horizon) > 1:
             print_button_stats_table(
-                f"Epoch {epoch + 1} train per-key/button @{cfg.prediction_horizon}:",
+                f"Epoch {epoch + 1} train per-key/button @+{final_horizon_offset}:",
                 train_metrics["final_button_rows"],
             )
         if val_metrics is not None:
             val_stats = (
                 f"Epoch {epoch + 1} val stats: "
-                f"f1@1={val_metrics['step1_button_macro_f1']:.4f} "
-                f"prec@1={val_metrics['step1_button_macro_precision']:.4f} "
-                f"rec@1={val_metrics['step1_button_macro_recall']:.4f}"
+                f"f1@+{first_horizon_offset}={val_metrics['step1_button_macro_f1']:.4f} "
+                f"prec@+{first_horizon_offset}={val_metrics['step1_button_macro_precision']:.4f} "
+                f"rec@+{first_horizon_offset}={val_metrics['step1_button_macro_recall']:.4f}"
             )
             if int(cfg.prediction_horizon) > 1:
                 val_stats += (
-                    f" f1@{cfg.prediction_horizon}={val_metrics['final_button_macro_f1']:.4f}"
+                    f" f1@+{final_horizon_offset}={val_metrics['final_button_macro_f1']:.4f}"
                 )
             print(val_stats)
             print_button_stats_table(
-                f"Epoch {epoch + 1} val per-key/button @1:",
+                f"Epoch {epoch + 1} val per-key/button @+{first_horizon_offset}:",
                 val_metrics["step1_button_rows"],
             )
             if int(cfg.prediction_horizon) > 1:
                 print_button_stats_table(
-                    f"Epoch {epoch + 1} val per-key/button @{cfg.prediction_horizon}:",
+                    f"Epoch {epoch + 1} val per-key/button @+{final_horizon_offset}:",
                     val_metrics["final_button_rows"],
                 )
         if (
