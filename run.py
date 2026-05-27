@@ -57,7 +57,7 @@ class RuntimeConfig(ModelConfig):
     use_checkpoint_button_thresholds: bool = False
 
     decision_interval: float = 1.0 / 20.0
-    command_horizon: int = 10
+    command_horizon: int = 1
     print_every: int = 2
     print_prob_decimals: int = 3
 

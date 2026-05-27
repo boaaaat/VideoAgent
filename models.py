@@ -74,8 +74,7 @@ class ModelConfig:
     temporal_heads: int = 4
     temporal_context: int = 80
 
-    pooling: Tuple[int, int] = (3, 3)
-    pool_heads: int = 4
+    pooling: Tuple[int, int] = (5, 5)
 
     button_state_threshold: float = 0.5
     button_state_thresholds: Optional[Sequence[float]] = None
@@ -117,7 +116,6 @@ class ModelConfig:
         self.temporal_context = max(1, int(self.temporal_context))
         pool_h, pool_w = self.pooling
         self.pooling = (max(1, int(pool_h)), max(1, int(pool_w)))
-        self.pool_heads = _largest_valid_head_count(CNN_FEATURE_CHANNELS, int(self.pool_heads))
 
         if self.key_names is None:
             self.key_names = get_key_names(self.selected_game)
@@ -270,43 +268,6 @@ class FastVitSpatialMixer(nn.Module):
         return self.blocks(x)
 
 
-class LearnedMultiHeadSpatialPool2d(nn.Module):
-    """
-    Learns spatial attention pools while preserving an AdaptiveAvgPool2d-style output shape.
-    """
-    def __init__(self, channels: int, output_size: Sequence[int], num_heads: int):
-        super().__init__()
-        output_h, output_w = output_size
-        self.channels = int(channels)
-        self.output_size = (max(1, int(output_h)), max(1, int(output_w)))
-        self.num_heads = _largest_valid_head_count(self.channels, int(num_heads))
-        self.head_dim = self.channels // self.num_heads
-        self.num_slots = self.output_size[0] * self.output_size[1]
-
-        self.attn_logits = nn.Conv2d(
-            self.channels,
-            self.num_heads * self.num_slots,
-            kernel_size=1,
-            bias=True,
-        )
-        nn.init.zeros_(self.attn_logits.weight)
-        nn.init.zeros_(self.attn_logits.bias)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        b, c, spatial_h, spatial_w = x.shape
-        if c != self.channels:
-            raise ValueError(f"Expected {self.channels} channels, got {c}.")
-
-        spatial_size = spatial_h * spatial_w
-        logits = self.attn_logits(x).reshape(b, self.num_heads, self.num_slots, spatial_size)
-        weights = torch.softmax(logits, dim=-1)
-
-        values = x.reshape(b, self.num_heads, self.head_dim, spatial_size)
-        pooled = torch.einsum("bhsn,bhdn->bhsd", weights, values)
-        pooled = pooled.permute(0, 1, 3, 2).reshape(b, c, self.output_size[0], self.output_size[1])
-        return pooled
-
-
 class DrivingVideoPolicy(nn.Module):
     def __init__(self, cfg: ModelConfig):
         super().__init__()
@@ -327,8 +288,7 @@ class DrivingVideoPolicy(nn.Module):
             dropout=cfg.spatial_dropout,
         )
         
-        # Learned multi-head pooling retains the configured spatial output layout for the classifier.
-        self.pool = LearnedMultiHeadSpatialPool2d(self.feat_channels, cfg.pooling, cfg.pool_heads)
+        self.pool = nn.AdaptiveAvgPool2d(cfg.pooling)
         
         self.fc_features = nn.Sequential(
             nn.Linear(self.feat_channels * cfg.pooling[0] * cfg.pooling[1], self.cfg.d_model),
@@ -569,21 +529,16 @@ class DrivingVideoPolicy(nn.Module):
         h, w = frames.shape[-2:]
         masked_frames = frames.clone()
 
-        # 1. Mask the Car (Center)
-        car_y1, car_y2 = int(h * self.car_y_min_pct), int(h * self.car_y_max_pct)
-        car_x1, car_x2 = int(w * self.car_x_min_pct), int(w * self.car_x_max_pct)
-        masked_frames[..., car_y1:car_y2, car_x1:car_x2] = 0.0
-
-        # 2. Mask the Bottom HUD (Speedometer, Gear, etc.)
-        hud_y1 = int(h * 0.80)
+        # 1. Mask the Bottom Left HUD (Speedometer)
+        hud_y1 = int(h * 0.96)
         masked_frames[..., hud_y1:, :] = 0.0
 
-        # 3. Mask the Minimap (Mid-Right)
+        # 2. Mask the Minimap (Mid-Right)
         map_y1, map_y2 = int(h * 0.05), int(h * 0.2)
         map_x1 = int(w * 0.75)
         masked_frames[..., map_y1:map_y2, map_x1:] = 0.0
 
-        # 4. Top Left Roblox UI
+        # 3. Top Left Roblox UI
         roblox_ui_y2 = int(h * 0.1)
         roblox_ui_x2 = int(w * 0.1)
         masked_frames[..., :roblox_ui_y2, :roblox_ui_x2] = 0.0

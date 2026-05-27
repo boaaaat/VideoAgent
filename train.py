@@ -52,7 +52,7 @@ class TrainConfig(ModelConfig):
 
     train_split: float = 0.8
     split_seed: int = 1337
-    pos_weight_power: float = 0.5
+    pos_weight_power: float = 0.25
     pos_weight_clamp: float = 8
     button_threshold_from_pos_weight: bool = False
     button_threshold_min: float = 0.5
@@ -61,8 +61,8 @@ class TrainConfig(ModelConfig):
     button_loss_weight: float = 1.0
     button_focal_gamma: float = 1.0
     action_label_offset: int = 0
-    last_action_sequence_dropout: float = 0.05
-    last_action_key_dropout: float = 0.1
+    last_action_sequence_dropout: float = 0.2
+    last_action_key_dropout: float = 0.4
     last_action_corruption_prob: float = 0.05
     skipped_key_names: Optional[Sequence[str]] = ("e", "q", "c", "z")
     button_label_smoothing: float = 0.02
@@ -665,13 +665,17 @@ def compute_losses(
     loss_weight = valid_4d
     horizon_count = int(button_logits.size(2))
     if horizon_count > 1:
-        horizon_weight = torch.linspace(
-            0.5,
-            1.5,
-            horizon_count,
+        base_horizon_weights = torch.tensor(
+            (1.0, 0.25, 0.20, 0.15, 0.12, 0.10, 0.08, 0.06, 0.05, 0.05),
             device=button_logits.device,
             dtype=button_logits.dtype,
-        ).view(1, 1, horizon_count, 1)
+        )
+        if horizon_count <= int(base_horizon_weights.numel()):
+            horizon_weight = base_horizon_weights[:horizon_count]
+        else:
+            tail = base_horizon_weights[-1].expand(horizon_count - int(base_horizon_weights.numel()))
+            horizon_weight = torch.cat([base_horizon_weights, tail], dim=0)
+        horizon_weight = horizon_weight.view(1, 1, horizon_count, 1)
         loss_weight = loss_weight * horizon_weight
     button_loss = (button_loss_raw * loss_weight).sum() / (loss_weight.sum() * cfg.num_bin).clamp(min=1.0)
 
@@ -791,10 +795,7 @@ def driving_score(metrics: Dict[str, float], cfg: TrainConfig) -> float:
         return state_total / max(total_weight, 1.0)
 
     step1_score = score_rows(metrics.get("step1_button_rows", []), metrics["step1_button_macro_f1"])
-    if int(cfg.prediction_horizon) <= 1:
-        return step1_score
-    final_score = score_rows(metrics.get("final_button_rows", []), metrics["final_button_macro_f1"])
-    return 0.2 * step1_score + 0.8 * final_score
+    return step1_score
 
 
 def print_button_stats_table(title: str, rows: Sequence[Dict[str, float | int | str]]) -> None:

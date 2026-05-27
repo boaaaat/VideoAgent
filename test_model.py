@@ -655,7 +655,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--labels", default=None, help="Ground-truth CSV. Defaults to the video path with .csv extension.")
     parser.add_argument("--data-root", default="./data/greenville", help="Dataset root used when --video is omitted.")
     parser.add_argument("--output", default="./data/test_model.mp4", help="Output annotated MP4 path.")
-    parser.add_argument("--command-horizon", type=int, default=10, help="1-based horizon index to visualize.")
+    parser.add_argument("--command-horizon", type=int, default=1, help="1-based horizon index to visualize.")
     parser.add_argument("--action-label-offset", type=int, default=None, help="Override checkpoint action_label_offset.")
     parser.add_argument("--threshold", type=float, default=None, help="Override button threshold. Defaults to checkpoint thresholds.")
     parser.add_argument("--change-threshold", type=float, default=None, help="Ignored for current direct-state policy checkpoints.")
