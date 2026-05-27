@@ -52,7 +52,7 @@ class TrainConfig(ModelConfig):
 
     train_split: float = 0.8
     split_seed: int = 1337
-    pos_weight_power: float = 0.25
+    pos_weight_power: float = 0.5
     pos_weight_clamp: float = 8
     button_threshold_from_pos_weight: bool = False
     button_threshold_min: float = 0.5
@@ -61,9 +61,9 @@ class TrainConfig(ModelConfig):
     button_loss_weight: float = 1.0
     button_focal_gamma: float = 1.0
     action_label_offset: int = 0
-    last_action_sequence_dropout: float = 0.15
-    last_action_key_dropout: float = 0.3
-    last_action_corruption_prob: float = 0.1
+    last_action_sequence_dropout: float = 0.05
+    last_action_key_dropout: float = 0.1
+    last_action_corruption_prob: float = 0.05
     skipped_key_names: Optional[Sequence[str]] = ("e", "q", "c", "z")
     button_label_smoothing: float = 0.02
 

@@ -346,10 +346,6 @@ class DrivingVideoPolicy(nn.Module):
             nn.Dropout(LAST_ACTION_EMBEDDING_DROPOUT),
             nn.Linear(action_hidden, self.cfg.d_model),
         )
-        final_action_layer = self.last_action_encoder[-1]
-        if isinstance(final_action_layer, nn.Linear):
-            nn.init.zeros_(final_action_layer.weight)
-            nn.init.zeros_(final_action_layer.bias)
 
         self.head_fusion = nn.Sequential(
             nn.LayerNorm(self.cfg.d_model * 3),
@@ -404,7 +400,7 @@ class DrivingVideoPolicy(nn.Module):
         )
         final_button_layer = self.button_head[-1]
         if isinstance(final_button_layer, nn.Linear):
-            nn.init.constant_(final_button_layer.bias, -1.0)
+            nn.init.zeros_(final_button_layer.bias)
 
     def _initial_temporal_state(
         self,
