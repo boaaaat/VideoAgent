@@ -43,7 +43,7 @@ class TrainConfig(ModelConfig):
     lr: float = 2e-4
     min_lr: float = 1e-5
     warmup_steps: int = 50
-    weight_decay: float = 0.03
+    weight_decay: float = 0.05
     grad_clip: float = 1.0
 
     amp_dtype: str = "bf16"

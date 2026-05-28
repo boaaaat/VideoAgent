@@ -68,13 +68,13 @@ class ModelConfig:
     spatial_dropout: float = 0.10
     head_dropout: float = 0.20
 
-    fastvit_depth: int = 2
+    fastvit_depth: int = 4
     fastvit_kernel_size: int = 3
-    temporal_layers: int = 2
+    temporal_layers: int = 4
     temporal_heads: int = 4
     temporal_context: int = 80
 
-    pooling: Tuple[int, int] = (5, 5)
+    pooling: Tuple[int, int] = (9, 9)
 
     button_state_threshold: float = 0.5
     button_state_thresholds: Optional[Sequence[float]] = None
