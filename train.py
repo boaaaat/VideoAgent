@@ -35,8 +35,8 @@ from models import (
 
 @dataclass
 class TrainConfig(ModelConfig):
-    batch_size: int = 4
-    target_effective_batch: int = 32
+    batch_size: int = 2
+    target_effective_batch: int = 16
     grad_accum: int = 8
     num_epochs: int = 100
 
@@ -60,7 +60,7 @@ class TrainConfig(ModelConfig):
 
     button_loss_weight: float = 1.0
     button_focal_gamma: float = 1.0
-    action_label_offset: int = 0
+    action_label_offset: int = -1
     last_action_sequence_dropout: float = 0.2
     last_action_key_dropout: float = 0.4
     last_action_corruption_prob: float = 0.05
@@ -349,12 +349,12 @@ def build_window_targets(
             last_action = np.zeros((cfg.seq_len, cfg.num_bin), dtype=np.float32)
 
             frame_indices = np.arange(start, end)
-            context_indices = frame_indices + int(cfg.action_label_offset)
+            context_indices = frame_indices - 1 + int(cfg.action_label_offset)
             context_valid = (context_indices >= 0) & (context_indices < buttons.shape[0])
             if np.any(context_valid):
                 last_action[context_valid] = buttons[context_indices[context_valid]]
             for horizon_idx, horizon_offset in enumerate(horizon_offsets):
-                target_indices = frame_indices + horizon_offset + int(cfg.action_label_offset)
+                target_indices = frame_indices + horizon_offset - 1 + int(cfg.action_label_offset)
                 prev_indices = target_indices - 1
                 valid = (target_indices >= 0) & (target_indices < buttons.shape[0]) & (prev_indices >= 0)
                 if np.any(valid):
@@ -1279,6 +1279,8 @@ def train() -> None:
         f"train={tuple(train_targets.button_horizon.shape)}",
         f"val={(tuple(val_targets.button_horizon.shape) if val_targets is not None else None)}",
         f"action_label_offset={cfg.action_label_offset}",
+        "action_index=frame+horizon-1+offset",
+        "last_action_index=frame-1+offset",
         f"horizon_offsets={horizon_offsets}",
     )
     supervised_start, supervised_end = supervised_frame_range(cfg.seq_len)

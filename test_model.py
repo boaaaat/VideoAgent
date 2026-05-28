@@ -259,7 +259,7 @@ def infer_video(
     prev_action = torch.zeros((1, cfg.num_bin), device=device, dtype=inference_dtype)
     h_idx = max(0, min(int(command_horizon) - 1, int(cfg.prediction_horizon) - 1))
     horizon_offsets = tuple(int(offset) for offset in cfg.prediction_horizon_offsets)
-    target_offset = horizon_offsets[h_idx] + int(action_label_offset)
+    target_offset = horizon_offsets[h_idx] - 1 + int(action_label_offset)
     threshold_tensor = torch.tensor(
         list(thresholds),
         device=device,

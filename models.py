@@ -75,7 +75,7 @@ class ModelConfig:
     temporal_context: int = 80
 
     pooling: Tuple[int, int] = (9, 9)
-    spatial_token_count: int = 16
+    spatial_token_count: int = 36
 
     button_state_threshold: float = 0.5
     button_state_thresholds: Optional[Sequence[float]] = None

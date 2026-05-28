@@ -228,7 +228,7 @@ def draw_overlay(
     label_str = f"{label_idx}" if label_idx is not None else "N/A"
     cv2.putText(
         frame,
-        f"Target idx: {label_str} = frame + frame_offset + label_offset",
+        f"Target idx: {label_str} = frame + frame_offset - 1 + label_offset",
         (x0 + 10, y),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.5,
@@ -360,7 +360,7 @@ def main() -> int:
     parser.add_argument(
         "--video",
         help="Path to the video file.",
-        default=r'C:\Users\Abhil\Desktop\vs_code_stuff\python\ai\data\greenville\run_20260518_153515.mp4',
+        default=r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\data\greenville\run_20260528_121826.mp4',
     )
     parser.add_argument(
         "--csv",
@@ -378,7 +378,7 @@ def main() -> int:
         "--prediction-horizon",
         type=int,
         default=None,
-        help="Direct future frame offset override. Target idx = frame + offset + action_label_offset.",
+        help="Direct future frame offset override. Target idx = frame + offset - 1 + action_label_offset.",
     )
     parser.add_argument(
         "--prediction-horizon-offsets",
@@ -394,8 +394,8 @@ def main() -> int:
     parser.add_argument(
         "--action-label-offset",
         type=int,
-        default=0,
-        help="Same offset used by train.py. Target idx = frame + frame_offset + label_offset.",
+        default=-1,
+        help="Same offset used by train.py. Target idx = frame + frame_offset - 1 + label_offset.",
     )
     parser.add_argument(
         "--max-frames",
@@ -510,9 +510,9 @@ def main() -> int:
             )
             if args.label_shift is None:
                 action_label_offset = int(args.action_label_offset)
-                label_idx = current_idx + prediction_horizon + action_label_offset
+                label_idx = current_idx + prediction_horizon - 1 + action_label_offset
             else:
-                action_label_offset = int(args.label_shift) - prediction_horizon
+                action_label_offset = int(args.label_shift) - prediction_horizon + 1
                 label_idx = current_idx + int(args.label_shift)
 
             if 0 <= label_idx < len(rows):

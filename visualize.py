@@ -615,7 +615,7 @@ def _real_trajectory_probs_for_frame(
 
     rows: List[np.ndarray] = []
     for offset in offsets:
-        target_idx = int(frame_idx) + int(offset) + int(action_label_offset)
+        target_idx = int(frame_idx) + int(offset) - 1 + int(action_label_offset)
         if target_idx < 0 or target_idx >= int(buttons.shape[0]):
             break
         rows.append(buttons[target_idx])
