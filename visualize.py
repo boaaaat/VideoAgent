@@ -590,7 +590,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--layer",
         choices=["motion", "stage1", "stage2", "stage3", "stage4", "spatial", "tokens"],
-        default="spatial",
+        default="tokens",
         help=(
             "CNN signal to visualize. Policy checkpoints support all choices; inverse checkpoints support "
             "motion and stage1-stage4."
