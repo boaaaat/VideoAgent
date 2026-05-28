@@ -1065,7 +1065,8 @@ def parse_args() -> TrainConfig:
     add("--temporal-layers", type=int, default=None)
     add("--temporal-heads", type=int, default=None)
     add("--temporal-context", type=int, default=None)
-    add("--pooling", choices=["3x3", "5x5"], default=None)
+    add("--pooling", choices=["3x3", "5x5", "9x9"], default=None)
+    add("--spatial-token-count", type=int, default=None)
     add("--train-seq-stride", type=int, default=None)
     add("--val-seq-stride", type=int, default=None)
     add("--target-effective-batch", type=int, default=None)
@@ -1153,6 +1154,7 @@ def parse_args() -> TrainConfig:
         "temporal_layers",
         "temporal_heads",
         "temporal_context",
+        "spatial_token_count",
         "train_seq_stride",
         "val_seq_stride",
         "target_effective_batch",
@@ -1264,6 +1266,7 @@ def train() -> None:
         f"temporal_heads={cfg.temporal_heads}",
         f"temporal_context={cfg.temporal_context}",
         f"pooling={cfg.pooling[0]}x{cfg.pooling[1]}",
+        f"spatial_tokens={cfg.spatial_token_count}",
     )
     horizon_offsets = tuple(int(offset) for offset in cfg.prediction_horizon_offsets)
     first_horizon_offset = int(horizon_offsets[0])

@@ -32,10 +32,12 @@ from models import (  # noqa: E402
 
 
 FeatureLayer = Literal["motion", "stage1", "stage2", "stage3", "stage4", "spatial", "tokens"]
+HeatReduction = Literal["l2", "mean_abs", "positive"]
 ModelKind = Literal["auto", "policy", "inverse"]
 LoadedModelKind = Literal["policy", "inverse"]
 VisualModel = DrivingVideoPolicy | InverseDynamicsModel
 VisualConfig = ModelConfig | InverseDynamicsConfig
+COLORMAP_CHOICES = ("magma", "viridis", "inferno", "turbo", "jet")
 
 
 class FFmpegWriter:
@@ -154,6 +156,7 @@ def _coerce_config_types(cfg: ModelConfig) -> ModelConfig:
     cfg.temporal_context = max(1, int(cfg.temporal_context))
     pooling = tuple(int(value) for value in cfg.pooling)
     cfg.pooling = (max(1, pooling[0]), max(1, pooling[1]))
+    cfg.spatial_token_count = max(1, int(cfg.spatial_token_count))
     cfg.num_bin = len(cfg.key_names) + len(cfg.mouse_button_names)
     return cfg
 
@@ -256,13 +259,13 @@ def load_model_from_checkpoint(
     model = DrivingVideoPolicy(cfg=cfg).to(device)
     initialize_model_lazy_layers(model, cfg, device)
     model_state = _extract_model_state(state)
-    missing, unexpected = model.load_state_dict(model_state, strict=False)
-    if missing or unexpected:
-        print("Checkpoint load warnings:")
-        if missing:
-            print("  Missing:", missing)
-        if unexpected:
-            print("  Unexpected:", unexpected)
+    try:
+        model.load_state_dict(model_state, strict=True)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"Policy checkpoint {ckpt_path} is incompatible with the current multi-token architecture. "
+            "Train a fresh policy checkpoint or pass a matching checkpoint."
+        ) from exc
 
     model.eval()
     return model, cfg
@@ -420,12 +423,27 @@ def _feature_to_heat_color(
     width: int,
     height: int,
     *,
+    reduction: HeatReduction,
     robust_norm: bool,
     q_low: float,
     q_high: float,
     gamma: float,
+    colormap: str,
+    blur: int,
 ) -> np.ndarray:
-    heat = torch.linalg.vector_norm(feat.float(), ord=2, dim=1)[0]
+    feat_float = feat.float()
+    if reduction == "positive":
+        heat = torch.relu(feat_float).mean(dim=1)[0]
+        if not bool(torch.any(heat > 1e-6)):
+            heat = feat_float.abs().mean(dim=1)[0]
+    elif reduction == "mean_abs":
+        heat = feat_float.abs().mean(dim=1)[0]
+    elif reduction == "l2":
+        heat = torch.linalg.vector_norm(feat_float, ord=2, dim=1)[0]
+        heat = heat / max(float(feat_float.size(1)) ** 0.5, 1.0)
+    else:
+        raise ValueError(f"Unknown heat reduction {reduction!r}.")
+
     if robust_norm:
         lo = torch.quantile(heat.flatten(), float(q_low))
         hi = torch.quantile(heat.flatten(), float(q_high))
@@ -439,8 +457,20 @@ def _feature_to_heat_color(
         heat = heat.pow(float(gamma))
 
     heat_np = (heat.detach().cpu().numpy() * 255.0).astype(np.uint8)
-    heat_up = cv2.resize(heat_np, (int(width), int(height)), interpolation=cv2.INTER_CUBIC)
-    return cv2.applyColorMap(heat_up, cv2.COLORMAP_JET)
+    heat_up = cv2.resize(heat_np, (int(width), int(height)), interpolation=cv2.INTER_LINEAR)
+    blur_kernel = max(0, int(blur))
+    if blur_kernel > 1:
+        blur_kernel |= 1
+        heat_up = cv2.GaussianBlur(heat_up, (blur_kernel, blur_kernel), 0)
+    colormap_attr = {
+        "magma": "COLORMAP_MAGMA",
+        "viridis": "COLORMAP_VIRIDIS",
+        "inferno": "COLORMAP_INFERNO",
+        "turbo": "COLORMAP_TURBO",
+        "jet": "COLORMAP_JET",
+    }.get(str(colormap).strip().lower(), "COLORMAP_MAGMA")
+    fallback_colormap = getattr(cv2, "COLORMAP_VIRIDIS", cv2.COLORMAP_JET)
+    return cv2.applyColorMap(heat_up, getattr(cv2, colormap_attr, fallback_colormap))
 
 
 def _feature_heatmap_for_frame(
@@ -451,10 +481,13 @@ def _feature_heatmap_for_frame(
     previous_frame_rgb: Optional[torch.Tensor] = None,
     layer: FeatureLayer = "tokens",
     resize_to: Optional[int] = None,
+    reduction: HeatReduction = "positive",
     robust_norm: bool = True,
-    q_low: float = 0.05,
-    q_high: float = 0.95,
-    gamma: float = 0.75,
+    q_low: float = 0.25,
+    q_high: float = 0.995,
+    gamma: float = 1.35,
+    colormap: str = "magma",
+    blur: int = 5,
     amp_dtype: torch.dtype = torch.bfloat16,
     use_autocast: bool = True,
     policy_state: Optional[TemporalState] = None,
@@ -483,10 +516,13 @@ def _feature_heatmap_for_frame(
         feat,
         orig_w,
         orig_h,
+        reduction=reduction,
         robust_norm=robust_norm,
         q_low=q_low,
         q_high=q_high,
         gamma=gamma,
+        colormap=colormap,
+        blur=blur,
     )
     return heat_color, current_frame_rgb.detach(), policy_state
 
@@ -598,10 +634,13 @@ def _policy_visuals_for_frame(
     prev_action: Optional[torch.Tensor],
     layer: FeatureLayer,
     resize_to: Optional[int],
+    reduction: HeatReduction,
     robust_norm: bool,
     q_low: float,
     q_high: float,
     gamma: float,
+    colormap: str,
+    blur: int,
     amp_dtype: torch.dtype,
     use_autocast: bool,
     need_trajectory: bool,
@@ -647,39 +686,26 @@ def _policy_visuals_for_frame(
                 else:
                     raise ValueError(f"Unknown policy layer {layer!r}.")
 
-            needs_temporal = bool(need_trajectory)
-            if needs_temporal:
-                if stages is None:
-                    if hasattr(model.spatial_encoder, "feature_stages"):
-                        stages = model.spatial_encoder.feature_stages(masked_frame)
-                    else:
-                        stages = _activation_stages(model.spatial_encoder.net, masked_frame)
-                b = int(masked_frame.size(0))
-                dt = torch.tensor([float(cfg.prediction_dt)], device=masked_frame.device, dtype=masked_frame.dtype)
+            if bool(need_trajectory):
+                b = int(x.size(0))
+                dt = torch.tensor([float(cfg.prediction_dt)], device=x.device, dtype=x.dtype)
                 if prev_action is None:
-                    prev_for_head = torch.zeros((b, int(cfg.num_bin)), device=masked_frame.device, dtype=masked_frame.dtype)
+                    prev_for_head = torch.zeros((b, int(cfg.num_bin)), device=x.device, dtype=x.dtype)
                 else:
-                    prev_for_head = prev_action.to(device=masked_frame.device, dtype=masked_frame.dtype)
-                frame_tokens = model._fused_frame_tokens(masked_frame.unsqueeze(1), dt, prev_for_head)
-                prior_tokens = model._prepare_temporal_state(
-                    state,
-                    b,
-                    device=frame_tokens.device,
-                    dtype=frame_tokens.dtype,
+                    prev_for_head = prev_action.to(device=x.device, dtype=x.dtype)
+                output, state = model.forward_step(
+                    x,
+                    dt,
+                    state if state is not None else TemporalState(),
+                    prev_action=prev_for_head,
                 )
-                token_memory = torch.cat([prior_tokens, frame_tokens], dim=1)
-                token_memory = token_memory[:, -int(cfg.temporal_context):]
-                temporal_feat = model._encode_temporal_tokens(token_memory)[:, -1]
-                state = TemporalState(hidden_state=token_memory.detach())
-
-                if bool(need_trajectory):
-                    logits = model._horizon_button_logits(temporal_feat)[0].detach().float()
-                    trajectory_probs = torch.sigmoid(logits).detach().cpu().numpy().astype(np.float32)
-                    command_idx = min(int(cfg.prediction_horizon) - 1, 9)
-                    thresholds = _button_thresholds(cfg, device=logits.device, dtype=logits.dtype)
-                    next_action = (
-                        torch.sigmoid(logits[command_idx]) >= thresholds
-                    ).to(dtype=frame_tokens.dtype).reshape(1, int(cfg.num_bin)).detach()
+                logits = output.horizon_button_logits[0].detach().float()
+                trajectory_probs = torch.sigmoid(logits).detach().cpu().numpy().astype(np.float32)
+                command_idx = min(int(cfg.prediction_horizon) - 1, 9)
+                thresholds = _button_thresholds(cfg, device=logits.device, dtype=logits.dtype)
+                next_action = (
+                    torch.sigmoid(logits[command_idx]) >= thresholds
+                ).to(dtype=x.dtype).reshape(1, int(cfg.num_bin)).detach()
 
             if feat is None:
                 raise RuntimeError(f"Policy layer {layer!r} did not produce a feature map.")
@@ -688,10 +714,13 @@ def _policy_visuals_for_frame(
         feat,
         orig_w,
         orig_h,
+        reduction=reduction,
         robust_norm=robust_norm,
         q_low=q_low,
         q_high=q_high,
         gamma=gamma,
+        colormap=colormap,
+        blur=blur,
     )
     return heat_color, frame_rgb.detach(), state, trajectory_probs, next_action
 
@@ -930,12 +959,15 @@ def process_video_cnn(
     model_kind: LoadedModelKind,
     layer: FeatureLayer = "tokens",
     mode: Literal["heat", "overlay", "side_by_side", "triple"] = "side_by_side",
-    alpha: float = 0.5,
+    alpha: float = 0.35,
     resize_to: Optional[int] = None,
+    reduction: HeatReduction = "positive",
     robust_norm: bool = True,
-    q_low: float = 0.05,
-    q_high: float = 0.95,
-    gamma: float = 0.75,
+    q_low: float = 0.25,
+    q_high: float = 0.995,
+    gamma: float = 1.35,
+    colormap: str = "magma",
+    blur: int = 5,
     amp_dtype: torch.dtype = torch.bfloat16,
     use_autocast: bool = True,
     ffmpeg_path: Optional[str] = None,
@@ -1027,10 +1059,13 @@ def process_video_cnn(
                         prev_action=trajectory_prev_action,
                         layer=layer,
                         resize_to=resize_to,
+                        reduction=reduction,
                         robust_norm=robust_norm,
                         q_low=q_low,
                         q_high=q_high,
                         gamma=gamma,
+                        colormap=colormap,
+                        blur=blur,
                         amp_dtype=amp_dtype,
                         use_autocast=use_autocast,
                         need_trajectory=trajectory_enabled,
@@ -1051,10 +1086,13 @@ def process_video_cnn(
                     previous_frame_rgb=previous_frame_rgb,
                     layer=layer,
                     resize_to=resize_to,
+                    reduction=reduction,
                     robust_norm=robust_norm,
                     q_low=q_low,
                     q_high=q_high,
                     gamma=gamma,
+                    colormap=colormap,
+                    blur=blur,
                     amp_dtype=amp_dtype,
                     use_autocast=use_autocast,
                     policy_state=policy_state,
@@ -1151,16 +1189,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--mode", choices=["heat", "overlay", "side_by_side", "triple"], default="side_by_side")
-    parser.add_argument("--alpha", type=float, default=0.5, help="Overlay blend factor.")
+    parser.add_argument("--alpha", type=float, default=0.35, help="Overlay blend factor.")
     parser.add_argument(
         "--resize-to",
         type=int,
         default=None,
         help="Resize frames to this square size before encoding. Defaults to model_size from checkpoint config.",
     )
-    parser.add_argument("--q-low", type=float, default=0.05)
-    parser.add_argument("--q-high", type=float, default=0.95)
-    parser.add_argument("--gamma", type=float, default=0.75)
+    parser.add_argument(
+        "--heat-reduction",
+        choices=["l2", "mean_abs", "positive"],
+        default="positive",
+        help="How feature channels are reduced into a heatmap. positive is less noisy than raw L2 energy.",
+    )
+    parser.add_argument("--q-low", type=float, default=0.25)
+    parser.add_argument("--q-high", type=float, default=0.995)
+    parser.add_argument("--gamma", type=float, default=1.35)
+    parser.add_argument("--colormap", choices=COLORMAP_CHOICES, default="magma")
+    parser.add_argument("--blur", type=int, default=5, help="Odd Gaussian blur kernel applied to the scalar heatmap.")
     parser.add_argument("--no-robust-norm", action="store_true", help="Use min/max normalization instead of quantiles.")
     parser.add_argument("--fp16", action="store_true", help="Use fp16 autocast on CUDA instead of bf16.")
     parser.add_argument("--no-amp", action="store_true", help="Disable autocast during encoder inference.")
@@ -1236,10 +1282,13 @@ def main() -> None:
         mode=args.mode,
         alpha=float(args.alpha),
         resize_to=resize_to,
+        reduction=args.heat_reduction,
         robust_norm=not bool(args.no_robust_norm),
         q_low=float(args.q_low),
         q_high=float(args.q_high),
         gamma=float(args.gamma),
+        colormap=str(args.colormap),
+        blur=int(args.blur),
         amp_dtype=amp_dtype,
         use_autocast=use_autocast,
         ffmpeg_path=args.ffmpeg_path,

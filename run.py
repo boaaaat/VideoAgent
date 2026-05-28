@@ -232,6 +232,7 @@ def _coerce_config_types(cfg: RuntimeConfig) -> RuntimeConfig:
     cfg.temporal_context = max(1, int(cfg.temporal_context))
     pooling = tuple(int(value) for value in cfg.pooling)
     cfg.pooling = (max(1, pooling[0]), max(1, pooling[1]))
+    cfg.spatial_token_count = max(1, int(cfg.spatial_token_count))
     cfg.prediction_dt = float(cfg.prediction_dt)
     cfg.mouse_buttons_enabled = bool(cfg.mouse_buttons_enabled)
     cfg.num_bin = len(cfg.key_names) + len(cfg.mouse_button_names)
@@ -452,7 +453,13 @@ def main() -> None:
     RUNTIME_CFG = cfg
 
     model = DrivingVideoPolicy(cfg).to(device)
-    model.load_state_dict(model_state)
+    try:
+        model.load_state_dict(model_state)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "Checkpoint is incompatible with the current multi-token policy architecture. "
+            "Train a fresh policy checkpoint before running realtime control."
+        ) from exc
     print(
         "Model:",
         f"size={cfg.model_size}",
@@ -466,6 +473,7 @@ def main() -> None:
         f"temporal_layers={cfg.temporal_layers}",
         f"temporal_context={cfg.temporal_context}",
         f"pooling={cfg.pooling[0]}x{cfg.pooling[1]}",
+        f"spatial_tokens={cfg.spatial_token_count}",
         "input=masked_full_frame+last_action",
     )
     print(
