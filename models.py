@@ -75,7 +75,7 @@ class ModelConfig:
     temporal_context: int = 80
 
     pooling: Tuple[int, int] = (16, 16)
-    spatial_token_count: int = 64
+    spatial_token_count: int = 81
 
     button_state_threshold: float = 0.5
     button_state_thresholds: Optional[Sequence[float]] = None
@@ -115,8 +115,6 @@ class ModelConfig:
         self.temporal_layers = max(1, int(self.temporal_layers))
         self.temporal_heads = _largest_valid_head_count(self.d_model, int(self.temporal_heads))
         self.temporal_context = max(1, int(self.temporal_context))
-        pool_h, pool_w = self.pooling
-        self.pooling = (max(1, int(pool_h)), max(1, int(pool_w)))
         self.spatial_token_count = max(1, int(self.spatial_token_count))
 
         if self.key_names is None:
@@ -290,8 +288,6 @@ class DrivingVideoPolicy(nn.Module):
             dropout=cfg.spatial_dropout,
         )
         
-        self.pool = nn.AdaptiveAvgPool2d(cfg.pooling)
-        self.pool_cell_count = int(cfg.pooling[0]) * int(cfg.pooling[1])
         self.tokens_per_frame = 1
 
         self.cell_projector = nn.Sequential(
@@ -300,7 +296,7 @@ class DrivingVideoPolicy(nn.Module):
             nn.ELU(inplace=True),
             nn.Dropout(cfg.head_dropout * 0.5),
         )
-        self.spatial_cell_pos_embed = nn.Parameter(torch.empty(1, self.pool_cell_count, self.cfg.d_model))
+        self.spatial_coord_projector = nn.Linear(4, self.cfg.d_model)
         self.spatial_queries = nn.Parameter(torch.empty(int(cfg.spatial_token_count), self.cfg.d_model))
         spatial_heads = _largest_valid_head_count(self.cfg.d_model, self.cfg.temporal_heads)
         self.spatial_query_norm = nn.LayerNorm(self.cfg.d_model)
@@ -320,7 +316,8 @@ class DrivingVideoPolicy(nn.Module):
             nn.Linear(max(self.cfg.d_model * 2, 256), self.cfg.d_model),
             nn.Dropout(cfg.head_dropout * 0.5),
         )
-        nn.init.normal_(self.spatial_cell_pos_embed, mean=0.0, std=0.02)
+        nn.init.normal_(self.spatial_coord_projector.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.spatial_coord_projector.bias)
         nn.init.normal_(self.spatial_queries, mean=0.0, std=0.02)
 
         self.frame_query = nn.Parameter(torch.empty(1, 1, self.cfg.d_model))
@@ -387,6 +384,7 @@ class DrivingVideoPolicy(nn.Module):
             temporal_layer,
             num_layers=self.cfg.temporal_layers,
             norm=nn.LayerNorm(self.cfg.d_model),
+            enable_nested_tensor=False,
         )
         self.temporal_norm = nn.LayerNorm(self.cfg.d_model)
         
@@ -499,18 +497,47 @@ class DrivingVideoPolicy(nn.Module):
         encoded = self.temporal_encoder(tokens + pos, mask=causal_mask, is_causal=False)
         return self.temporal_norm(encoded)
 
+    def _spatial_coord_tokens(
+        self,
+        height: int,
+        width: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        y = torch.linspace(-1.0, 1.0, int(height), device=device)
+        x = torch.linspace(-1.0, 1.0, int(width), device=device)
+        yy, xx = torch.meshgrid(y, x, indexing="ij")
+        coords = torch.stack((xx, yy, xx * yy, xx.square() + yy.square()), dim=-1)
+        weight_dtype = self.spatial_coord_projector.weight.dtype
+        coords = coords.reshape(1, int(height) * int(width), 4).to(dtype=weight_dtype)
+        return self.spatial_coord_projector(coords).to(dtype=dtype)
+
+    def _project_spatial_features(self, spatial_feats: torch.Tensor) -> torch.Tensor:
+        if spatial_feats.dim() != 4:
+            raise ValueError(f"Expected spatial features [B,C,H,W], got {tuple(spatial_feats.shape)}.")
+        b, c, h, w = spatial_feats.shape
+        if int(c) != int(self.feat_channels):
+            raise ValueError(f"Expected {self.feat_channels} feature channels, got {c}.")
+        cells = spatial_feats.flatten(2).transpose(1, 2)
+        cell_tokens = self.cell_projector(cells)
+        pos = self._spatial_coord_tokens(
+            int(h),
+            int(w),
+            device=cell_tokens.device,
+            dtype=cell_tokens.dtype,
+        )
+        return cell_tokens + pos
+
     def _visual_cells_from_masked_frames(self, frames: torch.Tensor) -> torch.Tensor:
         b, t, c, h, w = frames.shape
         x = frames.reshape(b * t, c, h, w)
         if x.is_cuda:
             x = x.contiguous(memory_format=torch.channels_last)
         spatial_feats = self.fastvit_mixer(self.spatial_encoder(x))
-        pooled = self.pool(spatial_feats)
-        cells = pooled.flatten(2).transpose(1, 2)
-        cell_tokens = self.cell_projector(cells)
-        pos = self.spatial_cell_pos_embed.to(device=cell_tokens.device, dtype=cell_tokens.dtype)
-        cell_tokens = cell_tokens + pos
-        return cell_tokens.reshape(b, t, self.pool_cell_count, self.cfg.d_model)
+        feature_h, feature_w = int(spatial_feats.size(-2)), int(spatial_feats.size(-1))
+        cell_tokens = self._project_spatial_features(spatial_feats)
+        return cell_tokens.reshape(b, t, feature_h * feature_w, self.cfg.d_model)
 
     def _spatial_tokens_from_cells(self, cell_tokens: torch.Tensor) -> torch.Tensor:
         b, t, k, d = cell_tokens.shape

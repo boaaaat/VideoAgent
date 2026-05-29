@@ -230,8 +230,6 @@ def _coerce_config_types(cfg: RuntimeConfig) -> RuntimeConfig:
     cfg.temporal_layers = max(1, int(cfg.temporal_layers))
     cfg.temporal_heads = max(1, int(cfg.temporal_heads))
     cfg.temporal_context = max(1, int(cfg.temporal_context))
-    pooling = tuple(int(value) for value in cfg.pooling)
-    cfg.pooling = (max(1, pooling[0]), max(1, pooling[1]))
     cfg.spatial_token_count = max(1, int(cfg.spatial_token_count))
     cfg.prediction_dt = float(cfg.prediction_dt)
     cfg.mouse_buttons_enabled = bool(cfg.mouse_buttons_enabled)
@@ -472,7 +470,7 @@ def main() -> None:
         f"fastvit_kernel={cfg.fastvit_kernel_size}",
         f"temporal_layers={cfg.temporal_layers}",
         f"temporal_context={cfg.temporal_context}",
-        f"pooling={cfg.pooling[0]}x{cfg.pooling[1]}",
+        "spatial_source=cnn_feature_grid",
         f"spatial_tokens={cfg.spatial_token_count}",
         f"current_spatial_tokens={cfg.spatial_token_count}",
         "input=masked_full_frame+gated_last_action",

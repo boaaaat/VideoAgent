@@ -708,7 +708,7 @@ def main() -> None:
         f"fastvit_kernel={cfg.fastvit_kernel_size}",
         f"temporal_layers={cfg.temporal_layers}",
         f"temporal_context={cfg.temporal_context}",
-        f"pooling={cfg.pooling[0]}x{cfg.pooling[1]}",
+        "spatial_source=cnn_feature_grid",
         f"current_spatial_tokens={cfg.spatial_token_count}",
         f"seq={cfg.seq_len}",
         f"horizon={cfg.prediction_horizon}",

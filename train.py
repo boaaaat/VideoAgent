@@ -63,7 +63,7 @@ class TrainConfig(ModelConfig):
     action_label_offset: int = 0
     last_action_sequence_dropout: float = 0.2
     last_action_key_dropout: float = 0.4
-    last_action_corruption_prob: float = 0.05
+    last_action_corruption_prob: float = 0.0
     skipped_key_names: Optional[Sequence[str]] = ("e", "q", "c", "z")
     button_label_smoothing: float = 0.02
 
@@ -666,7 +666,7 @@ def compute_losses(
     horizon_count = int(button_logits.size(2))
     if horizon_count > 1:
         base_horizon_weights = torch.tensor(
-            (0.50, 0.75, 0.90, 1.00, 1.00, 1.00, 1.00, 0.95, 0.90, 0.90),
+            (2.00, 1.25, 0.90, 0.65, 0.50, 0.35, 0.25, 0.20, 0.15, 0.15),
             device=button_logits.device,
             dtype=button_logits.dtype,
         )
@@ -798,7 +798,7 @@ def driving_score(metrics: Dict[str, float], cfg: TrainConfig) -> float:
     step1_score = score_rows(metrics.get("step1_button_rows", []), metrics["step1_button_macro_f1"])
     middle_score = score_rows(metrics.get("middle_button_rows", []), metrics.get("middle_button_macro_f1", step1_score))
     final_score = score_rows(metrics.get("final_button_rows", []), metrics["final_button_macro_f1"])
-    return 0.25 * step1_score + 0.35 * middle_score + 0.40 * final_score
+    return 0.80 * step1_score + 0.15 * middle_score + 0.05 * final_score
 
 
 def print_button_stats_table(title: str, rows: Sequence[Dict[str, float | int | str]]) -> None:
@@ -1078,7 +1078,7 @@ def parse_args() -> TrainConfig:
     add("--temporal-layers", type=int, default=None)
     add("--temporal-heads", type=int, default=None)
     add("--temporal-context", type=int, default=None)
-    add("--pooling", choices=["3x3", "5x5", "9x9", "12x12", "14x14", "16x16"], default=None)
+    add("--pooling", default=None, help="Legacy no-op. Spatial tokens attend to the raw CNN feature grid.")
     add("--spatial-token-count", type=int, default=None)
     add("--train-seq-stride", type=int, default=None)
     add("--val-seq-stride", type=int, default=None)
@@ -1220,9 +1220,6 @@ def parse_args() -> TrainConfig:
         value = args_by_name[key]
         if value is not None:
             kwargs[key] = value
-    if args.pooling is not None:
-        pool_parts = tuple(int(part) for part in str(args.pooling).lower().split("x"))
-        kwargs["pooling"] = pool_parts
     if args.train_all_keys:
         kwargs["skipped_key_names"] = ()
     elif args.skip_key_names is not None:
@@ -1278,7 +1275,7 @@ def train() -> None:
         f"temporal_layers={cfg.temporal_layers}",
         f"temporal_heads={cfg.temporal_heads}",
         f"temporal_context={cfg.temporal_context}",
-        f"pooling={cfg.pooling[0]}x{cfg.pooling[1]}",
+        "spatial_source=cnn_feature_grid",
         f"spatial_tokens={cfg.spatial_token_count}",
         f"current_spatial_tokens={cfg.spatial_token_count}",
     )
@@ -1400,8 +1397,6 @@ def train() -> None:
     optimizer_steps_per_epoch = int(math.ceil(train_batches / float(cfg.grad_accum)))
     total_steps = max(1, optimizer_steps_per_epoch * cfg.num_epochs)
     epochs_without_improvement = 0
-    middle_horizon_idx = min(int(cfg.prediction_horizon) - 1, int(cfg.prediction_horizon) // 2)
-    middle_horizon_offset = int(horizon_offsets[middle_horizon_idx])
     final_horizon_offset = int(horizon_offsets[-1])
 
     for epoch in range(start_epoch, cfg.num_epochs):
@@ -1481,13 +1476,11 @@ def train() -> None:
             f"tr_f1@+{first_horizon_offset}={train_metrics['step1_button_macro_f1']:.4f}",
         ]
         if int(cfg.prediction_horizon) > 1:
-            parts.append(f"tr_f1@+{middle_horizon_offset}={train_metrics['middle_button_macro_f1']:.4f}")
             parts.append(f"tr_f1@+{final_horizon_offset}={train_metrics['final_button_macro_f1']:.4f}")
         if val_metrics is not None:
             parts.append(f"va_loss={val_metrics['loss']:.4f}")
             parts.append(f"va_f1@+{first_horizon_offset}={val_metrics['step1_button_macro_f1']:.4f}")
             if int(cfg.prediction_horizon) > 1:
-                parts.append(f"va_f1@+{middle_horizon_offset}={val_metrics['middle_button_macro_f1']:.4f}")
                 parts.append(f"va_f1@+{final_horizon_offset}={val_metrics['final_button_macro_f1']:.4f}")
             parts.append(f"best={best_score:.4f}")
             parts.append(val_metrics["per_class_summary"])
@@ -1496,13 +1489,10 @@ def train() -> None:
         print(" | ".join(part for part in parts if part))
         train_stats = (
             f"Epoch {epoch + 1} train stats: "
-            f"f1@+{first_horizon_offset}={train_metrics['step1_button_macro_f1']:.4f} "
-            f"prec@+{first_horizon_offset}={train_metrics['step1_button_macro_precision']:.4f} "
-            f"rec@+{first_horizon_offset}={train_metrics['step1_button_macro_recall']:.4f}"
+            f"f1@+{first_horizon_offset}={train_metrics['step1_button_macro_f1']:.4f}"
         )
         if int(cfg.prediction_horizon) > 1:
             train_stats += (
-                f" f1@+{middle_horizon_offset}={train_metrics['middle_button_macro_f1']:.4f}"
                 f" f1@+{final_horizon_offset}={train_metrics['final_button_macro_f1']:.4f}"
             )
         print(train_stats)
@@ -1512,23 +1502,16 @@ def train() -> None:
         )
         if int(cfg.prediction_horizon) > 1:
             print_button_stats_table(
-                f"Epoch {epoch + 1} train per-key/button @+{middle_horizon_offset}:",
-                train_metrics["middle_button_rows"],
-            )
-            print_button_stats_table(
                 f"Epoch {epoch + 1} train per-key/button @+{final_horizon_offset}:",
                 train_metrics["final_button_rows"],
             )
         if val_metrics is not None:
             val_stats = (
                 f"Epoch {epoch + 1} val stats: "
-                f"f1@+{first_horizon_offset}={val_metrics['step1_button_macro_f1']:.4f} "
-                f"prec@+{first_horizon_offset}={val_metrics['step1_button_macro_precision']:.4f} "
-                f"rec@+{first_horizon_offset}={val_metrics['step1_button_macro_recall']:.4f}"
+                f"f1@+{first_horizon_offset}={val_metrics['step1_button_macro_f1']:.4f}"
             )
             if int(cfg.prediction_horizon) > 1:
                 val_stats += (
-                    f" f1@+{middle_horizon_offset}={val_metrics['middle_button_macro_f1']:.4f}"
                     f" f1@+{final_horizon_offset}={val_metrics['final_button_macro_f1']:.4f}"
                 )
             print(val_stats)
@@ -1537,10 +1520,6 @@ def train() -> None:
                 val_metrics["step1_button_rows"],
             )
             if int(cfg.prediction_horizon) > 1:
-                print_button_stats_table(
-                    f"Epoch {epoch + 1} val per-key/button @+{middle_horizon_offset}:",
-                    val_metrics["middle_button_rows"],
-                )
                 print_button_stats_table(
                     f"Epoch {epoch + 1} val per-key/button @+{final_horizon_offset}:",
                     val_metrics["final_button_rows"],

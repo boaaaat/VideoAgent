@@ -154,8 +154,6 @@ def _coerce_config_types(cfg: ModelConfig) -> ModelConfig:
     cfg.temporal_layers = max(1, int(cfg.temporal_layers))
     cfg.temporal_heads = max(1, int(cfg.temporal_heads))
     cfg.temporal_context = max(1, int(cfg.temporal_context))
-    pooling = tuple(int(value) for value in cfg.pooling)
-    cfg.pooling = (max(1, pooling[0]), max(1, pooling[1]))
     cfg.spatial_token_count = max(1, int(cfg.spatial_token_count))
     cfg.num_bin = len(cfg.key_names) + len(cfg.mouse_button_names)
     return cfg
@@ -382,11 +380,7 @@ def _policy_token_attention_heat_from_features(
     model: DrivingVideoPolicy,
     spatial_feats: torch.Tensor,
 ) -> torch.Tensor:
-    pooled = model.pool(spatial_feats)
-    cells = pooled.flatten(2).transpose(1, 2)
-    cell_tokens = model.cell_projector(cells)
-    pos = model.spatial_cell_pos_embed.to(device=cell_tokens.device, dtype=cell_tokens.dtype)
-    cell_tokens = cell_tokens + pos
+    cell_tokens = model._project_spatial_features(spatial_feats)
 
     queries = model.spatial_queries.to(device=cell_tokens.device, dtype=cell_tokens.dtype)
     queries = queries.unsqueeze(0).expand(cell_tokens.size(0), -1, -1)
@@ -410,8 +404,8 @@ def _policy_token_attention_heat_from_features(
     cell_energy = torch.linalg.vector_norm(cell_tokens.float(), ord=2, dim=-1)
     cell_energy = cell_energy / max(float(cell_tokens.size(-1)) ** 0.5, 1.0)
     heat = token_heat + 0.35 * cell_energy
-    pool_h, pool_w = int(model.cfg.pooling[0]), int(model.cfg.pooling[1])
-    return heat.reshape(spatial_feats.size(0), 1, pool_h, pool_w)
+    feature_h, feature_w = int(spatial_feats.size(-2)), int(spatial_feats.size(-1))
+    return heat.reshape(spatial_feats.size(0), 1, feature_h, feature_w)
 
 
 def _compute_feature_map(
