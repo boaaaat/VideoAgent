@@ -601,8 +601,14 @@ class DrivingVideoPolicy(nn.Module):
             queries = encoded_tokens.unsqueeze(1) + queries.unsqueeze(0).expand(memory.size(0), -1, -1)
             decoded = self.horizon_decoder(tgt=queries, memory=memory)
             logits = self.button_head(decoded)
-            prior = self._persistence_prior_logits(prev_action, batch_size=encoded_tokens.size(0), time_steps=1, device=logits.device, dtype=logits.dtype)
-            return logits + prior[:, 0].unsqueeze(1)
+            prior = self._persistence_prior_logits(
+                prev_action,
+                batch_size=encoded_tokens.size(0),
+                time_steps=1,
+                device=logits.device,
+                dtype=logits.dtype,
+            )
+            return logits + prior[:, 0]
 
         if encoded_tokens.dim() != 3:
             raise ValueError(f"Expected encoded tokens [B,N,D] or [B,D], got {tuple(encoded_tokens.shape)}.")
@@ -690,7 +696,7 @@ class DrivingVideoPolicy(nn.Module):
             device=logits.device,
             dtype=logits.dtype,
         )
-        return logits + prior.unsqueeze(2)
+        return logits + prior
 
     def _compressed_horizon_button_logits(
         self,
@@ -734,7 +740,7 @@ class DrivingVideoPolicy(nn.Module):
             device=logits.device,
             dtype=logits.dtype,
         )
-        return logits + prior.unsqueeze(2)
+        return logits + prior
 
     def _persistence_prior_logits(
         self,
@@ -769,7 +775,20 @@ class DrivingVideoPolicy(nn.Module):
                 raise ValueError(f"Expected prev_action with 2 or 3 dims, got {tuple(action_values.shape)}.")
 
         prior_logits = action_values.clamp(0.0, 1.0).mul(2.0).sub(1.0) * 2.0
-        return torch.sigmoid(self.persistence_logit_gate).to(dtype=dtype) * prior_logits
+        horizon_decay = self._persistence_horizon_decay(device=device, dtype=dtype)
+        gate = torch.sigmoid(self.persistence_logit_gate).to(dtype=dtype)
+        return gate * prior_logits.unsqueeze(2) * horizon_decay.view(1, 1, -1, 1)
+
+    def _persistence_horizon_decay(self, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        offsets = torch.tensor(
+            tuple(int(offset) for offset in self.cfg.prediction_horizon_offsets),
+            device=device,
+            dtype=dtype,
+        )
+        first = offsets[:1].clamp(min=1.0)
+        span = (offsets[-1:] - first).clamp(min=1.0)
+        progress = ((offsets - first) / span).clamp(0.0, 1.0)
+        return (1.0 - progress).pow(2.0).clamp(min=0.05, max=1.0)
 
     def _normalize_frames(self, frames: torch.Tensor) -> torch.Tensor:
         if frames.dtype == torch.uint8:
