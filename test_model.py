@@ -145,7 +145,7 @@ def load_model_checkpoint(
     load_result = model.load_state_dict(model_state, strict=False)
     if load_result.missing_keys or load_result.unexpected_keys:
         raise RuntimeError(
-            "Checkpoint does not match the current policy model. "
+            "Checkpoint does not match the current frame-token policy model. "
             f"missing={load_result.missing_keys} unexpected={load_result.unexpected_keys}"
         )
     model.eval()
@@ -703,12 +703,13 @@ def main() -> None:
         f"checkpoint={checkpoint_path}",
         f"video={video_path}",
         f"game={cfg.selected_game}",
-        "architecture=fastvit_temporal_transformer",
+        "architecture=fastvit_hybrid_frame_transformer",
         f"fastvit_depth={cfg.fastvit_depth}",
         f"fastvit_kernel={cfg.fastvit_kernel_size}",
         f"temporal_layers={cfg.temporal_layers}",
         f"temporal_context={cfg.temporal_context}",
         f"pooling={cfg.pooling[0]}x{cfg.pooling[1]}",
+        f"current_cells={int(cfg.pooling[0]) * int(cfg.pooling[1])}",
         f"seq={cfg.seq_len}",
         f"horizon={cfg.prediction_horizon}",
         f"horizon_offsets={','.join(str(int(offset)) for offset in cfg.prediction_horizon_offsets)}",

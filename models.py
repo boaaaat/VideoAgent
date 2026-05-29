@@ -292,7 +292,7 @@ class DrivingVideoPolicy(nn.Module):
         
         self.pool = nn.AdaptiveAvgPool2d(cfg.pooling)
         self.pool_cell_count = int(cfg.pooling[0]) * int(cfg.pooling[1])
-        self.tokens_per_frame = int(cfg.spatial_token_count) + 1
+        self.tokens_per_frame = 1
 
         self.cell_projector = nn.Sequential(
             nn.Linear(self.feat_channels, self.cfg.d_model),
@@ -323,9 +323,32 @@ class DrivingVideoPolicy(nn.Module):
         nn.init.normal_(self.spatial_cell_pos_embed, mean=0.0, std=0.02)
         nn.init.normal_(self.spatial_queries, mean=0.0, std=0.02)
 
-        self.dt_encoder = nn.Linear(1, self.cfg.d_model)
-        nn.init.zeros_(self.dt_encoder.weight)
-        nn.init.zeros_(self.dt_encoder.bias)
+        self.frame_query = nn.Parameter(torch.empty(1, 1, self.cfg.d_model))
+        self.frame_query_norm = nn.LayerNorm(self.cfg.d_model)
+        self.frame_token_norm = nn.LayerNorm(self.cfg.d_model)
+        self.frame_pool_attn = nn.MultiheadAttention(
+            self.cfg.d_model,
+            num_heads=spatial_heads,
+            dropout=cfg.head_dropout * 0.5,
+            batch_first=True,
+        )
+        self.visual_frame_norm = nn.LayerNorm(self.cfg.d_model)
+        self.visual_frame_ff = nn.Sequential(
+            nn.LayerNorm(self.cfg.d_model),
+            nn.Linear(self.cfg.d_model, max(self.cfg.d_model * 2, 256)),
+            nn.GELU(),
+            nn.Dropout(cfg.head_dropout * 0.5),
+            nn.Linear(max(self.cfg.d_model * 2, 256), self.cfg.d_model),
+            nn.Dropout(cfg.head_dropout * 0.5),
+        )
+        nn.init.normal_(self.frame_query, mean=0.0, std=0.02)
+
+        dt_hidden = max(16, min(64, self.cfg.d_model // 4))
+        self.dt_encoder = nn.Sequential(
+            nn.Linear(1, dt_hidden),
+            nn.ELU(inplace=True),
+            nn.Linear(dt_hidden, self.cfg.d_model),
+        )
 
         action_hidden = max(4, min(32, cfg.num_bin * 2, self.cfg.d_model // 4))
         self.last_action_encoder = nn.Sequential(
@@ -334,17 +357,20 @@ class DrivingVideoPolicy(nn.Module):
             nn.Dropout(LAST_ACTION_EMBEDDING_DROPOUT),
             nn.Linear(action_hidden, self.cfg.d_model),
         )
-
-        self.side_token_embed = nn.Parameter(torch.empty(1, 1, 1, self.cfg.d_model))
-        self.side_fusion = nn.Sequential(
+        self.context_delta = nn.Sequential(
             nn.LayerNorm(self.cfg.d_model * 2),
             nn.Linear(self.cfg.d_model * 2, self.cfg.d_model),
             nn.ELU(inplace=True),
+            nn.Dropout(cfg.head_dropout * 0.5),
+            nn.Linear(self.cfg.d_model, self.cfg.d_model),
         )
-        nn.init.normal_(self.side_token_embed, mean=0.0, std=0.02)
+        self.context_gate = nn.Linear(self.cfg.d_model * 3, self.cfg.d_model)
+        nn.init.zeros_(self.context_gate.weight)
+        nn.init.constant_(self.context_gate.bias, -3.0)
+        self.fused_frame_norm = nn.LayerNorm(self.cfg.d_model)
 
         self.temporal_frame_count = max(int(self.cfg.seq_len), int(self.cfg.temporal_context))
-        self.temporal_position_count = self.temporal_frame_count * self.tokens_per_frame
+        self.temporal_position_count = self.temporal_frame_count
         self.temporal_pos_embed = nn.Parameter(torch.empty(1, self.temporal_position_count, self.cfg.d_model))
         nn.init.normal_(self.temporal_pos_embed, mean=0.0, std=0.02)
         temporal_heads = _largest_valid_head_count(self.cfg.d_model, self.cfg.temporal_heads)
@@ -381,6 +407,10 @@ class DrivingVideoPolicy(nn.Module):
             num_layers=2,
             norm=nn.LayerNorm(self.cfg.d_model),
         )
+        self.current_memory_embed = nn.Parameter(torch.empty(1, 1, self.cfg.d_model))
+        self.history_memory_embed = nn.Parameter(torch.empty(1, 1, self.cfg.d_model))
+        nn.init.normal_(self.current_memory_embed, mean=0.0, std=0.02)
+        nn.init.normal_(self.history_memory_embed, mean=0.0, std=0.02)
         horizon_hidden = max(64, self.cfg.d_model // 2)
         self.button_head = nn.Sequential(
             nn.LayerNorm(self.cfg.d_model),
@@ -389,6 +419,7 @@ class DrivingVideoPolicy(nn.Module):
             nn.Dropout(cfg.head_dropout * 0.5),
             nn.Linear(horizon_hidden, self.cfg.num_bin),
         )
+        self.persistence_logit_gate = nn.Parameter(torch.tensor(-4.0))
         final_button_layer = self.button_head[-1]
         if isinstance(final_button_layer, nn.Linear):
             nn.init.zeros_(final_button_layer.bias)
@@ -431,27 +462,26 @@ class DrivingVideoPolicy(nn.Module):
         max_tokens = self._max_context_tokens()
         if hidden.size(1) > max_tokens:
             hidden = hidden[:, -max_tokens:]
-        complete_tokens = (int(hidden.size(1)) // self.tokens_per_frame) * self.tokens_per_frame
-        if complete_tokens != int(hidden.size(1)):
-            hidden = hidden[:, -complete_tokens:] if complete_tokens > 0 else hidden[:, :0]
         return hidden
 
     def _max_context_tokens(self) -> int:
-        return int(self.cfg.temporal_context) * int(self.tokens_per_frame)
+        return int(self.cfg.temporal_context)
 
     def _flatten_frame_tokens(self, frame_tokens: torch.Tensor) -> torch.Tensor:
+        if frame_tokens.dim() == 3:
+            if int(frame_tokens.size(-1)) != int(self.cfg.d_model):
+                raise ValueError(f"Expected token dim {self.cfg.d_model}, got {frame_tokens.size(-1)}.")
+            return frame_tokens
         if frame_tokens.dim() != 4:
             raise ValueError(f"Expected frame tokens [B,T,K,D], got {tuple(frame_tokens.shape)}.")
         b, t, k, d = frame_tokens.shape
-        if int(k) != int(self.tokens_per_frame):
-            raise ValueError(f"Expected {self.tokens_per_frame} tokens per frame, got {k}.")
         if int(d) != int(self.cfg.d_model):
             raise ValueError(f"Expected token dim {self.cfg.d_model}, got {d}.")
         return frame_tokens.reshape(b, t * k, d)
 
     def _causal_attention_mask(self, token_count: int, device: torch.device) -> torch.Tensor:
-        frame_idx = torch.arange(int(token_count), device=device) // int(self.tokens_per_frame)
-        return frame_idx.unsqueeze(0) > frame_idx.unsqueeze(1)
+        token_idx = torch.arange(int(token_count), device=device)
+        return token_idx.unsqueeze(0) > token_idx.unsqueeze(1)
 
     def _encode_temporal_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
         if tokens.dim() != 3:
@@ -459,10 +489,6 @@ class DrivingVideoPolicy(nn.Module):
         token_count = int(tokens.size(1))
         if token_count <= 0:
             raise ValueError("Temporal transformer requires at least one token.")
-        if token_count % int(self.tokens_per_frame) != 0:
-            raise ValueError(
-                f"Temporal token count {token_count} is not divisible by tokens_per_frame={self.tokens_per_frame}."
-            )
         if token_count > self.temporal_position_count:
             raise ValueError(
                 f"Temporal token length {token_count} exceeds configured position capacity "
@@ -473,7 +499,7 @@ class DrivingVideoPolicy(nn.Module):
         encoded = self.temporal_encoder(tokens + pos, mask=causal_mask, is_causal=False)
         return self.temporal_norm(encoded)
 
-    def _visual_tokens_from_masked_frames(self, frames: torch.Tensor) -> torch.Tensor:
+    def _visual_cells_from_masked_frames(self, frames: torch.Tensor) -> torch.Tensor:
         b, t, c, h, w = frames.shape
         x = frames.reshape(b * t, c, h, w)
         if x.is_cuda:
@@ -484,17 +510,57 @@ class DrivingVideoPolicy(nn.Module):
         cell_tokens = self.cell_projector(cells)
         pos = self.spatial_cell_pos_embed.to(device=cell_tokens.device, dtype=cell_tokens.dtype)
         cell_tokens = cell_tokens + pos
+        return cell_tokens.reshape(b, t, self.pool_cell_count, self.cfg.d_model)
+
+    def _spatial_tokens_from_cells(self, cell_tokens: torch.Tensor) -> torch.Tensor:
+        b, t, k, d = cell_tokens.shape
+        cells_flat = cell_tokens.reshape(b * t, k, d)
         queries = self.spatial_queries.to(device=cell_tokens.device, dtype=cell_tokens.dtype)
-        queries = queries.unsqueeze(0).expand(cell_tokens.size(0), -1, -1)
+        queries = queries.unsqueeze(0).expand(cells_flat.size(0), -1, -1)
         attn_out, _ = self.spatial_cross_attn(
             query=self.spatial_query_norm(queries),
-            key=self.spatial_cell_norm(cell_tokens),
-            value=cell_tokens,
+            key=self.spatial_cell_norm(cells_flat),
+            value=cells_flat,
             need_weights=False,
         )
         spatial_tokens = self.spatial_token_norm(queries + attn_out)
         spatial_tokens = spatial_tokens + self.spatial_token_ff(spatial_tokens)
         return spatial_tokens.reshape(b, t, int(self.cfg.spatial_token_count), self.cfg.d_model)
+
+    def _visual_tokens_from_masked_frames(self, frames: torch.Tensor) -> torch.Tensor:
+        return self._spatial_tokens_from_cells(self._visual_cells_from_masked_frames(frames))
+
+    def _visual_frame_tokens_from_cells(self, cell_tokens: torch.Tensor) -> torch.Tensor:
+        b, t, k, d = cell_tokens.shape
+        spatial_flat = cell_tokens.reshape(b * t, k, d)
+        query = self.frame_query.to(device=spatial_flat.device, dtype=spatial_flat.dtype)
+        query = query.expand(spatial_flat.size(0), -1, -1)
+        pooled, _ = self.frame_pool_attn(
+            query=self.frame_query_norm(query),
+            key=self.frame_token_norm(spatial_flat),
+            value=spatial_flat,
+            need_weights=False,
+        )
+        frame_token = self.visual_frame_norm(query + pooled).reshape(b, t, self.cfg.d_model)
+        frame_token = frame_token + self.visual_frame_ff(frame_token)
+        return frame_token
+
+    def _visual_frame_tokens_from_masked_frames(self, frames: torch.Tensor) -> torch.Tensor:
+        return self._visual_frame_tokens_from_cells(self._visual_cells_from_masked_frames(frames))
+
+    def _fuse_frame_context(
+        self,
+        visual_token: torch.Tensor,
+        dt: Optional[torch.Tensor],
+        prev_action: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        b, t = int(visual_token.size(0)), int(visual_token.size(1))
+        dt_feat = self._dt_features(dt, b, t, device=visual_token.device, dtype=visual_token.dtype)
+        action_feat = self._last_action_features(prev_action, b, t, device=visual_token.device, dtype=visual_token.dtype)
+        context = torch.cat([action_feat, dt_feat], dim=-1)
+        context_delta = self.context_delta(context)
+        gate = torch.sigmoid(self.context_gate(torch.cat([visual_token, action_feat, dt_feat], dim=-1)))
+        return self.fused_frame_norm(visual_token + gate * context_delta)
 
     def _fused_frame_tokens(
         self,
@@ -502,19 +568,26 @@ class DrivingVideoPolicy(nn.Module):
         dt: Optional[torch.Tensor],
         prev_action: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        b, t = int(frames.size(0)), int(frames.size(1))
-        visual_tokens = self._visual_tokens_from_masked_frames(frames)
-        dt_feat = self._dt_features(dt, b, t, device=frames.device, dtype=visual_tokens.dtype)
-        action_feat = self._last_action_features(prev_action, b, t, device=frames.device, dtype=visual_tokens.dtype)
-        side_token = self.side_fusion(torch.cat([dt_feat, action_feat], dim=-1)).unsqueeze(2)
-        side_embed = self.side_token_embed.to(device=side_token.device, dtype=side_token.dtype)
-        side_token = side_token + side_embed
-        return torch.cat([visual_tokens, side_token], dim=2)
+        visual_token = self._visual_frame_tokens_from_masked_frames(frames)
+        return self._fuse_frame_context(visual_token, dt, prev_action)
+
+    def _visual_memory_and_frame_tokens(
+        self,
+        frames: torch.Tensor,
+        dt: Optional[torch.Tensor],
+        prev_action: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        current_visual_tokens = self._visual_cells_from_masked_frames(frames)
+        visual_frame_tokens = self._visual_frame_tokens_from_cells(current_visual_tokens)
+        fused_frame_tokens = self._fuse_frame_context(visual_frame_tokens, dt, prev_action)
+        return current_visual_tokens, fused_frame_tokens
 
     def _horizon_button_logits(
         self,
         encoded_tokens: torch.Tensor,
         current_frame_count: Optional[int] = None,
+        prev_action: Optional[torch.Tensor] = None,
+        current_visual_tokens: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if encoded_tokens.size(-1) != self.cfg.d_model:
             raise ValueError(f"Expected final feature dim {self.cfg.d_model}, got {encoded_tokens.size(-1)}.")
@@ -522,25 +595,113 @@ class DrivingVideoPolicy(nn.Module):
         if encoded_tokens.dim() == 2:
             memory = encoded_tokens.unsqueeze(1)
             queries = self.horizon_queries.to(device=encoded_tokens.device, dtype=encoded_tokens.dtype)
-            queries = queries.unsqueeze(0).expand(memory.size(0), -1, -1)
+            queries = encoded_tokens.unsqueeze(1) + queries.unsqueeze(0).expand(memory.size(0), -1, -1)
             decoded = self.horizon_decoder(tgt=queries, memory=memory)
-            return self.button_head(decoded)
+            logits = self.button_head(decoded)
+            prior = self._persistence_prior_logits(prev_action, batch_size=encoded_tokens.size(0), time_steps=1, device=logits.device, dtype=logits.dtype)
+            return logits + prior[:, 0].unsqueeze(1)
 
         if encoded_tokens.dim() != 3:
             raise ValueError(f"Expected encoded tokens [B,N,D] or [B,D], got {tuple(encoded_tokens.shape)}.")
 
-        b, token_count, d = encoded_tokens.shape
-        if int(token_count) % int(self.tokens_per_frame) != 0:
-            raise ValueError(
-                f"Encoded token count {token_count} is not divisible by tokens_per_frame={self.tokens_per_frame}."
+        if current_visual_tokens is None:
+            return self._compressed_horizon_button_logits(
+                encoded_tokens,
+                current_frame_count=current_frame_count,
+                prev_action=prev_action,
             )
-        total_frames = int(token_count) // int(self.tokens_per_frame)
+
+        if current_visual_tokens.dim() != 4:
+            raise ValueError(f"Expected current visual tokens [B,T,K,D], got {tuple(current_visual_tokens.shape)}.")
+
+        b, token_count, d = encoded_tokens.shape
+        if int(current_visual_tokens.size(0)) != b or int(current_visual_tokens.size(-1)) != d:
+            raise ValueError(
+                f"Current visual token shape {tuple(current_visual_tokens.shape)} does not match encoded "
+                f"batch/dim {(b, d)}."
+            )
+        total_frames = int(token_count)
+        if current_frame_count is None:
+            current_frame_count = int(current_visual_tokens.size(1))
+        current_frame_count = max(1, min(int(current_frame_count), total_frames))
+        if int(current_visual_tokens.size(1)) < current_frame_count:
+            raise ValueError(
+                f"Need at least {current_frame_count} current visual frames, got {current_visual_tokens.size(1)}."
+            )
+
+        current_visual = current_visual_tokens[:, -current_frame_count:, :, :]
+        frame_anchor = encoded_tokens[:, -current_frame_count:, :]
+        horizon_queries = self.horizon_queries.to(device=encoded_tokens.device, dtype=encoded_tokens.dtype)
+        tgt = frame_anchor.unsqueeze(2) + horizon_queries.reshape(1, 1, self.cfg.prediction_horizon, d)
+        tgt = tgt.reshape(b * current_frame_count, self.cfg.prediction_horizon, d)
+
+        query_frame_idx = torch.arange(
+            total_frames - current_frame_count,
+            total_frames,
+            device=encoded_tokens.device,
+        )
+        source_frame_idx = torch.arange(total_frames, device=encoded_tokens.device)
+        history_mask = source_frame_idx.unsqueeze(0) >= query_frame_idx.unsqueeze(1)
+        current_mask = torch.zeros(
+            current_frame_count,
+            int(current_visual.size(2)),
+            device=encoded_tokens.device,
+            dtype=torch.bool,
+        )
+        memory_key_padding_mask = torch.cat([current_mask, history_mask], dim=1)
+        memory_key_padding_mask = (
+            memory_key_padding_mask.unsqueeze(0)
+            .expand(b, -1, -1)
+            .reshape(b * current_frame_count, -1)
+        )
+
+        current_memory = current_visual + self.current_memory_embed.to(
+            device=current_visual.device,
+            dtype=current_visual.dtype,
+        )
+        history_memory = encoded_tokens.unsqueeze(1).expand(b, current_frame_count, total_frames, d)
+        history_memory = history_memory + self.history_memory_embed.to(
+            device=encoded_tokens.device,
+            dtype=encoded_tokens.dtype,
+        )
+        memory = torch.cat([current_memory, history_memory], dim=2)
+        memory = memory.reshape(b * current_frame_count, memory.size(2), d)
+
+        decoded = self.horizon_decoder(
+            tgt=tgt,
+            memory=memory,
+            memory_key_padding_mask=memory_key_padding_mask,
+            tgt_is_causal=False,
+            memory_is_causal=False,
+        )
+        logits = self.button_head(decoded).reshape(
+            b,
+            current_frame_count,
+            self.cfg.prediction_horizon,
+            self.cfg.num_bin,
+        )
+        prior = self._persistence_prior_logits(
+            prev_action,
+            batch_size=b,
+            time_steps=current_frame_count,
+            device=logits.device,
+            dtype=logits.dtype,
+        )
+        return logits + prior.unsqueeze(2)
+
+    def _compressed_horizon_button_logits(
+        self,
+        encoded_tokens: torch.Tensor,
+        current_frame_count: Optional[int],
+        prev_action: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        b, token_count, d = encoded_tokens.shape
+        total_frames = int(token_count)
         if current_frame_count is None:
             current_frame_count = total_frames
         current_frame_count = max(1, min(int(current_frame_count), total_frames))
 
-        memory_frames = encoded_tokens.reshape(b, total_frames, int(self.tokens_per_frame), d)
-        frame_anchor = memory_frames[:, -current_frame_count:, -1, :]
+        frame_anchor = encoded_tokens[:, -current_frame_count:, :]
         horizon_queries = self.horizon_queries.to(device=encoded_tokens.device, dtype=encoded_tokens.dtype)
         tgt = frame_anchor.unsqueeze(2) + horizon_queries.reshape(1, 1, self.cfg.prediction_horizon, d)
         tgt = tgt.reshape(b, current_frame_count * self.cfg.prediction_horizon, d)
@@ -550,9 +711,7 @@ class DrivingVideoPolicy(nn.Module):
             total_frames,
             device=encoded_tokens.device,
         ).repeat_interleave(int(self.cfg.prediction_horizon))
-        source_frame_idx = torch.arange(total_frames, device=encoded_tokens.device).repeat_interleave(
-            int(self.tokens_per_frame)
-        )
+        source_frame_idx = torch.arange(total_frames, device=encoded_tokens.device)
         tgt_mask = query_frame_idx.unsqueeze(0) > query_frame_idx.unsqueeze(1)
         memory_mask = source_frame_idx.unsqueeze(0) > query_frame_idx.unsqueeze(1)
 
@@ -564,8 +723,50 @@ class DrivingVideoPolicy(nn.Module):
             tgt_is_causal=False,
             memory_is_causal=False,
         )
-        logits = self.button_head(decoded)
-        return logits.reshape(b, current_frame_count, self.cfg.prediction_horizon, self.cfg.num_bin)
+        logits = self.button_head(decoded).reshape(b, current_frame_count, self.cfg.prediction_horizon, self.cfg.num_bin)
+        prior = self._persistence_prior_logits(
+            prev_action,
+            batch_size=b,
+            time_steps=current_frame_count,
+            device=logits.device,
+            dtype=logits.dtype,
+        )
+        return logits + prior.unsqueeze(2)
+
+    def _persistence_prior_logits(
+        self,
+        prev_action: Optional[torch.Tensor],
+        *,
+        batch_size: int,
+        time_steps: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if prev_action is None:
+            action_values = torch.zeros((batch_size, time_steps, self.cfg.num_bin), device=device, dtype=dtype)
+        else:
+            action_values = prev_action.to(device=device, dtype=dtype)
+            if action_values.dim() == 2:
+                if tuple(action_values.shape) != (batch_size, self.cfg.num_bin):
+                    raise ValueError(
+                        f"Expected prev_action shape {(batch_size, self.cfg.num_bin)} or "
+                        f"{(batch_size, time_steps, self.cfg.num_bin)}, got {tuple(action_values.shape)}."
+                    )
+                action_values = action_values.view(batch_size, 1, self.cfg.num_bin).expand(batch_size, time_steps, self.cfg.num_bin)
+            elif action_values.dim() == 3:
+                if int(action_values.size(0)) != int(batch_size) or int(action_values.size(-1)) != int(self.cfg.num_bin):
+                    raise ValueError(
+                        f"Expected prev_action batch/classes {(batch_size, self.cfg.num_bin)}, got {tuple(action_values.shape)}."
+                    )
+                if int(action_values.size(1)) < int(time_steps):
+                    pad = action_values[:, :1].expand(batch_size, time_steps - int(action_values.size(1)), self.cfg.num_bin)
+                    action_values = torch.cat([pad, action_values], dim=1)
+                action_values = action_values[:, -time_steps:, :]
+            else:
+                raise ValueError(f"Expected prev_action with 2 or 3 dims, got {tuple(action_values.shape)}.")
+
+        prior_logits = action_values.clamp(0.0, 1.0).mul(2.0).sub(1.0) * 2.0
+        return torch.sigmoid(self.persistence_logit_gate).to(dtype=dtype) * prior_logits
 
     def _normalize_frames(self, frames: torch.Tensor) -> torch.Tensor:
         if frames.dtype == torch.uint8:
@@ -674,8 +875,7 @@ class DrivingVideoPolicy(nn.Module):
         frames = self._normalize_frames(frames)
         frames = self._apply_masks(frames)
 
-        frame_tokens = self._fused_frame_tokens(frames, dt, prev_action)
-        current_tokens = self._flatten_frame_tokens(frame_tokens)
+        current_visual_tokens, current_tokens = self._visual_memory_and_frame_tokens(frames, dt, prev_action)
         prior_tokens = self._prepare_temporal_state(
             state,
             b,
@@ -688,12 +888,16 @@ class DrivingVideoPolicy(nn.Module):
             )
         if prior_tokens.size(1) > 0:
             keep_prior = max(0, self.temporal_position_count - int(current_tokens.size(1)))
-            keep_prior = (keep_prior // self.tokens_per_frame) * self.tokens_per_frame
             prior_tokens = prior_tokens[:, -keep_prior:] if keep_prior > 0 else prior_tokens[:, :0]
             current_tokens = torch.cat([prior_tokens, current_tokens], dim=1)
         temporal_out = self._encode_temporal_tokens(current_tokens)
         
-        button = self._horizon_button_logits(temporal_out, current_frame_count=t)
+        button = self._horizon_button_logits(
+            temporal_out,
+            current_frame_count=t,
+            prev_action=prev_action,
+            current_visual_tokens=current_visual_tokens,
+        )
         
         step_button = button[:, :, 0]
         output = PolicyOutput(
@@ -720,8 +924,11 @@ class DrivingVideoPolicy(nn.Module):
         frame_norm = self._normalize_frames(frame)
         masked_frame = self._apply_masks(frame_norm)
 
-        frame_tokens = self._fused_frame_tokens(masked_frame.unsqueeze(1), dt, prev_action)
-        current_tokens = self._flatten_frame_tokens(frame_tokens)
+        current_visual_tokens, current_tokens = self._visual_memory_and_frame_tokens(
+            masked_frame.unsqueeze(1),
+            dt,
+            prev_action,
+        )
         prior_tokens = self._prepare_temporal_state(
             state,
             b,
@@ -733,7 +940,12 @@ class DrivingVideoPolicy(nn.Module):
         temporal_out = self._encode_temporal_tokens(token_memory)
 
         # 5. Project to action space values
-        button = self._horizon_button_logits(temporal_out, current_frame_count=1)[:, 0]
+        button = self._horizon_button_logits(
+            temporal_out,
+            current_frame_count=1,
+            prev_action=prev_action,
+            current_visual_tokens=current_visual_tokens,
+        )[:, 0]
 
         squeezed = PolicyOutput(
             button_logits=button[:, 0],

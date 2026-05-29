@@ -60,7 +60,7 @@ class TrainConfig(ModelConfig):
 
     button_loss_weight: float = 1.0
     button_focal_gamma: float = 1.0
-    action_label_offset: int = -1
+    action_label_offset: int = 0
     last_action_sequence_dropout: float = 0.2
     last_action_key_dropout: float = 0.4
     last_action_corruption_prob: float = 0.05
@@ -666,7 +666,7 @@ def compute_losses(
     horizon_count = int(button_logits.size(2))
     if horizon_count > 1:
         base_horizon_weights = torch.tensor(
-            (1.0, 0.25, 0.20, 0.15, 0.12, 0.10, 0.08, 0.06, 0.05, 0.05),
+            (0.50, 0.75, 0.90, 1.00, 1.00, 1.00, 1.00, 0.95, 0.90, 0.90),
             device=button_logits.device,
             dtype=button_logits.dtype,
         )
@@ -721,18 +721,19 @@ def update_metrics(
     output: PolicyOutput,
     targets: WindowTargets,
     cfg: TrainConfig,
-    step1_stats: BinaryStats,
-    final_stats: BinaryStats,
+    horizon_stats: Sequence[BinaryStats],
 ) -> None:
     valid = second_half_only(targets.horizon_valid)
-    step1_valid = valid[:, :, 0] > 0.5
-    final_idx = int(cfg.prediction_horizon) - 1
-    final_valid = valid[:, :, final_idx] > 0.5
     thresholds = button_threshold_tensor(cfg, device=output.horizon_button_logits.device).view(1, 1, -1)
-    step1_pred = torch.sigmoid(output.horizon_button_logits[:, :, 0].float()) >= thresholds
-    final_pred = torch.sigmoid(output.horizon_button_logits[:, :, final_idx].float()) >= thresholds
-    step1_stats.update(step1_pred, targets.button_horizon[:, :, 0] > 0.5, step1_valid)
-    final_stats.update(final_pred, targets.button_horizon[:, :, final_idx] > 0.5, final_valid)
+    pred = torch.sigmoid(output.horizon_button_logits.float()) >= thresholds.unsqueeze(2)
+    true = targets.button_horizon > 0.5
+    horizon_count = min(int(output.horizon_button_logits.size(2)), len(horizon_stats))
+    for horizon_idx in range(horizon_count):
+        horizon_stats[horizon_idx].update(
+            pred[:, :, horizon_idx],
+            true[:, :, horizon_idx],
+            valid[:, :, horizon_idx] > 0.5,
+        )
 
 
 def per_class_f1_summary(stats: BinaryStats, names: Sequence[str], count: int = 8) -> str:
@@ -795,7 +796,9 @@ def driving_score(metrics: Dict[str, float], cfg: TrainConfig) -> float:
         return state_total / max(total_weight, 1.0)
 
     step1_score = score_rows(metrics.get("step1_button_rows", []), metrics["step1_button_macro_f1"])
-    return step1_score
+    middle_score = score_rows(metrics.get("middle_button_rows", []), metrics.get("middle_button_macro_f1", step1_score))
+    final_score = score_rows(metrics.get("final_button_rows", []), metrics["final_button_macro_f1"])
+    return 0.25 * step1_score + 0.35 * middle_score + 0.40 * final_score
 
 
 def print_button_stats_table(title: str, rows: Sequence[Dict[str, float | int | str]]) -> None:
@@ -897,8 +900,8 @@ def run_epoch(
 
     loss_sum = torch.zeros((), device=device)
     detail_sums = {name: torch.zeros((), device=device) for name in ("button",)}
-    step1_stats = BinaryStats(cfg.num_bin, device)
-    final_stats = BinaryStats(cfg.num_bin, device)
+    horizon_count = int(cfg.prediction_horizon)
+    horizon_stats = [BinaryStats(cfg.num_bin, device) for _ in range(horizon_count)]
     steps = 0
 
     iterator_it = iter(iterator)
@@ -945,8 +948,7 @@ def run_epoch(
             output,
             batch_targets,
             cfg,
-            step1_stats,
-            final_stats,
+            horizon_stats,
         )
         loss_sum += loss.detach().float()
         for name, value in details.items():
@@ -961,21 +963,32 @@ def run_epoch(
             )
     iterator.reset()
 
-    step1 = step1_stats.compute()
-    final = final_stats.compute()
+    horizon_results = [stats.compute() for stats in horizon_stats]
+    first_idx = 0
+    middle_idx = min(horizon_count - 1, horizon_count // 2)
+    final_idx = horizon_count - 1
+    step1 = horizon_results[first_idx]
+    middle = horizon_results[middle_idx]
+    final = horizon_results[final_idx]
     button_names = list(cfg.key_names) + list(cfg.mouse_button_names)
+    horizon_macro_f1 = [float(item["macro_f1"]) for item in horizon_results]
     metrics = {
         "loss": float((loss_sum / max(1, steps)).item()),
         "button_loss": float((detail_sums["button"] / max(1, steps)).item()),
+        "horizon_button_macro_f1": horizon_macro_f1,
         "step1_button_macro_f1": step1["macro_f1"],
         "step1_button_macro_precision": step1["macro_precision"],
         "step1_button_macro_recall": step1["macro_recall"],
+        "middle_button_macro_f1": middle["macro_f1"],
+        "middle_button_macro_precision": middle["macro_precision"],
+        "middle_button_macro_recall": middle["macro_recall"],
         "final_button_macro_f1": final["macro_f1"],
         "final_button_macro_precision": final["macro_precision"],
         "final_button_macro_recall": final["macro_recall"],
-        "per_class_summary": per_class_f1_summary(step1_stats, button_names),
-        "step1_button_rows": binary_stats_rows(step1_stats, button_names),
-        "final_button_rows": binary_stats_rows(final_stats, button_names),
+        "per_class_summary": per_class_f1_summary(horizon_stats[first_idx], button_names),
+        "step1_button_rows": binary_stats_rows(horizon_stats[first_idx], button_names),
+        "middle_button_rows": binary_stats_rows(horizon_stats[middle_idx], button_names),
+        "final_button_rows": binary_stats_rows(horizon_stats[final_idx], button_names),
     }
     return metrics, global_step
 
@@ -1259,7 +1272,7 @@ def train() -> None:
     print(f"Training action keys: {', '.join(cfg.key_names + cfg.mouse_button_names)}")
     print(
         "Policy architecture:",
-        "fastvit_temporal_transformer",
+        "fastvit_hybrid_frame_transformer",
         f"fastvit_depth={cfg.fastvit_depth}",
         f"fastvit_kernel={cfg.fastvit_kernel_size}",
         f"temporal_layers={cfg.temporal_layers}",
@@ -1267,6 +1280,7 @@ def train() -> None:
         f"temporal_context={cfg.temporal_context}",
         f"pooling={cfg.pooling[0]}x{cfg.pooling[1]}",
         f"spatial_tokens={cfg.spatial_token_count}",
+        f"current_cells={int(cfg.pooling[0]) * int(cfg.pooling[1])}",
     )
     horizon_offsets = tuple(int(offset) for offset in cfg.prediction_horizon_offsets)
     first_horizon_offset = int(horizon_offsets[0])
@@ -1386,6 +1400,8 @@ def train() -> None:
     optimizer_steps_per_epoch = int(math.ceil(train_batches / float(cfg.grad_accum)))
     total_steps = max(1, optimizer_steps_per_epoch * cfg.num_epochs)
     epochs_without_improvement = 0
+    middle_horizon_idx = min(int(cfg.prediction_horizon) - 1, int(cfg.prediction_horizon) // 2)
+    middle_horizon_offset = int(horizon_offsets[middle_horizon_idx])
     final_horizon_offset = int(horizon_offsets[-1])
 
     for epoch in range(start_epoch, cfg.num_epochs):
@@ -1465,18 +1481,16 @@ def train() -> None:
             f"tr_f1@+{first_horizon_offset}={train_metrics['step1_button_macro_f1']:.4f}",
         ]
         if int(cfg.prediction_horizon) > 1:
+            parts.append(f"tr_f1@+{middle_horizon_offset}={train_metrics['middle_button_macro_f1']:.4f}")
             parts.append(f"tr_f1@+{final_horizon_offset}={train_metrics['final_button_macro_f1']:.4f}")
         if val_metrics is not None:
-            parts.extend(
-                [
-                    f"va_loss={val_metrics['loss']:.4f}",
-                    f"va_f1@+{first_horizon_offset}={val_metrics['step1_button_macro_f1']:.4f}",
-                    f"best={best_score:.4f}",
-                    val_metrics["per_class_summary"],
-                ]
-            )
+            parts.append(f"va_loss={val_metrics['loss']:.4f}")
+            parts.append(f"va_f1@+{first_horizon_offset}={val_metrics['step1_button_macro_f1']:.4f}")
             if int(cfg.prediction_horizon) > 1:
-                parts.insert(-3, f"va_f1@+{final_horizon_offset}={val_metrics['final_button_macro_f1']:.4f}")
+                parts.append(f"va_f1@+{middle_horizon_offset}={val_metrics['middle_button_macro_f1']:.4f}")
+                parts.append(f"va_f1@+{final_horizon_offset}={val_metrics['final_button_macro_f1']:.4f}")
+            parts.append(f"best={best_score:.4f}")
+            parts.append(val_metrics["per_class_summary"])
         else:
             parts.append(train_metrics["per_class_summary"])
         print(" | ".join(part for part in parts if part))
@@ -1488,6 +1502,7 @@ def train() -> None:
         )
         if int(cfg.prediction_horizon) > 1:
             train_stats += (
+                f" f1@+{middle_horizon_offset}={train_metrics['middle_button_macro_f1']:.4f}"
                 f" f1@+{final_horizon_offset}={train_metrics['final_button_macro_f1']:.4f}"
             )
         print(train_stats)
@@ -1496,6 +1511,10 @@ def train() -> None:
             train_metrics["step1_button_rows"],
         )
         if int(cfg.prediction_horizon) > 1:
+            print_button_stats_table(
+                f"Epoch {epoch + 1} train per-key/button @+{middle_horizon_offset}:",
+                train_metrics["middle_button_rows"],
+            )
             print_button_stats_table(
                 f"Epoch {epoch + 1} train per-key/button @+{final_horizon_offset}:",
                 train_metrics["final_button_rows"],
@@ -1509,6 +1528,7 @@ def train() -> None:
             )
             if int(cfg.prediction_horizon) > 1:
                 val_stats += (
+                    f" f1@+{middle_horizon_offset}={val_metrics['middle_button_macro_f1']:.4f}"
                     f" f1@+{final_horizon_offset}={val_metrics['final_button_macro_f1']:.4f}"
                 )
             print(val_stats)
@@ -1517,6 +1537,10 @@ def train() -> None:
                 val_metrics["step1_button_rows"],
             )
             if int(cfg.prediction_horizon) > 1:
+                print_button_stats_table(
+                    f"Epoch {epoch + 1} val per-key/button @+{middle_horizon_offset}:",
+                    val_metrics["middle_button_rows"],
+                )
                 print_button_stats_table(
                     f"Epoch {epoch + 1} val per-key/button @+{final_horizon_offset}:",
                     val_metrics["final_button_rows"],

@@ -457,7 +457,7 @@ def main() -> None:
         model.load_state_dict(model_state)
     except RuntimeError as exc:
         raise RuntimeError(
-            "Checkpoint is incompatible with the current multi-token policy architecture. "
+            "Checkpoint is incompatible with the current frame-token policy architecture. "
             "Train a fresh policy checkpoint before running realtime control."
         ) from exc
     print(
@@ -467,14 +467,15 @@ def main() -> None:
         f"command_horizon={cfg.command_horizon}",
         f"command_offset=+{int(cfg.prediction_horizon_offsets[cfg.command_horizon - 1])}",
         f"d_model={cfg.d_model}",
-        "architecture=fastvit_temporal_transformer",
+        "architecture=fastvit_hybrid_frame_transformer",
         f"fastvit_depth={cfg.fastvit_depth}",
         f"fastvit_kernel={cfg.fastvit_kernel_size}",
         f"temporal_layers={cfg.temporal_layers}",
         f"temporal_context={cfg.temporal_context}",
         f"pooling={cfg.pooling[0]}x{cfg.pooling[1]}",
         f"spatial_tokens={cfg.spatial_token_count}",
-        "input=masked_full_frame+last_action",
+        f"current_cells={int(cfg.pooling[0]) * int(cfg.pooling[1])}",
+        "input=masked_full_frame+gated_last_action",
     )
     print(
         "Button thresholds:",

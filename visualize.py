@@ -263,7 +263,7 @@ def load_model_from_checkpoint(
         model.load_state_dict(model_state, strict=True)
     except RuntimeError as exc:
         raise RuntimeError(
-            f"Policy checkpoint {ckpt_path} is incompatible with the current multi-token architecture. "
+            f"Policy checkpoint {ckpt_path} is incompatible with the current frame-token architecture. "
             "Train a fresh policy checkpoint or pass a matching checkpoint."
         ) from exc
 
@@ -686,7 +686,8 @@ def _policy_visuals_for_frame(
                 else:
                     raise ValueError(f"Unknown policy layer {layer!r}.")
 
-            if bool(need_trajectory):
+            needs_temporal = bool(need_trajectory)
+            if needs_temporal:
                 b = int(x.size(0))
                 dt = torch.tensor([float(cfg.prediction_dt)], device=x.device, dtype=x.dtype)
                 if prev_action is None:
@@ -699,13 +700,15 @@ def _policy_visuals_for_frame(
                     state if state is not None else TemporalState(),
                     prev_action=prev_for_head,
                 )
-                logits = output.horizon_button_logits[0].detach().float()
-                trajectory_probs = torch.sigmoid(logits).detach().cpu().numpy().astype(np.float32)
-                command_idx = min(int(cfg.prediction_horizon) - 1, 9)
-                thresholds = _button_thresholds(cfg, device=logits.device, dtype=logits.dtype)
-                next_action = (
-                    torch.sigmoid(logits[command_idx]) >= thresholds
-                ).to(dtype=x.dtype).reshape(1, int(cfg.num_bin)).detach()
+
+                if bool(need_trajectory):
+                    logits = output.horizon_button_logits[0].detach().float()
+                    trajectory_probs = torch.sigmoid(logits).detach().cpu().numpy().astype(np.float32)
+                    command_idx = min(int(cfg.prediction_horizon) - 1, 9)
+                    thresholds = _button_thresholds(cfg, device=logits.device, dtype=logits.dtype)
+                    next_action = (
+                        torch.sigmoid(logits[command_idx]) >= thresholds
+                    ).to(dtype=x.dtype).reshape(1, int(cfg.num_bin)).detach()
 
             if feat is None:
                 raise RuntimeError(f"Policy layer {layer!r} did not produce a feature map.")
