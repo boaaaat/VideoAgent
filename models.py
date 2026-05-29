@@ -65,8 +65,8 @@ class ModelConfig:
     mouse_button_names: Optional[List[str]] = None
 
     d_model: int = 256
-    spatial_dropout: float = 0.10
-    head_dropout: float = 0.20
+    spatial_dropout: float = 0.05
+    head_dropout: float = 0.1
 
     fastvit_depth: int = 2
     fastvit_kernel_size: int = 3
@@ -74,8 +74,8 @@ class ModelConfig:
     temporal_heads: int = 4
     temporal_context: int = 80
 
-    pooling: Tuple[int, int] = (9, 9)
-    spatial_token_count: int = 36
+    pooling: Tuple[int, int] = (16, 16)
+    spatial_token_count: int = 64
 
     button_state_threshold: float = 0.5
     button_state_thresholds: Optional[Sequence[float]] = None
@@ -546,7 +546,9 @@ class DrivingVideoPolicy(nn.Module):
         return frame_token
 
     def _visual_frame_tokens_from_masked_frames(self, frames: torch.Tensor) -> torch.Tensor:
-        return self._visual_frame_tokens_from_cells(self._visual_cells_from_masked_frames(frames))
+        cell_tokens = self._visual_cells_from_masked_frames(frames)
+        spatial_tokens = self._spatial_tokens_from_cells(cell_tokens)
+        return self._visual_frame_tokens_from_cells(spatial_tokens)
 
     def _fuse_frame_context(
         self,
@@ -577,7 +579,8 @@ class DrivingVideoPolicy(nn.Module):
         dt: Optional[torch.Tensor],
         prev_action: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        current_visual_tokens = self._visual_cells_from_masked_frames(frames)
+        cell_tokens = self._visual_cells_from_masked_frames(frames)
+        current_visual_tokens = self._spatial_tokens_from_cells(cell_tokens)
         visual_frame_tokens = self._visual_frame_tokens_from_cells(current_visual_tokens)
         fused_frame_tokens = self._fuse_frame_context(visual_frame_tokens, dt, prev_action)
         return current_visual_tokens, fused_frame_tokens

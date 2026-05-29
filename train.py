@@ -52,7 +52,7 @@ class TrainConfig(ModelConfig):
 
     train_split: float = 0.8
     split_seed: int = 1337
-    pos_weight_power: float = 0.25
+    pos_weight_power: float = 0.5
     pos_weight_clamp: float = 8
     button_threshold_from_pos_weight: bool = False
     button_threshold_min: float = 0.5
@@ -1078,7 +1078,7 @@ def parse_args() -> TrainConfig:
     add("--temporal-layers", type=int, default=None)
     add("--temporal-heads", type=int, default=None)
     add("--temporal-context", type=int, default=None)
-    add("--pooling", choices=["3x3", "5x5", "9x9"], default=None)
+    add("--pooling", choices=["3x3", "5x5", "9x9", "12x12", "14x14", "16x16"], default=None)
     add("--spatial-token-count", type=int, default=None)
     add("--train-seq-stride", type=int, default=None)
     add("--val-seq-stride", type=int, default=None)
@@ -1280,7 +1280,7 @@ def train() -> None:
         f"temporal_context={cfg.temporal_context}",
         f"pooling={cfg.pooling[0]}x{cfg.pooling[1]}",
         f"spatial_tokens={cfg.spatial_token_count}",
-        f"current_cells={int(cfg.pooling[0]) * int(cfg.pooling[1])}",
+        f"current_spatial_tokens={cfg.spatial_token_count}",
     )
     horizon_offsets = tuple(int(offset) for offset in cfg.prediction_horizon_offsets)
     first_horizon_offset = int(horizon_offsets[0])

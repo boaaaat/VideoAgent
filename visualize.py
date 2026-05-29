@@ -378,6 +378,42 @@ def _inverse_encoder_input(
     return x, frame_rgb.detach()
 
 
+def _policy_token_attention_heat_from_features(
+    model: DrivingVideoPolicy,
+    spatial_feats: torch.Tensor,
+) -> torch.Tensor:
+    pooled = model.pool(spatial_feats)
+    cells = pooled.flatten(2).transpose(1, 2)
+    cell_tokens = model.cell_projector(cells)
+    pos = model.spatial_cell_pos_embed.to(device=cell_tokens.device, dtype=cell_tokens.dtype)
+    cell_tokens = cell_tokens + pos
+
+    queries = model.spatial_queries.to(device=cell_tokens.device, dtype=cell_tokens.dtype)
+    queries = queries.unsqueeze(0).expand(cell_tokens.size(0), -1, -1)
+    attn_out, attn_weights = model.spatial_cross_attn(
+        query=model.spatial_query_norm(queries),
+        key=model.spatial_cell_norm(cell_tokens),
+        value=cell_tokens,
+        need_weights=True,
+    )
+    spatial_tokens = model.spatial_token_norm(queries + attn_out)
+    spatial_tokens = spatial_tokens + model.spatial_token_ff(spatial_tokens)
+
+    if attn_weights.dim() == 4:
+        attn = attn_weights.float().mean(dim=1)
+    else:
+        attn = attn_weights.float()
+    token_energy = torch.linalg.vector_norm(spatial_tokens.float(), ord=2, dim=-1)
+    token_energy = token_energy / max(float(spatial_tokens.size(-1)) ** 0.5, 1.0)
+    token_heat = torch.bmm(token_energy.unsqueeze(1), attn).squeeze(1)
+
+    cell_energy = torch.linalg.vector_norm(cell_tokens.float(), ord=2, dim=-1)
+    cell_energy = cell_energy / max(float(cell_tokens.size(-1)) ** 0.5, 1.0)
+    heat = token_heat + 0.35 * cell_energy
+    pool_h, pool_w = int(model.cfg.pooling[0]), int(model.cfg.pooling[1])
+    return heat.reshape(spatial_feats.size(0), 1, pool_h, pool_w)
+
+
 def _compute_feature_map(
     model: VisualModel,
     frame_rgb: torch.Tensor,
@@ -401,7 +437,7 @@ def _compute_feature_map(
         if layer == "spatial":
             return stages[-1], current, policy_state
         if layer == "tokens":
-            return model.fastvit_mixer(stages[-1]), current, policy_state
+            return _policy_token_attention_heat_from_features(model, model.fastvit_mixer(stages[-1])), current, policy_state
         raise ValueError(f"Unknown policy layer {layer!r}.")
 
     x, current = _inverse_encoder_input(frame_rgb, previous_frame_rgb)
@@ -481,13 +517,13 @@ def _feature_heatmap_for_frame(
     previous_frame_rgb: Optional[torch.Tensor] = None,
     layer: FeatureLayer = "tokens",
     resize_to: Optional[int] = None,
-    reduction: HeatReduction = "positive",
+    reduction: HeatReduction = "l2",
     robust_norm: bool = True,
-    q_low: float = 0.25,
-    q_high: float = 0.995,
-    gamma: float = 1.35,
-    colormap: str = "magma",
-    blur: int = 5,
+    q_low: float = 0.05,
+    q_high: float = 0.98,
+    gamma: float = 0.75,
+    colormap: str = "jet",
+    blur: int = 3,
     amp_dtype: torch.dtype = torch.bfloat16,
     use_autocast: bool = True,
     policy_state: Optional[TemporalState] = None,
@@ -682,7 +718,7 @@ def _policy_visuals_for_frame(
                 elif layer == "spatial":
                     feat = stages[-1]
                 elif layer == "tokens":
-                    feat = model.fastvit_mixer(stages[-1])
+                    feat = _policy_token_attention_heat_from_features(model, model.fastvit_mixer(stages[-1]))
                 else:
                     raise ValueError(f"Unknown policy layer {layer!r}.")
 
@@ -961,16 +997,16 @@ def process_video_cnn(
     *,
     model_kind: LoadedModelKind,
     layer: FeatureLayer = "tokens",
-    mode: Literal["heat", "overlay", "side_by_side", "triple"] = "side_by_side",
-    alpha: float = 0.35,
+    mode: Literal["heat", "overlay", "side_by_side", "triple"] = "triple",
+    alpha: float = 0.55,
     resize_to: Optional[int] = None,
-    reduction: HeatReduction = "positive",
+    reduction: HeatReduction = "l2",
     robust_norm: bool = True,
-    q_low: float = 0.25,
-    q_high: float = 0.995,
-    gamma: float = 1.35,
-    colormap: str = "magma",
-    blur: int = 5,
+    q_low: float = 0.05,
+    q_high: float = 0.98,
+    gamma: float = 0.75,
+    colormap: str = "jet",
+    blur: int = 3,
     amp_dtype: torch.dtype = torch.bfloat16,
     use_autocast: bool = True,
     ffmpeg_path: Optional[str] = None,
@@ -1192,7 +1228,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--mode", choices=["heat", "overlay", "side_by_side", "triple"], default="side_by_side")
-    parser.add_argument("--alpha", type=float, default=0.35, help="Overlay blend factor.")
+    parser.add_argument("--alpha", type=float, default=0.55, help="Overlay blend factor.")
     parser.add_argument(
         "--resize-to",
         type=int,
@@ -1202,14 +1238,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--heat-reduction",
         choices=["l2", "mean_abs", "positive"],
-        default="positive",
-        help="How feature channels are reduced into a heatmap. positive is less noisy than raw L2 energy.",
+        default="l2",
+        help="How feature channels are reduced into a heatmap. l2 shows more activation energy.",
     )
-    parser.add_argument("--q-low", type=float, default=0.25)
-    parser.add_argument("--q-high", type=float, default=0.995)
-    parser.add_argument("--gamma", type=float, default=1.35)
-    parser.add_argument("--colormap", choices=COLORMAP_CHOICES, default="magma")
-    parser.add_argument("--blur", type=int, default=5, help="Odd Gaussian blur kernel applied to the scalar heatmap.")
+    parser.add_argument("--q-low", type=float, default=0.05)
+    parser.add_argument("--q-high", type=float, default=0.98)
+    parser.add_argument("--gamma", type=float, default=0.75)
+    parser.add_argument("--colormap", choices=COLORMAP_CHOICES, default="jet")
+    parser.add_argument("--blur", type=int, default=3, help="Odd Gaussian blur kernel applied to the scalar heatmap.")
     parser.add_argument("--no-robust-norm", action="store_true", help="Use min/max normalization instead of quantiles.")
     parser.add_argument("--fp16", action="store_true", help="Use fp16 autocast on CUDA instead of bf16.")
     parser.add_argument("--no-amp", action="store_true", help="Disable autocast during encoder inference.")
@@ -1219,6 +1255,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--no-trajectory",
         action="store_true",
         help="Disable the FSD-style policy trajectory overlay.",
+        default=True
     )
     parser.add_argument(
         "--no-real-trajectory",

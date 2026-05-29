@@ -474,7 +474,7 @@ def main() -> None:
         f"temporal_context={cfg.temporal_context}",
         f"pooling={cfg.pooling[0]}x{cfg.pooling[1]}",
         f"spatial_tokens={cfg.spatial_token_count}",
-        f"current_cells={int(cfg.pooling[0]) * int(cfg.pooling[1])}",
+        f"current_spatial_tokens={cfg.spatial_token_count}",
         "input=masked_full_frame+gated_last_action",
     )
     print(
