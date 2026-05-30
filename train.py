@@ -1102,6 +1102,7 @@ def maybe_resume(
     cfg: TrainConfig,
     device: torch.device,
 ) -> Tuple[int, int, float]:
+    allowed_missing = {"recent_visual_age_embed"}
     if not cfg.resume:
         return 0, 0, -1e9
     if cfg.resume_path is not None:
@@ -1113,7 +1114,13 @@ def maybe_resume(
     print(f"Resuming from {ckpt_path}")
     state = torch.load(ckpt_path, map_location=device)
     try:
-        model.load_state_dict(state["model_state"])
+        missing, unexpected = model.load_state_dict(state["model_state"], strict=False)
+        missing_set = set(missing)
+        unexpected_set = set(unexpected)
+        if missing_set - allowed_missing or unexpected_set:
+            raise RuntimeError(
+                f"missing={sorted(missing_set)} unexpected={sorted(unexpected_set)}"
+            )
     except RuntimeError as exc:
         if cfg.resume_path is None:
             print(
@@ -1125,7 +1132,13 @@ def maybe_resume(
             f"Cannot resume checkpoint {ckpt_path}: it does not match the current policy model. "
             "Start a fresh run or pass --no-resume."
         ) from exc
-    optimizer.load_state_dict(state["optimizer_state"])
+    if missing_set:
+        print(
+            "Checkpoint predates recent visual age embeddings; "
+            "loaded model weights and starting a fresh optimizer state for the new parameter."
+        )
+    else:
+        optimizer.load_state_dict(state["optimizer_state"])
     return int(state["epoch"]), int(state["global_step"]), float(state["best_score"])
 
 

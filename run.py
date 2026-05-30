@@ -453,7 +453,21 @@ def main() -> None:
 
     model = DrivingVideoPolicy(cfg).to(device)
     try:
-        model.load_state_dict(model_state)
+        missing, unexpected = model.load_state_dict(model_state, strict=False)
+        missing_set = set(missing)
+        unexpected_set = set(unexpected)
+        allowed_missing = {"recent_visual_age_embed"}
+        if missing_set - allowed_missing or unexpected_set:
+            raise RuntimeError(
+                f"missing={sorted(missing_set)} unexpected={sorted(unexpected_set)}"
+            )
+        if "recent_visual_age_embed" in missing_set:
+            with torch.no_grad():
+                model.recent_visual_age_embed.zero_()
+            print(
+                "Checkpoint predates recent visual age embeddings; "
+                "using zero age embeddings for compatibility. Retrain to use the fix."
+            )
     except RuntimeError as exc:
         raise RuntimeError(
             "Checkpoint is incompatible with the current frame-token policy architecture. "

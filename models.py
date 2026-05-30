@@ -410,8 +410,12 @@ class DrivingVideoPolicy(nn.Module):
         )
         self.current_memory_embed = nn.Parameter(torch.empty(1, 1, self.cfg.d_model))
         self.history_memory_embed = nn.Parameter(torch.empty(1, 1, self.cfg.d_model))
+        self.recent_visual_age_embed = nn.Parameter(
+            torch.empty(self._max_recent_visual_frames(), self.cfg.d_model)
+        )
         nn.init.normal_(self.current_memory_embed, mean=0.0, std=0.02)
         nn.init.normal_(self.history_memory_embed, mean=0.0, std=0.02)
+        nn.init.normal_(self.recent_visual_age_embed, mean=0.0, std=0.02)
         horizon_hidden = max(64, self.cfg.d_model // 2)
         self.button_head = nn.Sequential(
             nn.LayerNorm(self.cfg.d_model),
@@ -707,6 +711,11 @@ class DrivingVideoPolicy(nn.Module):
             d,
         )
         recent_memory = torch.gather(visual_source, dim=2, index=gather_idx)
+        age_embed = self.recent_visual_age_embed[-recent_frames:].to(
+            device=recent_memory.device,
+            dtype=recent_memory.dtype,
+        )
+        recent_memory = recent_memory + age_embed.view(1, 1, recent_frames, 1, d)
         recent_memory = recent_memory.reshape(
             b,
             current_frame_count,
