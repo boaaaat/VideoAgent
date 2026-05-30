@@ -343,6 +343,29 @@ class DrivingVideoPolicy(nn.Module):
         )
         nn.init.normal_(self.frame_query, mean=0.0, std=0.02)
 
+        self.motion_query = nn.Parameter(torch.empty(1, 1, self.cfg.d_model))
+        self.motion_query_norm = nn.LayerNorm(self.cfg.d_model)
+        self.motion_token_norm = nn.LayerNorm(self.cfg.d_model)
+        self.motion_pool_attn = nn.MultiheadAttention(
+            self.cfg.d_model,
+            num_heads=spatial_heads,
+            dropout=cfg.head_dropout * 0.5,
+            batch_first=True,
+        )
+        self.visual_motion_fuser = nn.Sequential(
+            nn.LayerNorm(self.cfg.d_model * 2),
+            nn.Linear(self.cfg.d_model * 2, self.cfg.d_model),
+            nn.GELU(),
+            nn.Dropout(cfg.head_dropout * 0.5),
+            nn.Linear(self.cfg.d_model, self.cfg.d_model),
+            nn.Dropout(cfg.head_dropout * 0.5),
+        )
+        self.visual_motion_gate = nn.Linear(self.cfg.d_model * 2, self.cfg.d_model)
+        self.visual_motion_norm = nn.LayerNorm(self.cfg.d_model)
+        nn.init.normal_(self.motion_query, mean=0.0, std=0.02)
+        nn.init.zeros_(self.visual_motion_gate.weight)
+        nn.init.constant_(self.visual_motion_gate.bias, -1.0)
+
         dt_hidden = max(16, min(64, self.cfg.d_model // 4))
         self.dt_encoder = nn.Sequential(
             nn.Linear(1, dt_hidden),
@@ -616,10 +639,60 @@ class DrivingVideoPolicy(nn.Module):
         frame_token = frame_token + self.visual_frame_ff(frame_token)
         return frame_token
 
+    def _motion_frame_tokens_from_spatial_tokens(
+        self,
+        spatial_tokens: torch.Tensor,
+        previous_spatial_tokens: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if spatial_tokens.dim() != 4:
+            raise ValueError(f"Expected spatial tokens [B,T,K,D], got {tuple(spatial_tokens.shape)}.")
+        b, t, k, d = spatial_tokens.shape
+        delta = torch.zeros_like(spatial_tokens)
+        if previous_spatial_tokens is not None and int(previous_spatial_tokens.size(1)) > 0:
+            previous = previous_spatial_tokens[:, -1:].to(
+                device=spatial_tokens.device,
+                dtype=spatial_tokens.dtype,
+            )
+            if int(previous.size(0)) != b or int(previous.size(2)) != k or int(previous.size(3)) != d:
+                raise ValueError(
+                    f"Previous spatial token shape {tuple(previous.shape)} does not match "
+                    f"current shape {(b, t, k, d)}."
+                )
+            delta[:, :1] = spatial_tokens[:, :1] - previous
+        if t > 1:
+            delta[:, 1:] = spatial_tokens[:, 1:] - spatial_tokens[:, :-1]
+
+        delta_flat = delta.reshape(b * t, k, d)
+        query = self.motion_query.to(device=delta_flat.device, dtype=delta_flat.dtype)
+        query = query.expand(delta_flat.size(0), -1, -1)
+        pooled, _ = self.motion_pool_attn(
+            query=self.motion_query_norm(query),
+            key=self.motion_token_norm(delta_flat),
+            value=delta_flat,
+            need_weights=False,
+        )
+        return pooled.reshape(b, t, d)
+
+    def _add_visual_motion_context(
+        self,
+        visual_frame_tokens: torch.Tensor,
+        spatial_tokens: torch.Tensor,
+        previous_spatial_tokens: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        motion_tokens = self._motion_frame_tokens_from_spatial_tokens(
+            spatial_tokens,
+            previous_spatial_tokens=previous_spatial_tokens,
+        )
+        context = torch.cat([visual_frame_tokens, motion_tokens], dim=-1)
+        motion_delta = self.visual_motion_fuser(context)
+        gate = torch.sigmoid(self.visual_motion_gate(context))
+        return self.visual_motion_norm(visual_frame_tokens + gate * motion_delta)
+
     def _visual_frame_tokens_from_masked_frames(self, frames: torch.Tensor) -> torch.Tensor:
         cell_tokens = self._visual_cells_from_masked_frames(frames)
         spatial_tokens = self._spatial_tokens_from_cells(cell_tokens)
-        return self._visual_frame_tokens_from_cells(spatial_tokens)
+        visual_frame_tokens = self._visual_frame_tokens_from_cells(spatial_tokens)
+        return self._add_visual_motion_context(visual_frame_tokens, spatial_tokens)
 
     def _fuse_frame_context(
         self,
@@ -654,10 +727,16 @@ class DrivingVideoPolicy(nn.Module):
         dt: Optional[torch.Tensor],
         prev_action: Optional[torch.Tensor],
         prev_action_scale: float = 1.0,
+        previous_visual_tokens: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         cell_tokens = self._visual_cells_from_masked_frames(frames)
         current_visual_tokens = self._spatial_tokens_from_cells(cell_tokens)
         visual_frame_tokens = self._visual_frame_tokens_from_cells(current_visual_tokens)
+        visual_frame_tokens = self._add_visual_motion_context(
+            visual_frame_tokens,
+            current_visual_tokens,
+            previous_spatial_tokens=previous_visual_tokens,
+        )
         fused_frame_tokens = self._fuse_frame_context(
             visual_frame_tokens,
             dt,
@@ -1056,17 +1135,18 @@ class DrivingVideoPolicy(nn.Module):
         frames = self._normalize_frames(frames)
         frames = self._apply_masks(frames)
 
+        prior_visual_tokens = self._prepare_visual_state(
+            state,
+            b,
+            device=frames.device,
+            dtype=frames.dtype,
+        )
         current_visual_tokens, current_tokens = self._visual_memory_and_frame_tokens(
             frames,
             dt,
             prev_action,
             prev_action_scale=prev_action_scale,
-        )
-        prior_visual_tokens = self._prepare_visual_state(
-            state,
-            b,
-            device=frames.device,
-            dtype=current_visual_tokens.dtype,
+            previous_visual_tokens=prior_visual_tokens,
         )
         prior_tokens = self._prepare_temporal_state(
             state,
@@ -1124,17 +1204,18 @@ class DrivingVideoPolicy(nn.Module):
         frame_norm = self._normalize_frames(frame)
         masked_frame = self._apply_masks(frame_norm)
 
+        prior_visual_tokens = self._prepare_visual_state(
+            state,
+            b,
+            device=frame.device,
+            dtype=masked_frame.dtype,
+        )
         current_visual_tokens, current_tokens = self._visual_memory_and_frame_tokens(
             masked_frame.unsqueeze(1),
             dt,
             prev_action,
             prev_action_scale=prev_action_scale,
-        )
-        prior_visual_tokens = self._prepare_visual_state(
-            state,
-            b,
-            device=frame.device,
-            dtype=current_visual_tokens.dtype,
+            previous_visual_tokens=prior_visual_tokens,
         )
         prior_tokens = self._prepare_temporal_state(
             state,

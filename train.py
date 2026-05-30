@@ -1102,7 +1102,7 @@ def maybe_resume(
     cfg: TrainConfig,
     device: torch.device,
 ) -> Tuple[int, int, float]:
-    allowed_missing = {"recent_visual_age_embed"}
+    allowed_missing_prefixes = ("recent_visual_age_embed", "motion_", "visual_motion_")
     if not cfg.resume:
         return 0, 0, -1e9
     if cfg.resume_path is not None:
@@ -1117,9 +1117,14 @@ def maybe_resume(
         missing, unexpected = model.load_state_dict(state["model_state"], strict=False)
         missing_set = set(missing)
         unexpected_set = set(unexpected)
-        if missing_set - allowed_missing or unexpected_set:
+        bad_missing = [
+            name
+            for name in missing
+            if not any(name == prefix or name.startswith(prefix) for prefix in allowed_missing_prefixes)
+        ]
+        if bad_missing or unexpected_set:
             raise RuntimeError(
-                f"missing={sorted(missing_set)} unexpected={sorted(unexpected_set)}"
+                f"missing={sorted(bad_missing)} unexpected={sorted(unexpected_set)}"
             )
     except RuntimeError as exc:
         if cfg.resume_path is None:
@@ -1134,8 +1139,8 @@ def maybe_resume(
         ) from exc
     if missing_set:
         print(
-            "Checkpoint predates recent visual age embeddings; "
-            "loaded model weights and starting a fresh optimizer state for the new parameter."
+            "Checkpoint predates visual motion/age embeddings; "
+            "loaded matching model weights and starting a fresh optimizer state for the new parameters."
         )
     else:
         optimizer.load_state_dict(state["optimizer_state"])

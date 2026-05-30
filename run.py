@@ -456,17 +456,22 @@ def main() -> None:
         missing, unexpected = model.load_state_dict(model_state, strict=False)
         missing_set = set(missing)
         unexpected_set = set(unexpected)
-        allowed_missing = {"recent_visual_age_embed"}
-        if missing_set - allowed_missing or unexpected_set:
+        allowed_missing_prefixes = ("recent_visual_age_embed", "motion_", "visual_motion_")
+        bad_missing = [
+            name
+            for name in missing
+            if not any(name == prefix or name.startswith(prefix) for prefix in allowed_missing_prefixes)
+        ]
+        if bad_missing or unexpected_set:
             raise RuntimeError(
-                f"missing={sorted(missing_set)} unexpected={sorted(unexpected_set)}"
+                f"missing={sorted(bad_missing)} unexpected={sorted(unexpected_set)}"
             )
-        if "recent_visual_age_embed" in missing_set:
+        if missing_set:
             with torch.no_grad():
-                model.recent_visual_age_embed.zero_()
+                if "recent_visual_age_embed" in missing_set:
+                    model.recent_visual_age_embed.zero_()
             print(
-                "Checkpoint predates recent visual age embeddings; "
-                "using zero age embeddings for compatibility. Retrain to use the fix."
+                "Checkpoint predates visual motion/age embeddings. Retrain to use the updated architecture."
             )
     except RuntimeError as exc:
         raise RuntimeError(
