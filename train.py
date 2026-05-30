@@ -64,6 +64,8 @@ class TrainConfig(ModelConfig):
     last_action_sequence_dropout: float = 0.2
     last_action_key_dropout: float = 0.4
     last_action_corruption_prob: float = 0.0
+    last_action_curriculum_warmup_epochs: int = 5
+    last_action_curriculum_ramp_epochs: int = 5
     skipped_key_names: Optional[Sequence[str]] = ("e", "q", "c", "z")
     button_label_smoothing: float = 0.02
 
@@ -141,6 +143,8 @@ class TrainConfig(ModelConfig):
         self.last_action_sequence_dropout = float(min(max(self.last_action_sequence_dropout, 0.0), 1.0))
         self.last_action_key_dropout = float(min(max(self.last_action_key_dropout, 0.0), 1.0))
         self.last_action_corruption_prob = float(min(max(self.last_action_corruption_prob, 0.0), 1.0))
+        self.last_action_curriculum_warmup_epochs = max(0, int(self.last_action_curriculum_warmup_epochs))
+        self.last_action_curriculum_ramp_epochs = max(0, int(self.last_action_curriculum_ramp_epochs))
         self.button_label_smoothing = float(min(max(self.button_label_smoothing, 0.0), 0.2))
         self.aug_brightness = float(min(max(self.aug_brightness, 0.0), 0.5))
         self.aug_contrast = float(min(max(self.aug_contrast, 0.0), 0.5))
@@ -177,6 +181,16 @@ class WindowTargets:
     horizon_valid: torch.Tensor
     last_action: torch.Tensor
     meta: Optional[List[Tuple[str, int, int]]] = None
+
+
+@dataclass(frozen=True)
+class LastActionCurriculum:
+    alpha: float
+    sequence_dropout: float
+    key_dropout: float
+    corruption_prob: float
+    context_scale: float
+    persistence_scale: float
 
 
 @dataclass
@@ -600,6 +614,32 @@ def warmup_cosine_lr(step: int, *, total_steps: int, base_lr: float, min_lr: flo
     return float(min_lr) + (float(base_lr) - float(min_lr)) * cosine
 
 
+def last_action_curriculum_for_epoch(cfg: TrainConfig, epoch: int) -> LastActionCurriculum:
+    warmup_epochs = max(0, int(cfg.last_action_curriculum_warmup_epochs))
+    ramp_epochs = max(0, int(cfg.last_action_curriculum_ramp_epochs))
+    epoch = max(0, int(epoch))
+
+    if warmup_epochs == 0 and ramp_epochs == 0:
+        alpha = 1.0
+    elif epoch < warmup_epochs:
+        alpha = 0.0
+    elif ramp_epochs <= 0:
+        alpha = 1.0
+    else:
+        alpha = min(1.0, max(0.0, float(epoch - warmup_epochs + 1) / float(ramp_epochs)))
+
+    sequence_dropout = 1.0 - alpha * (1.0 - float(cfg.last_action_sequence_dropout))
+    key_dropout = 1.0 - alpha * (1.0 - float(cfg.last_action_key_dropout))
+    return LastActionCurriculum(
+        alpha=alpha,
+        sequence_dropout=float(min(max(sequence_dropout, 0.0), 1.0)),
+        key_dropout=float(min(max(key_dropout, 0.0), 1.0)),
+        corruption_prob=float(min(max(alpha * float(cfg.last_action_corruption_prob), 0.0), 1.0)),
+        context_scale=float(alpha),
+        persistence_scale=float(alpha),
+    )
+
+
 def resolve_amp_settings(amp: str) -> Tuple[torch.dtype, bool, bool]:
     amp = str(amp).lower().strip()
     if amp in {"fp32", "float32", "none"}:
@@ -685,31 +725,51 @@ def compute_losses(
     }
 
 
-def regularize_last_action_context(last_action: torch.Tensor, cfg: TrainConfig) -> torch.Tensor:
+def regularize_last_action_context(
+    last_action: torch.Tensor,
+    cfg: TrainConfig,
+    curriculum: Optional[LastActionCurriculum] = None,
+) -> torch.Tensor:
     prev_action = last_action.float()
     if prev_action.dim() != 3:
         raise ValueError(f"Expected last_action [B,T,C], got {tuple(prev_action.shape)}.")
 
+    sequence_dropout = (
+        float(curriculum.sequence_dropout)
+        if curriculum is not None
+        else float(cfg.last_action_sequence_dropout)
+    )
+    key_dropout = (
+        float(curriculum.key_dropout)
+        if curriculum is not None
+        else float(cfg.last_action_key_dropout)
+    )
+    corruption_prob = (
+        float(curriculum.corruption_prob)
+        if curriculum is not None
+        else float(cfg.last_action_corruption_prob)
+    )
+
     batch_size = int(prev_action.size(0))
-    if batch_size > 1 and float(cfg.last_action_corruption_prob) > 0.0:
+    if batch_size > 1 and corruption_prob > 0.0:
         replace = (
             torch.rand((batch_size, 1, 1), device=prev_action.device)
-            < float(cfg.last_action_corruption_prob)
+            < corruption_prob
         )
         permuted = prev_action[torch.randperm(batch_size, device=prev_action.device)]
         prev_action = torch.where(replace, permuted, prev_action)
 
-    if float(cfg.last_action_sequence_dropout) > 0.0:
+    if sequence_dropout > 0.0:
         keep_sequence = (
             torch.rand((batch_size, 1, 1), device=prev_action.device)
-            >= float(cfg.last_action_sequence_dropout)
+            >= sequence_dropout
         ).to(dtype=prev_action.dtype)
         prev_action = prev_action * keep_sequence
 
-    if float(cfg.last_action_key_dropout) > 0.0:
+    if key_dropout > 0.0:
         keep_key = (
             torch.rand((batch_size, 1, int(prev_action.size(-1))), device=prev_action.device)
-            >= float(cfg.last_action_key_dropout)
+            >= key_dropout
         ).to(dtype=prev_action.dtype)
         prev_action = prev_action * keep_key
 
@@ -892,6 +952,7 @@ def run_epoch(
     optimizer: Optional[torch.optim.Optimizer] = None,
     total_steps: int = 1,
     global_step: int = 0,
+    last_action_curriculum: Optional[LastActionCurriculum] = None,
 ) -> Tuple[Dict[str, float], int]:
     is_train = optimizer is not None
     model.train(is_train)
@@ -903,6 +964,12 @@ def run_epoch(
     horizon_count = int(cfg.prediction_horizon)
     horizon_stats = [BinaryStats(cfg.num_bin, device) for _ in range(horizon_count)]
     steps = 0
+    if last_action_curriculum is None:
+        context_scale = torch.ones((), device=device)
+        persistence_scale = torch.ones((), device=device)
+    else:
+        context_scale = torch.tensor(float(last_action_curriculum.context_scale), device=device)
+        persistence_scale = torch.tensor(float(last_action_curriculum.persistence_scale), device=device)
 
     iterator_it = iter(iterator)
     pbar = tqdm(range(int(batches)), desc=desc, dynamic_ncols=True)
@@ -913,11 +980,17 @@ def run_epoch(
         with torch.set_grad_enabled(is_train):
             with torch.amp.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_autocast):
                 prev_action = (
-                    regularize_last_action_context(batch_targets.last_action, cfg)
+                    regularize_last_action_context(batch_targets.last_action, cfg, last_action_curriculum)
                     if is_train
                     else batch_targets.last_action
                 )
-                output = model(frames, dt=batch_targets.dt, prev_action=prev_action)
+                output = model(
+                    frames,
+                    dt=batch_targets.dt,
+                    prev_action=prev_action,
+                    prev_action_scale=context_scale,
+                    persistence_scale=persistence_scale,
+                )
                 loss, details = compute_losses(
                     output,
                     batch_targets,
@@ -1080,6 +1153,7 @@ def parse_args() -> TrainConfig:
     add("--temporal-context", type=int, default=None)
     add("--pooling", default=None, help="Legacy no-op. Spatial tokens attend to the raw CNN feature grid.")
     add("--spatial-token-count", type=int, default=None)
+    add("--recent-spatial-context", type=int, default=None)
     add("--train-seq-stride", type=int, default=None)
     add("--val-seq-stride", type=int, default=None)
     add("--target-effective-batch", type=int, default=None)
@@ -1098,6 +1172,8 @@ def parse_args() -> TrainConfig:
     add("--last-action-sequence-dropout", type=float, default=None)
     add("--last-action-key-dropout", type=float, default=None)
     add("--last-action-corruption-prob", type=float, default=None)
+    add("--last-action-curriculum-warmup-epochs", type=int, default=None)
+    add("--last-action-curriculum-ramp-epochs", type=int, default=None)
     add("--skip-key-names", default=None, help="Comma-separated key names to exclude from training labels.")
     add("--train-all-keys", action="store_true", help="Disable the default Greenville test filter for e,q,c,z.")
     add("--button-focal-gamma", type=float, default=None)
@@ -1168,6 +1244,7 @@ def parse_args() -> TrainConfig:
         "temporal_heads",
         "temporal_context",
         "spatial_token_count",
+        "recent_spatial_context",
         "train_seq_stride",
         "val_seq_stride",
         "target_effective_batch",
@@ -1185,6 +1262,8 @@ def parse_args() -> TrainConfig:
         "last_action_sequence_dropout",
         "last_action_key_dropout",
         "last_action_corruption_prob",
+        "last_action_curriculum_warmup_epochs",
+        "last_action_curriculum_ramp_epochs",
         "button_focal_gamma",
         "button_label_smoothing",
         "aug_brightness",
@@ -1277,6 +1356,7 @@ def train() -> None:
         f"temporal_context={cfg.temporal_context}",
         "spatial_source=cnn_feature_grid",
         f"spatial_tokens={cfg.spatial_token_count}",
+        f"recent_full_frames={cfg.recent_spatial_context}",
         f"current_spatial_tokens={cfg.spatial_token_count}",
     )
     horizon_offsets = tuple(int(offset) for offset in cfg.prediction_horizon_offsets)
@@ -1306,6 +1386,11 @@ def train() -> None:
         f"seq_drop={cfg.last_action_sequence_dropout:.2f}",
         f"key_drop={cfg.last_action_key_dropout:.2f}",
         f"corrupt={cfg.last_action_corruption_prob:.2f}",
+    )
+    print(
+        "Last action curriculum:",
+        f"vision_only_epochs={cfg.last_action_curriculum_warmup_epochs}",
+        f"ramp_epochs={cfg.last_action_curriculum_ramp_epochs}",
     )
     train_persist = persistence_baseline_metrics(train_targets, cfg)
     print(f"Persistence baseline: train_f1@+{first_horizon_offset}={train_persist['macro_f1']:.4f}")
@@ -1391,8 +1476,11 @@ def train() -> None:
             compile_kwargs["mode"] = cfg.compile_mode
         model = torch.compile(base_model, **compile_kwargs)
         print(f"torch.compile enabled: mode={cfg.compile_mode}")
+        eval_model = base_model
+        print("Validation uses eager model to avoid TorchInductor eval-graph compiler failures.")
     else:
         model = base_model
+        eval_model = model
 
     optimizer_steps_per_epoch = int(math.ceil(train_batches / float(cfg.grad_accum)))
     total_steps = max(1, optimizer_steps_per_epoch * cfg.num_epochs)
@@ -1400,6 +1488,7 @@ def train() -> None:
     final_horizon_offset = int(horizon_offsets[-1])
 
     for epoch in range(start_epoch, cfg.num_epochs):
+        last_action_curriculum = last_action_curriculum_for_epoch(cfg, epoch)
         train_metrics, global_step = run_epoch(
             desc=f"Epoch {epoch + 1}/{cfg.num_epochs} [train]",
             model=model,
@@ -1414,6 +1503,7 @@ def train() -> None:
             optimizer=optimizer,
             total_steps=total_steps,
             global_step=global_step,
+            last_action_curriculum=last_action_curriculum,
         )
 
         val_metrics = None
@@ -1422,7 +1512,7 @@ def train() -> None:
             with torch.inference_mode():
                 val_metrics, _ = run_epoch(
                     desc=f"Epoch {epoch + 1}/{cfg.num_epochs} [val]",
-                    model=model,
+                    model=eval_model,
                     iterator=val_iter,
                     batches=val_batches,
                     targets=val_targets,
@@ -1431,6 +1521,7 @@ def train() -> None:
                     amp_dtype=amp_dtype,
                     use_autocast=use_autocast,
                     button_pos_weight=button_pos_weight,
+                    last_action_curriculum=last_action_curriculum,
                 )
             score = driving_score(val_metrics, cfg)
 
@@ -1472,6 +1563,7 @@ def train() -> None:
 
         parts = [
             f"Epoch {epoch + 1}/{cfg.num_epochs}",
+            f"la={last_action_curriculum.alpha:.2f}",
             f"tr_loss={train_metrics['loss']:.4f}",
             f"tr_f1@+{first_horizon_offset}={train_metrics['step1_button_macro_f1']:.4f}",
         ]

@@ -76,6 +76,7 @@ class ModelConfig:
 
     pooling: Tuple[int, int] = (16, 16)
     spatial_token_count: int = 81
+    recent_spatial_context: int = 10
 
     button_state_threshold: float = 0.5
     button_state_thresholds: Optional[Sequence[float]] = None
@@ -116,6 +117,7 @@ class ModelConfig:
         self.temporal_heads = _largest_valid_head_count(self.d_model, int(self.temporal_heads))
         self.temporal_context = max(1, int(self.temporal_context))
         self.spatial_token_count = max(1, int(self.spatial_token_count))
+        self.recent_spatial_context = max(1, int(self.recent_spatial_context))
 
         if self.key_names is None:
             self.key_names = get_key_names(self.selected_game)
@@ -151,6 +153,7 @@ class PolicyOutput:
 @dataclass
 class TemporalState:
     hidden_state: Optional[torch.Tensor] = None
+    visual_tokens: Optional[torch.Tensor] = None
     previous_frame: Optional[torch.Tensor] = None
 
 
@@ -417,7 +420,7 @@ class DrivingVideoPolicy(nn.Module):
             nn.Dropout(cfg.head_dropout * 0.5),
             nn.Linear(horizon_hidden, self.cfg.num_bin),
         )
-        self.persistence_logit_gate = nn.Parameter(torch.tensor(-4.0))
+        self.persistence_logit_gate = nn.Parameter(torch.tensor(0.0))
         final_button_layer = self.button_head[-1]
         if isinstance(final_button_layer, nn.Linear):
             nn.init.zeros_(final_button_layer.bias)
@@ -464,6 +467,43 @@ class DrivingVideoPolicy(nn.Module):
 
     def _max_context_tokens(self) -> int:
         return int(self.cfg.temporal_context)
+
+    def _max_recent_visual_frames(self) -> int:
+        return max(1, int(self.cfg.recent_spatial_context))
+
+    def _prepare_visual_state(
+        self,
+        state: Optional[TemporalState],
+        batch_size: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if state is None or state.visual_tokens is None:
+            return torch.zeros(
+                batch_size,
+                0,
+                int(self.cfg.spatial_token_count),
+                self.cfg.d_model,
+                device=device,
+                dtype=dtype,
+            )
+
+        visual = state.visual_tokens.to(device=device, dtype=dtype)
+        if visual.dim() == 3:
+            visual = visual.unsqueeze(1)
+        if visual.dim() != 4:
+            raise ValueError(f"Expected visual token state [B,T,K,D], got {tuple(visual.shape)}.")
+        if int(visual.size(0)) != int(batch_size):
+            raise ValueError(f"Expected visual state batch {batch_size}, got {visual.size(0)}.")
+        if int(visual.size(2)) != int(self.cfg.spatial_token_count):
+            raise ValueError(f"Expected {self.cfg.spatial_token_count} visual tokens, got {visual.size(2)}.")
+        if int(visual.size(-1)) != int(self.cfg.d_model):
+            raise ValueError(f"Expected visual token dim {self.cfg.d_model}, got {visual.size(-1)}.")
+        max_prior_frames = max(0, self._max_recent_visual_frames() - 1)
+        if max_prior_frames <= 0:
+            return visual[:, :0]
+        return visual[:, -max_prior_frames:]
 
     def _flatten_frame_tokens(self, frame_tokens: torch.Tensor) -> torch.Tensor:
         if frame_tokens.dim() == 3:
@@ -582,10 +622,13 @@ class DrivingVideoPolicy(nn.Module):
         visual_token: torch.Tensor,
         dt: Optional[torch.Tensor],
         prev_action: Optional[torch.Tensor],
+        prev_action_scale: float = 1.0,
     ) -> torch.Tensor:
         b, t = int(visual_token.size(0)), int(visual_token.size(1))
         dt_feat = self._dt_features(dt, b, t, device=visual_token.device, dtype=visual_token.dtype)
         action_feat = self._last_action_features(prev_action, b, t, device=visual_token.device, dtype=visual_token.dtype)
+        action_scale = torch.as_tensor(prev_action_scale, device=action_feat.device, dtype=action_feat.dtype)
+        action_feat = action_feat * action_scale
         context = torch.cat([action_feat, dt_feat], dim=-1)
         context_delta = self.context_delta(context)
         gate = torch.sigmoid(self.context_gate(torch.cat([visual_token, action_feat, dt_feat], dim=-1)))
@@ -596,21 +639,100 @@ class DrivingVideoPolicy(nn.Module):
         frames: torch.Tensor,
         dt: Optional[torch.Tensor],
         prev_action: Optional[torch.Tensor],
+        prev_action_scale: float = 1.0,
     ) -> torch.Tensor:
         visual_token = self._visual_frame_tokens_from_masked_frames(frames)
-        return self._fuse_frame_context(visual_token, dt, prev_action)
+        return self._fuse_frame_context(visual_token, dt, prev_action, prev_action_scale=prev_action_scale)
 
     def _visual_memory_and_frame_tokens(
         self,
         frames: torch.Tensor,
         dt: Optional[torch.Tensor],
         prev_action: Optional[torch.Tensor],
+        prev_action_scale: float = 1.0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         cell_tokens = self._visual_cells_from_masked_frames(frames)
         current_visual_tokens = self._spatial_tokens_from_cells(cell_tokens)
         visual_frame_tokens = self._visual_frame_tokens_from_cells(current_visual_tokens)
-        fused_frame_tokens = self._fuse_frame_context(visual_frame_tokens, dt, prev_action)
+        fused_frame_tokens = self._fuse_frame_context(
+            visual_frame_tokens,
+            dt,
+            prev_action,
+            prev_action_scale=prev_action_scale,
+        )
         return current_visual_tokens, fused_frame_tokens
+
+    def _recent_visual_memory(
+        self,
+        visual_tokens: torch.Tensor,
+        *,
+        total_frames: int,
+        current_frame_count: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if visual_tokens.dim() != 4:
+            raise ValueError(f"Expected visual tokens [B,T,K,D], got {tuple(visual_tokens.shape)}.")
+        b, visual_frames, visual_tokens_per_frame, d = visual_tokens.shape
+        total_frames = int(total_frames)
+        current_frame_count = int(current_frame_count)
+        if visual_frames <= 0:
+            raise ValueError("Recent visual memory requires at least one visual frame.")
+        if visual_frames > total_frames:
+            visual_tokens = visual_tokens[:, -total_frames:]
+            visual_frames = int(visual_tokens.size(1))
+
+        recent_frames = min(self._max_recent_visual_frames(), total_frames)
+        device = visual_tokens.device
+        query_frame_idx = torch.arange(
+            total_frames - current_frame_count,
+            total_frames,
+            device=device,
+        )
+        recent_offsets = torch.arange(recent_frames, device=device) - (recent_frames - 1)
+        recent_frame_idx = query_frame_idx.unsqueeze(1) + recent_offsets.unsqueeze(0)
+        visual_start_idx = total_frames - int(visual_frames)
+
+        visual_gather_idx = (recent_frame_idx - visual_start_idx).clamp(0, int(visual_frames) - 1).long()
+        visual_source = visual_tokens.unsqueeze(1).expand(
+            b,
+            current_frame_count,
+            int(visual_frames),
+            int(visual_tokens_per_frame),
+            d,
+        )
+        gather_idx = visual_gather_idx.view(1, current_frame_count, recent_frames, 1, 1).expand(
+            b,
+            current_frame_count,
+            recent_frames,
+            int(visual_tokens_per_frame),
+            d,
+        )
+        recent_memory = torch.gather(visual_source, dim=2, index=gather_idx)
+        recent_memory = recent_memory.reshape(
+            b,
+            current_frame_count,
+            recent_frames * int(visual_tokens_per_frame),
+            d,
+        )
+
+        recent_valid = (recent_frame_idx >= visual_start_idx) & (recent_frame_idx >= 0)
+        recent_padding_mask = ~recent_valid.unsqueeze(-1).expand(
+            current_frame_count,
+            recent_frames,
+            int(visual_tokens_per_frame),
+        ).reshape(current_frame_count, recent_frames * int(visual_tokens_per_frame))
+
+        source_frame_idx = torch.arange(total_frames, device=device)
+        future_or_current = source_frame_idx.unsqueeze(0) >= query_frame_idx.unsqueeze(1)
+        visual_available_start = torch.maximum(
+            query_frame_idx - (recent_frames - 1),
+            torch.full_like(query_frame_idx, visual_start_idx),
+        )
+        recent_compressed_duplicate = (
+            (source_frame_idx.unsqueeze(0) >= visual_available_start.unsqueeze(1))
+            & (source_frame_idx.unsqueeze(0) < query_frame_idx.unsqueeze(1))
+        )
+        history_padding_mask = future_or_current | recent_compressed_duplicate
+        return recent_memory, recent_padding_mask, history_padding_mask
 
     def _horizon_button_logits(
         self,
@@ -618,6 +740,7 @@ class DrivingVideoPolicy(nn.Module):
         current_frame_count: Optional[int] = None,
         prev_action: Optional[torch.Tensor] = None,
         current_visual_tokens: Optional[torch.Tensor] = None,
+        persistence_scale: float = 1.0,
     ) -> torch.Tensor:
         if encoded_tokens.size(-1) != self.cfg.d_model:
             raise ValueError(f"Expected final feature dim {self.cfg.d_model}, got {encoded_tokens.size(-1)}.")
@@ -634,6 +757,7 @@ class DrivingVideoPolicy(nn.Module):
                 time_steps=1,
                 device=logits.device,
                 dtype=logits.dtype,
+                persistence_scale=persistence_scale,
             )
             return logits + prior[:, 0]
 
@@ -645,6 +769,7 @@ class DrivingVideoPolicy(nn.Module):
                 encoded_tokens,
                 current_frame_count=current_frame_count,
                 prev_action=prev_action,
+                persistence_scale=persistence_scale,
             )
 
         if current_visual_tokens.dim() != 4:
@@ -665,35 +790,26 @@ class DrivingVideoPolicy(nn.Module):
                 f"Need at least {current_frame_count} current visual frames, got {current_visual_tokens.size(1)}."
             )
 
-        current_visual = current_visual_tokens[:, -current_frame_count:, :, :]
+        recent_visual_memory, recent_visual_mask, history_mask = self._recent_visual_memory(
+            current_visual_tokens,
+            total_frames=total_frames,
+            current_frame_count=current_frame_count,
+        )
         frame_anchor = encoded_tokens[:, -current_frame_count:, :]
         horizon_queries = self.horizon_queries.to(device=encoded_tokens.device, dtype=encoded_tokens.dtype)
         tgt = frame_anchor.unsqueeze(2) + horizon_queries.reshape(1, 1, self.cfg.prediction_horizon, d)
         tgt = tgt.reshape(b * current_frame_count, self.cfg.prediction_horizon, d)
 
-        query_frame_idx = torch.arange(
-            total_frames - current_frame_count,
-            total_frames,
-            device=encoded_tokens.device,
-        )
-        source_frame_idx = torch.arange(total_frames, device=encoded_tokens.device)
-        history_mask = source_frame_idx.unsqueeze(0) >= query_frame_idx.unsqueeze(1)
-        current_mask = torch.zeros(
-            current_frame_count,
-            int(current_visual.size(2)),
-            device=encoded_tokens.device,
-            dtype=torch.bool,
-        )
-        memory_key_padding_mask = torch.cat([current_mask, history_mask], dim=1)
+        memory_key_padding_mask = torch.cat([recent_visual_mask, history_mask], dim=1)
         memory_key_padding_mask = (
             memory_key_padding_mask.unsqueeze(0)
             .expand(b, -1, -1)
             .reshape(b * current_frame_count, -1)
         )
 
-        current_memory = current_visual + self.current_memory_embed.to(
-            device=current_visual.device,
-            dtype=current_visual.dtype,
+        current_memory = recent_visual_memory + self.current_memory_embed.to(
+            device=recent_visual_memory.device,
+            dtype=recent_visual_memory.dtype,
         )
         history_memory = encoded_tokens.unsqueeze(1).expand(b, current_frame_count, total_frames, d)
         history_memory = history_memory + self.history_memory_embed.to(
@@ -722,6 +838,7 @@ class DrivingVideoPolicy(nn.Module):
             time_steps=current_frame_count,
             device=logits.device,
             dtype=logits.dtype,
+            persistence_scale=persistence_scale,
         )
         return logits + prior
 
@@ -730,6 +847,7 @@ class DrivingVideoPolicy(nn.Module):
         encoded_tokens: torch.Tensor,
         current_frame_count: Optional[int],
         prev_action: Optional[torch.Tensor],
+        persistence_scale: float = 1.0,
     ) -> torch.Tensor:
         b, token_count, d = encoded_tokens.shape
         total_frames = int(token_count)
@@ -766,6 +884,7 @@ class DrivingVideoPolicy(nn.Module):
             time_steps=current_frame_count,
             device=logits.device,
             dtype=logits.dtype,
+            persistence_scale=persistence_scale,
         )
         return logits + prior
 
@@ -777,6 +896,7 @@ class DrivingVideoPolicy(nn.Module):
         time_steps: int,
         device: torch.device,
         dtype: torch.dtype,
+        persistence_scale: float = 1.0,
     ) -> torch.Tensor:
         if prev_action is None:
             action_values = torch.zeros((batch_size, time_steps, self.cfg.num_bin), device=device, dtype=dtype)
@@ -803,7 +923,8 @@ class DrivingVideoPolicy(nn.Module):
 
         prior_logits = action_values.clamp(0.0, 1.0).mul(2.0).sub(1.0) * 2.0
         horizon_decay = self._persistence_horizon_decay(device=device, dtype=dtype)
-        gate = torch.sigmoid(self.persistence_logit_gate).to(dtype=dtype)
+        persistence_scale_tensor = torch.as_tensor(persistence_scale, device=device, dtype=dtype)
+        gate = torch.sigmoid(self.persistence_logit_gate).to(dtype=dtype) * persistence_scale_tensor
         return gate * prior_logits.unsqueeze(2) * horizon_decay.view(1, 1, -1, 1)
 
     def _persistence_horizon_decay(self, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -916,6 +1037,8 @@ class DrivingVideoPolicy(nn.Module):
         state: Optional[TemporalState] = None,
         return_aux: bool = False,
         prev_action: Optional[torch.Tensor] = None,
+        prev_action_scale: float = 1.0,
+        persistence_scale: float = 1.0,
     ):
         b, t, c, h, w = frames.shape
         if c != 3:
@@ -924,7 +1047,18 @@ class DrivingVideoPolicy(nn.Module):
         frames = self._normalize_frames(frames)
         frames = self._apply_masks(frames)
 
-        current_visual_tokens, current_tokens = self._visual_memory_and_frame_tokens(frames, dt, prev_action)
+        current_visual_tokens, current_tokens = self._visual_memory_and_frame_tokens(
+            frames,
+            dt,
+            prev_action,
+            prev_action_scale=prev_action_scale,
+        )
+        prior_visual_tokens = self._prepare_visual_state(
+            state,
+            b,
+            device=frames.device,
+            dtype=current_visual_tokens.dtype,
+        )
         prior_tokens = self._prepare_temporal_state(
             state,
             b,
@@ -938,7 +1072,12 @@ class DrivingVideoPolicy(nn.Module):
         if prior_tokens.size(1) > 0:
             keep_prior = max(0, self.temporal_position_count - int(current_tokens.size(1)))
             prior_tokens = prior_tokens[:, -keep_prior:] if keep_prior > 0 else prior_tokens[:, :0]
+            if prior_visual_tokens.size(1) > 0:
+                keep_visual = min(int(prior_visual_tokens.size(1)), int(prior_tokens.size(1)))
+                prior_visual_tokens = prior_visual_tokens[:, -keep_visual:] if keep_visual > 0 else prior_visual_tokens[:, :0]
             current_tokens = torch.cat([prior_tokens, current_tokens], dim=1)
+            if prior_visual_tokens.size(1) > 0:
+                current_visual_tokens = torch.cat([prior_visual_tokens, current_visual_tokens], dim=1)
         temporal_out = self._encode_temporal_tokens(current_tokens)
         
         button = self._horizon_button_logits(
@@ -946,6 +1085,7 @@ class DrivingVideoPolicy(nn.Module):
             current_frame_count=t,
             prev_action=prev_action,
             current_visual_tokens=current_visual_tokens,
+            persistence_scale=persistence_scale,
         )
         
         step_button = button[:, :, 0]
@@ -966,6 +1106,8 @@ class DrivingVideoPolicy(nn.Module):
         state: TemporalState,
         return_aux: bool = False,
         prev_action: Optional[torch.Tensor] = None,
+        prev_action_scale: float = 1.0,
+        persistence_scale: float = 1.0,
     ):
         b = frame.shape[0]
 
@@ -977,6 +1119,13 @@ class DrivingVideoPolicy(nn.Module):
             masked_frame.unsqueeze(1),
             dt,
             prev_action,
+            prev_action_scale=prev_action_scale,
+        )
+        prior_visual_tokens = self._prepare_visual_state(
+            state,
+            b,
+            device=frame.device,
+            dtype=current_visual_tokens.dtype,
         )
         prior_tokens = self._prepare_temporal_state(
             state,
@@ -986,6 +1135,8 @@ class DrivingVideoPolicy(nn.Module):
         )
         token_memory = torch.cat([prior_tokens, current_tokens], dim=1)
         token_memory = token_memory[:, -self._max_context_tokens():]
+        visual_memory = torch.cat([prior_visual_tokens, current_visual_tokens], dim=1)
+        visual_memory = visual_memory[:, -min(self._max_recent_visual_frames(), int(token_memory.size(1))):]
         temporal_out = self._encode_temporal_tokens(token_memory)
 
         # 5. Project to action space values
@@ -993,7 +1144,8 @@ class DrivingVideoPolicy(nn.Module):
             temporal_out,
             current_frame_count=1,
             prev_action=prev_action,
-            current_visual_tokens=current_visual_tokens,
+            current_visual_tokens=visual_memory,
+            persistence_scale=persistence_scale,
         )[:, 0]
 
         squeezed = PolicyOutput(
@@ -1008,6 +1160,7 @@ class DrivingVideoPolicy(nn.Module):
         # 6. Detach hidden state to prevent backpropagation graph memory leaks
         new_state = TemporalState(
             hidden_state=token_memory.detach(),
+            visual_tokens=visual_memory.detach(),
             previous_frame=None,
         )
         return squeezed, new_state

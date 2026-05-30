@@ -231,6 +231,7 @@ def _coerce_config_types(cfg: RuntimeConfig) -> RuntimeConfig:
     cfg.temporal_heads = max(1, int(cfg.temporal_heads))
     cfg.temporal_context = max(1, int(cfg.temporal_context))
     cfg.spatial_token_count = max(1, int(cfg.spatial_token_count))
+    cfg.recent_spatial_context = max(1, int(getattr(cfg, "recent_spatial_context", 10)))
     cfg.prediction_dt = float(cfg.prediction_dt)
     cfg.mouse_buttons_enabled = bool(cfg.mouse_buttons_enabled)
     cfg.num_bin = len(cfg.key_names) + len(cfg.mouse_button_names)
@@ -472,6 +473,7 @@ def main() -> None:
         f"temporal_context={cfg.temporal_context}",
         "spatial_source=cnn_feature_grid",
         f"spatial_tokens={cfg.spatial_token_count}",
+        f"recent_full_frames={cfg.recent_spatial_context}",
         f"current_spatial_tokens={cfg.spatial_token_count}",
         "input=masked_full_frame+gated_last_action",
     )

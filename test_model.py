@@ -709,6 +709,7 @@ def main() -> None:
         f"temporal_layers={cfg.temporal_layers}",
         f"temporal_context={cfg.temporal_context}",
         "spatial_source=cnn_feature_grid",
+        f"recent_full_frames={cfg.recent_spatial_context}",
         f"current_spatial_tokens={cfg.spatial_token_count}",
         f"seq={cfg.seq_len}",
         f"horizon={cfg.prediction_horizon}",
