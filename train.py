@@ -30,6 +30,7 @@ from models import (
     DrivingVideoPolicy,
     ModelConfig,
     PolicyOutput,
+    is_legacy_learned_pooling_state_key,
 )
 
 
@@ -1122,9 +1123,12 @@ def maybe_resume(
             for name in missing
             if not any(name == prefix or name.startswith(prefix) for prefix in allowed_missing_prefixes)
         ]
-        if bad_missing or unexpected_set:
+        bad_unexpected = [
+            name for name in unexpected if not is_legacy_learned_pooling_state_key(name)
+        ]
+        if bad_missing or bad_unexpected:
             raise RuntimeError(
-                f"missing={sorted(bad_missing)} unexpected={sorted(unexpected_set)}"
+                f"missing={sorted(bad_missing)} unexpected={sorted(bad_unexpected)}"
             )
     except RuntimeError as exc:
         if cfg.resume_path is None:
@@ -1137,10 +1141,10 @@ def maybe_resume(
             f"Cannot resume checkpoint {ckpt_path}: it does not match the current policy model. "
             "Start a fresh run or pass --no-resume."
         ) from exc
-    if missing_set:
+    if missing_set or unexpected_set:
         print(
-            "Checkpoint predates visual motion/age embeddings; "
-            "loaded matching model weights and starting a fresh optimizer state for the new parameters."
+            "Checkpoint has compatible model weights but a stale optimizer layout; "
+            "loaded matching model weights and starting a fresh optimizer state."
         )
     else:
         optimizer.load_state_dict(state["optimizer_state"])

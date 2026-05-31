@@ -28,6 +28,7 @@ from models import (  # noqa: E402
     TemporalState,
     get_key_names as MODEL_GET_KEY_NAMES,
     get_mouse_button_names as MODEL_GET_MOUSE_BUTTON_NAMES,
+    is_legacy_learned_pooling_state_key,
 )
 
 
@@ -258,13 +259,16 @@ def load_model_from_checkpoint(
     model = DrivingVideoPolicy(cfg=cfg).to(device)
     initialize_model_lazy_layers(model, cfg, device)
     model_state = _extract_model_state(state)
-    try:
-        model.load_state_dict(model_state, strict=True)
-    except RuntimeError as exc:
+    load_result = model.load_state_dict(model_state, strict=False)
+    bad_missing = list(load_result.missing_keys)
+    bad_unexpected = [
+        name for name in load_result.unexpected_keys if not is_legacy_learned_pooling_state_key(name)
+    ]
+    if bad_missing or bad_unexpected:
         raise RuntimeError(
             f"Policy checkpoint {ckpt_path} is incompatible with the current frame-token architecture. "
             "Train a fresh policy checkpoint or pass a matching checkpoint."
-        ) from exc
+        )
 
     model.eval()
     return model, cfg
@@ -382,31 +386,10 @@ def _policy_token_attention_heat_from_features(
     spatial_feats: torch.Tensor,
 ) -> torch.Tensor:
     cell_tokens = model._project_spatial_features(spatial_feats)
-
-    queries = model.spatial_queries.to(device=cell_tokens.device, dtype=cell_tokens.dtype)
-    queries = queries.unsqueeze(0).expand(cell_tokens.size(0), -1, -1)
-    attn_out, attn_weights = model.spatial_cross_attn(
-        query=model.spatial_query_norm(queries),
-        key=model.spatial_cell_norm(cell_tokens),
-        value=cell_tokens,
-        need_weights=True,
-    )
-    spatial_tokens = model.spatial_token_norm(queries + attn_out)
-    spatial_tokens = spatial_tokens + model.spatial_token_ff(spatial_tokens)
-
-    if attn_weights.dim() == 4:
-        attn = attn_weights.float().mean(dim=1)
-    else:
-        attn = attn_weights.float()
-    token_energy = torch.linalg.vector_norm(spatial_tokens.float(), ord=2, dim=-1)
-    token_energy = token_energy / max(float(spatial_tokens.size(-1)) ** 0.5, 1.0)
-    token_heat = torch.bmm(token_energy.unsqueeze(1), attn).squeeze(1)
-
     cell_energy = torch.linalg.vector_norm(cell_tokens.float(), ord=2, dim=-1)
     cell_energy = cell_energy / max(float(cell_tokens.size(-1)) ** 0.5, 1.0)
-    heat = token_heat + 0.35 * cell_energy
     feature_h, feature_w = int(spatial_feats.size(-2)), int(spatial_feats.size(-1))
-    return heat.reshape(spatial_feats.size(0), 1, feature_h, feature_w)
+    return cell_energy.reshape(spatial_feats.size(0), 1, feature_h, feature_w)
 
 
 def _compute_feature_map(

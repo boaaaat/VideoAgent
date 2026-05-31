@@ -11,7 +11,12 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
-from models import DrivingVideoPolicy, ModelConfig, TemporalState
+from models import (
+    DrivingVideoPolicy,
+    ModelConfig,
+    TemporalState,
+    is_legacy_learned_pooling_state_key,
+)
 
 
 class FFmpegPipeWriter:
@@ -143,10 +148,13 @@ def load_model_checkpoint(
 
     model = DrivingVideoPolicy(cfg).to(device)
     load_result = model.load_state_dict(model_state, strict=False)
-    if load_result.missing_keys or load_result.unexpected_keys:
+    bad_unexpected = [
+        name for name in load_result.unexpected_keys if not is_legacy_learned_pooling_state_key(name)
+    ]
+    if load_result.missing_keys or bad_unexpected:
         raise RuntimeError(
             "Checkpoint does not match the current frame-token policy model. "
-            f"missing={load_result.missing_keys} unexpected={load_result.unexpected_keys}"
+            f"missing={load_result.missing_keys} unexpected={bad_unexpected}"
         )
     model.eval()
     return model, cfg, config_dict

@@ -1,8 +1,10 @@
+import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from action_space import (
     game_data_root,
@@ -19,6 +21,30 @@ LAST_ACTION_EMBEDDING_DROPOUT = 0.25
 LAST_ACTION_FEATURE_SCALE = 1.0
 GROUP_NORM_GROUPS = 8
 DEFAULT_HORIZON_OFFSETS = (1, 2, 3, 5, 7, 10, 13, 16, 20, 24)
+LEGACY_LEARNED_POOLING_STATE_PREFIXES = (
+    "spatial_queries",
+    "spatial_query_norm.",
+    "spatial_cell_norm.",
+    "spatial_cross_attn.",
+    "frame_query",
+    "frame_query_norm.",
+    "frame_token_norm.",
+    "frame_pool_attn.",
+    "motion_query",
+    "motion_query_norm.",
+    "motion_token_norm.",
+    "motion_pool_attn.",
+)
+
+
+def is_legacy_learned_pooling_state_key(name: str) -> bool:
+    for prefix in LEGACY_LEARNED_POOLING_STATE_PREFIXES:
+        if prefix.endswith("."):
+            if name.startswith(prefix):
+                return True
+        elif name == prefix:
+            return True
+    return False
 
 
 def _largest_valid_head_count(channels: int, requested_heads: int) -> int:
@@ -300,16 +326,6 @@ class DrivingVideoPolicy(nn.Module):
             nn.Dropout(cfg.head_dropout * 0.5),
         )
         self.spatial_coord_projector = nn.Linear(4, self.cfg.d_model)
-        self.spatial_queries = nn.Parameter(torch.empty(int(cfg.spatial_token_count), self.cfg.d_model))
-        spatial_heads = _largest_valid_head_count(self.cfg.d_model, self.cfg.temporal_heads)
-        self.spatial_query_norm = nn.LayerNorm(self.cfg.d_model)
-        self.spatial_cell_norm = nn.LayerNorm(self.cfg.d_model)
-        self.spatial_cross_attn = nn.MultiheadAttention(
-            self.cfg.d_model,
-            num_heads=spatial_heads,
-            dropout=cfg.head_dropout * 0.5,
-            batch_first=True,
-        )
         self.spatial_token_norm = nn.LayerNorm(self.cfg.d_model)
         self.spatial_token_ff = nn.Sequential(
             nn.LayerNorm(self.cfg.d_model),
@@ -321,17 +337,7 @@ class DrivingVideoPolicy(nn.Module):
         )
         nn.init.normal_(self.spatial_coord_projector.weight, mean=0.0, std=0.02)
         nn.init.zeros_(self.spatial_coord_projector.bias)
-        nn.init.normal_(self.spatial_queries, mean=0.0, std=0.02)
 
-        self.frame_query = nn.Parameter(torch.empty(1, 1, self.cfg.d_model))
-        self.frame_query_norm = nn.LayerNorm(self.cfg.d_model)
-        self.frame_token_norm = nn.LayerNorm(self.cfg.d_model)
-        self.frame_pool_attn = nn.MultiheadAttention(
-            self.cfg.d_model,
-            num_heads=spatial_heads,
-            dropout=cfg.head_dropout * 0.5,
-            batch_first=True,
-        )
         self.visual_frame_norm = nn.LayerNorm(self.cfg.d_model)
         self.visual_frame_ff = nn.Sequential(
             nn.LayerNorm(self.cfg.d_model),
@@ -341,17 +347,7 @@ class DrivingVideoPolicy(nn.Module):
             nn.Linear(max(self.cfg.d_model * 2, 256), self.cfg.d_model),
             nn.Dropout(cfg.head_dropout * 0.5),
         )
-        nn.init.normal_(self.frame_query, mean=0.0, std=0.02)
 
-        self.motion_query = nn.Parameter(torch.empty(1, 1, self.cfg.d_model))
-        self.motion_query_norm = nn.LayerNorm(self.cfg.d_model)
-        self.motion_token_norm = nn.LayerNorm(self.cfg.d_model)
-        self.motion_pool_attn = nn.MultiheadAttention(
-            self.cfg.d_model,
-            num_heads=spatial_heads,
-            dropout=cfg.head_dropout * 0.5,
-            batch_first=True,
-        )
         self.visual_motion_fuser = nn.Sequential(
             nn.LayerNorm(self.cfg.d_model * 2),
             nn.Linear(self.cfg.d_model * 2, self.cfg.d_model),
@@ -362,7 +358,6 @@ class DrivingVideoPolicy(nn.Module):
         )
         self.visual_motion_gate = nn.Linear(self.cfg.d_model * 2, self.cfg.d_model)
         self.visual_motion_norm = nn.LayerNorm(self.cfg.d_model)
-        nn.init.normal_(self.motion_query, mean=0.0, std=0.02)
         nn.init.zeros_(self.visual_motion_gate.weight)
         nn.init.constant_(self.visual_motion_gate.bias, -1.0)
 
@@ -580,6 +575,13 @@ class DrivingVideoPolicy(nn.Module):
         coords = coords.reshape(1, int(height) * int(width), 4).to(dtype=weight_dtype)
         return self.spatial_coord_projector(coords).to(dtype=dtype)
 
+    def _spatial_pool_shape(self) -> Tuple[int, int]:
+        token_count = max(1, int(self.cfg.spatial_token_count))
+        rows = max(1, int(math.isqrt(token_count)))
+        while rows > 1 and token_count % rows != 0:
+            rows -= 1
+        return rows, token_count // rows
+
     def _project_spatial_features(self, spatial_feats: torch.Tensor) -> torch.Tensor:
         if spatial_feats.dim() != 4:
             raise ValueError(f"Expected spatial features [B,C,H,W], got {tuple(spatial_feats.shape)}.")
@@ -602,40 +604,30 @@ class DrivingVideoPolicy(nn.Module):
         if x.is_cuda:
             x = x.contiguous(memory_format=torch.channels_last)
         spatial_feats = self.fastvit_mixer(self.spatial_encoder(x))
-        feature_h, feature_w = int(spatial_feats.size(-2)), int(spatial_feats.size(-1))
+        pool_h, pool_w = self._spatial_pool_shape()
+        spatial_feats = F.adaptive_avg_pool2d(spatial_feats, (pool_h, pool_w))
         cell_tokens = self._project_spatial_features(spatial_feats)
-        return cell_tokens.reshape(b, t, feature_h * feature_w, self.cfg.d_model)
+        return cell_tokens.reshape(b, t, pool_h * pool_w, self.cfg.d_model)
 
     def _spatial_tokens_from_cells(self, cell_tokens: torch.Tensor) -> torch.Tensor:
         b, t, k, d = cell_tokens.shape
-        cells_flat = cell_tokens.reshape(b * t, k, d)
-        queries = self.spatial_queries.to(device=cell_tokens.device, dtype=cell_tokens.dtype)
-        queries = queries.unsqueeze(0).expand(cells_flat.size(0), -1, -1)
-        attn_out, _ = self.spatial_cross_attn(
-            query=self.spatial_query_norm(queries),
-            key=self.spatial_cell_norm(cells_flat),
-            value=cells_flat,
-            need_weights=False,
-        )
-        spatial_tokens = self.spatial_token_norm(queries + attn_out)
+        expected_tokens = int(self.cfg.spatial_token_count)
+        if int(k) != expected_tokens:
+            raise ValueError(f"Expected {expected_tokens} averaged spatial tokens, got {k}.")
+        if int(d) != int(self.cfg.d_model):
+            raise ValueError(f"Expected token dim {self.cfg.d_model}, got {d}.")
+        spatial_tokens = self.spatial_token_norm(cell_tokens)
         spatial_tokens = spatial_tokens + self.spatial_token_ff(spatial_tokens)
-        return spatial_tokens.reshape(b, t, int(self.cfg.spatial_token_count), self.cfg.d_model)
+        return spatial_tokens
 
     def _visual_tokens_from_masked_frames(self, frames: torch.Tensor) -> torch.Tensor:
         return self._spatial_tokens_from_cells(self._visual_cells_from_masked_frames(frames))
 
     def _visual_frame_tokens_from_cells(self, cell_tokens: torch.Tensor) -> torch.Tensor:
         b, t, k, d = cell_tokens.shape
-        spatial_flat = cell_tokens.reshape(b * t, k, d)
-        query = self.frame_query.to(device=spatial_flat.device, dtype=spatial_flat.dtype)
-        query = query.expand(spatial_flat.size(0), -1, -1)
-        pooled, _ = self.frame_pool_attn(
-            query=self.frame_query_norm(query),
-            key=self.frame_token_norm(spatial_flat),
-            value=spatial_flat,
-            need_weights=False,
-        )
-        frame_token = self.visual_frame_norm(query + pooled).reshape(b, t, self.cfg.d_model)
+        if int(d) != int(self.cfg.d_model):
+            raise ValueError(f"Expected token dim {self.cfg.d_model}, got {d}.")
+        frame_token = self.visual_frame_norm(cell_tokens.mean(dim=2))
         frame_token = frame_token + self.visual_frame_ff(frame_token)
         return frame_token
 
@@ -662,16 +654,7 @@ class DrivingVideoPolicy(nn.Module):
         if t > 1:
             delta[:, 1:] = spatial_tokens[:, 1:] - spatial_tokens[:, :-1]
 
-        delta_flat = delta.reshape(b * t, k, d)
-        query = self.motion_query.to(device=delta_flat.device, dtype=delta_flat.dtype)
-        query = query.expand(delta_flat.size(0), -1, -1)
-        pooled, _ = self.motion_pool_attn(
-            query=self.motion_query_norm(query),
-            key=self.motion_token_norm(delta_flat),
-            value=delta_flat,
-            need_weights=False,
-        )
-        return pooled.reshape(b, t, d)
+        return delta.mean(dim=2)
 
     def _add_visual_motion_context(
         self,

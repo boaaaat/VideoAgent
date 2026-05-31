@@ -22,6 +22,7 @@ from models import (  # noqa: E402
     DrivingVideoPolicy,
     ModelConfig,
     TemporalState,
+    is_legacy_learned_pooling_state_key,
 )
 
 pdi.FAILSAFE = True
@@ -462,9 +463,12 @@ def main() -> None:
             for name in missing
             if not any(name == prefix or name.startswith(prefix) for prefix in allowed_missing_prefixes)
         ]
-        if bad_missing or unexpected_set:
+        bad_unexpected = [
+            name for name in unexpected if not is_legacy_learned_pooling_state_key(name)
+        ]
+        if bad_missing or bad_unexpected:
             raise RuntimeError(
-                f"missing={sorted(bad_missing)} unexpected={sorted(unexpected_set)}"
+                f"missing={sorted(bad_missing)} unexpected={sorted(bad_unexpected)}"
             )
         if missing_set:
             with torch.no_grad():
