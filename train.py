@@ -52,7 +52,7 @@ class TrainConfig(ModelConfig):
 
     train_split: float = 0.8
     split_seed: int = 1337
-    pos_weight_power: float = 0.25
+    pos_weight_power: float = 0.5
     pos_weight_clamp: float = 8
     button_threshold_from_pos_weight: bool = False
     button_threshold_min: float = 0.5

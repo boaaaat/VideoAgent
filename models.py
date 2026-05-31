@@ -520,21 +520,16 @@ class DrivingVideoPolicy(nn.Module):
         h, w = frames.shape[-2:]
         masked_frames = frames.clone()
 
-        # 1. Mask the Car (Center)
-        car_y1, car_y2 = int(h * self.car_y_min_pct), int(h * self.car_y_max_pct)
-        car_x1, car_x2 = int(w * self.car_x_min_pct), int(w * self.car_x_max_pct)
-        masked_frames[..., car_y1:car_y2, car_x1:car_x2] = 0.0
-
-        # 2. Mask the Bottom HUD (Speedometer, Gear, etc.)
-        hud_y1 = int(h * 0.80)
+        # 1. Mask the Bottom Left HUD (Speedometer)
+        hud_y1 = int(h * 0.96)
         masked_frames[..., hud_y1:, :] = 0.0
 
-        # 3. Mask the Minimap (Mid-Right)
+        # 2. Mask the Minimap (Mid-Right)
         map_y1, map_y2 = int(h * 0.05), int(h * 0.2)
         map_x1 = int(w * 0.75)
         masked_frames[..., map_y1:map_y2, map_x1:] = 0.0
 
-        # 4. Top Left Roblox UI
+        # 3. Top Left Roblox UI
         roblox_ui_y2 = int(h * 0.1)
         roblox_ui_x2 = int(w * 0.1)
         masked_frames[..., :roblox_ui_y2, :roblox_ui_x2] = 0.0
