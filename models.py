@@ -1,4 +1,3 @@
-import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -45,6 +44,24 @@ def is_legacy_learned_pooling_state_key(name: str) -> bool:
         elif name == prefix:
             return True
     return False
+
+
+def normalize_pooling_shape(pooling: object) -> Tuple[int, int]:
+    if isinstance(pooling, str):
+        parts = tuple(part.strip() for part in pooling.lower().replace("x", ",").split(",") if part.strip())
+        if len(parts) == 1:
+            size = int(parts[0])
+            return max(1, size), max(1, size)
+        if len(parts) == 2:
+            return max(1, int(parts[0])), max(1, int(parts[1]))
+        raise ValueError(f"pooling must be H,W or HxW, got {pooling!r}.")
+    if isinstance(pooling, int):
+        size = max(1, int(pooling))
+        return size, size
+    values = tuple(int(value) for value in pooling)  # type: ignore[arg-type]
+    if len(values) != 2:
+        raise ValueError(f"pooling must contain 2 values, got {values}.")
+    return max(1, values[0]), max(1, values[1])
 
 
 def _largest_valid_head_count(channels: int, requested_heads: int) -> int:
@@ -101,7 +118,6 @@ class ModelConfig:
     temporal_context: int = 80
 
     pooling: Tuple[int, int] = (16, 16)
-    spatial_token_count: int = 81
     recent_spatial_context: int = 10
 
     button_state_threshold: float = 0.5
@@ -142,7 +158,7 @@ class ModelConfig:
         self.temporal_layers = max(1, int(self.temporal_layers))
         self.temporal_heads = _largest_valid_head_count(self.d_model, int(self.temporal_heads))
         self.temporal_context = max(1, int(self.temporal_context))
-        self.spatial_token_count = max(1, int(self.spatial_token_count))
+        self.pooling = normalize_pooling_shape(self.pooling)
         self.recent_spatial_context = max(1, int(self.recent_spatial_context))
 
         if self.key_names is None:
@@ -493,6 +509,10 @@ class DrivingVideoPolicy(nn.Module):
     def _max_recent_visual_frames(self) -> int:
         return max(1, int(self.cfg.recent_spatial_context))
 
+    def _pooling_token_count(self) -> int:
+        pool_h, pool_w = self._spatial_pool_shape()
+        return pool_h * pool_w
+
     def _prepare_visual_state(
         self,
         state: Optional[TemporalState],
@@ -505,7 +525,7 @@ class DrivingVideoPolicy(nn.Module):
             return torch.zeros(
                 batch_size,
                 0,
-                int(self.cfg.spatial_token_count),
+                self._pooling_token_count(),
                 self.cfg.d_model,
                 device=device,
                 dtype=dtype,
@@ -518,8 +538,9 @@ class DrivingVideoPolicy(nn.Module):
             raise ValueError(f"Expected visual token state [B,T,K,D], got {tuple(visual.shape)}.")
         if int(visual.size(0)) != int(batch_size):
             raise ValueError(f"Expected visual state batch {batch_size}, got {visual.size(0)}.")
-        if int(visual.size(2)) != int(self.cfg.spatial_token_count):
-            raise ValueError(f"Expected {self.cfg.spatial_token_count} visual tokens, got {visual.size(2)}.")
+        expected_tokens = self._pooling_token_count()
+        if int(visual.size(2)) != expected_tokens:
+            raise ValueError(f"Expected {expected_tokens} visual tokens, got {visual.size(2)}.")
         if int(visual.size(-1)) != int(self.cfg.d_model):
             raise ValueError(f"Expected visual token dim {self.cfg.d_model}, got {visual.size(-1)}.")
         max_prior_frames = max(0, self._max_recent_visual_frames() - 1)
@@ -576,11 +597,7 @@ class DrivingVideoPolicy(nn.Module):
         return self.spatial_coord_projector(coords).to(dtype=dtype)
 
     def _spatial_pool_shape(self) -> Tuple[int, int]:
-        token_count = max(1, int(self.cfg.spatial_token_count))
-        rows = max(1, int(math.isqrt(token_count)))
-        while rows > 1 and token_count % rows != 0:
-            rows -= 1
-        return rows, token_count // rows
+        return normalize_pooling_shape(self.cfg.pooling)
 
     def _project_spatial_features(self, spatial_feats: torch.Tensor) -> torch.Tensor:
         if spatial_feats.dim() != 4:
@@ -611,7 +628,7 @@ class DrivingVideoPolicy(nn.Module):
 
     def _spatial_tokens_from_cells(self, cell_tokens: torch.Tensor) -> torch.Tensor:
         b, t, k, d = cell_tokens.shape
-        expected_tokens = int(self.cfg.spatial_token_count)
+        expected_tokens = self._pooling_token_count()
         if int(k) != expected_tokens:
             raise ValueError(f"Expected {expected_tokens} averaged spatial tokens, got {k}.")
         if int(d) != int(self.cfg.d_model):

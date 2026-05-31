@@ -1173,8 +1173,7 @@ def parse_args() -> TrainConfig:
     add("--temporal-layers", type=int, default=None)
     add("--temporal-heads", type=int, default=None)
     add("--temporal-context", type=int, default=None)
-    add("--pooling", default=None, help="Legacy no-op. Spatial tokens attend to the raw CNN feature grid.")
-    add("--spatial-token-count", type=int, default=None)
+    add("--pooling", default=None, help="Average-pooled spatial grid size, e.g. 16,16 or 16x16.")
     add("--recent-spatial-context", type=int, default=None)
     add("--train-seq-stride", type=int, default=None)
     add("--val-seq-stride", type=int, default=None)
@@ -1265,7 +1264,7 @@ def parse_args() -> TrainConfig:
         "temporal_layers",
         "temporal_heads",
         "temporal_context",
-        "spatial_token_count",
+        "pooling",
         "recent_spatial_context",
         "train_seq_stride",
         "val_seq_stride",
@@ -1377,9 +1376,9 @@ def train() -> None:
         f"temporal_heads={cfg.temporal_heads}",
         f"temporal_context={cfg.temporal_context}",
         "spatial_source=cnn_feature_grid",
-        f"spatial_tokens={cfg.spatial_token_count}",
+        f"spatial_pooling={cfg.pooling[0]}x{cfg.pooling[1]}",
         f"recent_full_frames={cfg.recent_spatial_context}",
-        f"current_spatial_tokens={cfg.spatial_token_count}",
+        f"current_spatial_grid={cfg.pooling[0]}x{cfg.pooling[1]}",
     )
     horizon_offsets = tuple(int(offset) for offset in cfg.prediction_horizon_offsets)
     first_horizon_offset = int(horizon_offsets[0])

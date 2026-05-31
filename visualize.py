@@ -29,6 +29,7 @@ from models import (  # noqa: E402
     get_key_names as MODEL_GET_KEY_NAMES,
     get_mouse_button_names as MODEL_GET_MOUSE_BUTTON_NAMES,
     is_legacy_learned_pooling_state_key,
+    normalize_pooling_shape,
 )
 
 
@@ -155,7 +156,7 @@ def _coerce_config_types(cfg: ModelConfig) -> ModelConfig:
     cfg.temporal_layers = max(1, int(cfg.temporal_layers))
     cfg.temporal_heads = max(1, int(cfg.temporal_heads))
     cfg.temporal_context = max(1, int(cfg.temporal_context))
-    cfg.spatial_token_count = max(1, int(cfg.spatial_token_count))
+    cfg.pooling = normalize_pooling_shape(getattr(cfg, "pooling", (16, 16)))
     cfg.recent_spatial_context = max(1, int(getattr(cfg, "recent_spatial_context", 10)))
     cfg.num_bin = len(cfg.key_names) + len(cfg.mouse_button_names)
     return cfg

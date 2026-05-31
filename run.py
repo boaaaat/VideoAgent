@@ -23,6 +23,7 @@ from models import (  # noqa: E402
     ModelConfig,
     TemporalState,
     is_legacy_learned_pooling_state_key,
+    normalize_pooling_shape,
 )
 
 pdi.FAILSAFE = True
@@ -231,7 +232,7 @@ def _coerce_config_types(cfg: RuntimeConfig) -> RuntimeConfig:
     cfg.temporal_layers = max(1, int(cfg.temporal_layers))
     cfg.temporal_heads = max(1, int(cfg.temporal_heads))
     cfg.temporal_context = max(1, int(cfg.temporal_context))
-    cfg.spatial_token_count = max(1, int(cfg.spatial_token_count))
+    cfg.pooling = normalize_pooling_shape(getattr(cfg, "pooling", (16, 16)))
     cfg.recent_spatial_context = max(1, int(getattr(cfg, "recent_spatial_context", 10)))
     cfg.prediction_dt = float(cfg.prediction_dt)
     cfg.mouse_buttons_enabled = bool(cfg.mouse_buttons_enabled)
@@ -495,9 +496,9 @@ def main() -> None:
         f"temporal_layers={cfg.temporal_layers}",
         f"temporal_context={cfg.temporal_context}",
         "spatial_source=cnn_feature_grid",
-        f"spatial_tokens={cfg.spatial_token_count}",
+        f"spatial_pooling={cfg.pooling[0]}x{cfg.pooling[1]}",
         f"recent_full_frames={cfg.recent_spatial_context}",
-        f"current_spatial_tokens={cfg.spatial_token_count}",
+        f"current_spatial_grid={cfg.pooling[0]}x{cfg.pooling[1]}",
         "input=masked_full_frame+gated_last_action",
     )
     print(

@@ -718,7 +718,7 @@ def main() -> None:
         f"temporal_context={cfg.temporal_context}",
         "spatial_source=cnn_feature_grid",
         f"recent_full_frames={cfg.recent_spatial_context}",
-        f"current_spatial_tokens={cfg.spatial_token_count}",
+        f"current_spatial_grid={cfg.pooling[0]}x{cfg.pooling[1]}",
         f"seq={cfg.seq_len}",
         f"horizon={cfg.prediction_horizon}",
         f"horizon_offsets={','.join(str(int(offset)) for offset in cfg.prediction_horizon_offsets)}",
