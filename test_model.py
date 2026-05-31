@@ -278,14 +278,10 @@ def infer_video(
             frame = frame.to(device, non_blocking=True)
             if frame.dtype != inference_dtype:
                 frame = frame.to(dtype=inference_dtype)
-            dt_value = float(gt["dt"][source_idx]) if source_idx < gt["dt"].shape[0] else float(cfg.prediction_dt)
-            dt = torch.tensor([dt_value], device=device, dtype=frame.dtype)
-
             with torch.inference_mode():
                 with torch.amp.autocast(device_type=device.type, dtype=inference_dtype, enabled=use_autocast):
                     output, state = model.forward_step(
                         frame,
-                        dt,
                         state,
                         prev_action=prev_action,
                     )

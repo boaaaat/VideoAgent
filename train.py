@@ -35,8 +35,8 @@ from models import (
 
 @dataclass
 class TrainConfig(ModelConfig):
-    batch_size: int = 4
-    target_effective_batch: int = 32
+    batch_size: int = 2
+    target_effective_batch: int = 16
     grad_accum: int = 8
     num_epochs: int = 100
 
@@ -54,15 +54,15 @@ class TrainConfig(ModelConfig):
     split_seed: int = 1337
     pos_weight_power: float = 0.8
     pos_weight_clamp: float = 25
-    button_threshold_from_pos_weight: bool = True
+    button_threshold_from_pos_weight: bool = False
     button_threshold_min: float = 0.2
     button_threshold_max: float = 0.9
 
     button_loss_weight: float = 1.0
     action_label_offset: int = 0
     last_action_sequence_dropout: float = 0.15
-    last_action_key_dropout: float = 0.3
-    last_action_corruption_prob: float = 0.0
+    last_action_key_dropout: float = 0.4
+    last_action_corruption_prob: float = 0.05
     skipped_key_names: Optional[Sequence[str]] = ("e", "q", "c", "z")
     button_label_smoothing: float = 0.02
 
@@ -572,11 +572,15 @@ def second_half_only(valid: torch.Tensor) -> torch.Tensor:
 
 
 def decision_thresholds_from_pos_weight(pos_weight: torch.Tensor, cfg: TrainConfig) -> torch.Tensor:
-    """Undo the logit prior introduced by weighted BCE when making binary decisions."""
+    """Undo the logit prior introduced by weighted BCE, softened by an alpha parameter."""
     if not bool(cfg.button_threshold_from_pos_weight):
         return torch.full_like(pos_weight.float(), float(cfg.button_state_threshold))
-
-    thresholds = 1.0 / (pos_weight.float() + 1.0)
+    
+    alpha = 0.2 
+    effective_weight = 1.0 + (pos_weight.float() - 1.0) * alpha
+    
+    thresholds = 1.0 / (effective_weight + 1.0)
+    
     return thresholds.clamp(min=float(cfg.button_threshold_min), max=float(cfg.button_threshold_max))
 
 
@@ -909,7 +913,7 @@ def run_epoch(
                     if is_train
                     else batch_targets.last_action
                 )
-                output = model(frames, dt=batch_targets.dt, prev_action=prev_action)
+                output = model(frames, prev_action=prev_action)
                 loss, details = compute_losses(
                     output,
                     batch_targets,

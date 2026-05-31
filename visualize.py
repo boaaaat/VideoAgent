@@ -227,8 +227,7 @@ def initialize_model_lazy_layers(
     model.eval()
     with torch.no_grad():
         dummy_frames = torch.zeros(1, 1, 3, cfg.model_size, cfg.model_size, device=device)
-        dummy_dt = torch.full((1, 1), float(cfg.prediction_dt), device=device)
-        _ = model(dummy_frames, dt=dummy_dt)
+        _ = model(dummy_frames)
     model.train(was_training)
 
 
@@ -688,9 +687,7 @@ def _policy_visuals_for_frame(
                 if bool(need_trajectory):
                     pooled = model.pool(temporal_feat)
                     visual_feat = model.fc_features(pooled.reshape(b, -1))
-                    dt = torch.tensor([float(cfg.prediction_dt)], device=visual_feat.device, dtype=visual_feat.dtype)
                     dt_feat = model._dt_features(
-                        dt,
                         b,
                         1,
                         device=visual_feat.device,
@@ -1155,7 +1152,7 @@ def process_video_cnn(
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Visualize feature-energy heatmaps from the current CNN encoders.")
-    parser.add_argument("--input", default=r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\data\greenville\run_20260521_182038.mp4', help="Input video path. Defaults to the newest run in cfg.data_root.")
+    parser.add_argument("--input", default=r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\data\greenville\run_20260527_134734.mp4', help="Input video path. Defaults to the newest run in cfg.data_root.")
     parser.add_argument("--output", default=None, help="Output video path (.mp4). Default auto-names next to input.")
     parser.add_argument("--csv", default=None, help="CSV labels for the input video. Default auto-detects next to --input.")
     parser.add_argument(
@@ -1177,7 +1174,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--layer",
         choices=["motion", "stage1", "stage2", "stage3", "stage4", "spatial", "tokens"],
-        default="spatial",
+        default="tokens",
         help=(
             "CNN signal to visualize. Policy checkpoints use masked RGB input for motion, stage1-stage4 for "
             "the spatial encoder blocks, final spatial features for spatial, and ConvGRU hidden features for tokens. "
@@ -1200,11 +1197,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fp16", action="store_true", help="Use fp16 autocast on CUDA instead of bf16.")
     parser.add_argument("--no-amp", action="store_true", help="Disable autocast during encoder inference.")
     parser.add_argument("--cpu", action="store_true", help="Force CPU execution.")
-    parser.add_argument("--max-frames", type=int, default=None, help="Stop after this many frames.")
+    parser.add_argument("--max-frames", type=int, default=5000, help="Stop after this many frames.")
     parser.add_argument(
         "--no-trajectory",
         action="store_true",
         help="Disable the FSD-style policy trajectory overlay.",
+        default=False,
     )
     parser.add_argument(
         "--no-real-trajectory",

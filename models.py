@@ -65,7 +65,7 @@ class ModelConfig:
     key_names: Optional[List[str]] = None
     mouse_button_names: Optional[List[str]] = None
 
-    d_model: int = 128
+    d_model: int = 64
     spatial_dropout = 0.10
     head_dropout = 0.20
     zoneout = 0.10
@@ -449,34 +449,13 @@ class DrivingVideoPolicy(nn.Module):
 
     def _dt_features(
         self,
-        dt: Optional[torch.Tensor],
         batch_size: int,
         time_steps: int,
         *,
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        if dt is None:
-            dt_values = torch.full((batch_size, time_steps), float(self.cfg.prediction_dt), device=device, dtype=dtype)
-        else:
-            dt_values = dt.to(device=device, dtype=dtype)
-            if dt_values.dim() == 0:
-                dt_values = dt_values.reshape(1, 1).expand(batch_size, time_steps)
-            elif dt_values.dim() == 1:
-                if int(dt_values.numel()) == batch_size and time_steps == 1:
-                    dt_values = dt_values.view(batch_size, 1)
-                elif int(dt_values.numel()) == time_steps and batch_size == 1:
-                    dt_values = dt_values.view(1, time_steps)
-                elif int(dt_values.numel()) == batch_size:
-                    dt_values = dt_values.view(batch_size, 1).expand(batch_size, time_steps)
-                else:
-                    raise ValueError(f"Expected dt with {batch_size} or {time_steps} values, got {tuple(dt_values.shape)}.")
-            elif dt_values.dim() == 2:
-                if tuple(dt_values.shape) != (batch_size, time_steps):
-                    raise ValueError(f"Expected dt shape {(batch_size, time_steps)}, got {tuple(dt_values.shape)}.")
-            else:
-                raise ValueError(f"Expected scalar, [B], [T], or [B,T] dt, got {tuple(dt_values.shape)}.")
-
+        dt_values = torch.full((batch_size, time_steps), float(self.cfg.prediction_dt), device=device, dtype=dtype)
         base_dt = max(float(self.cfg.prediction_dt), 1.0 / 240.0)
         dt_scaled = (dt_values / base_dt).clamp(0.25, 4.0) - 1.0
         return self.dt_encoder(dt_scaled.reshape(batch_size, time_steps, 1)).to(dtype=dtype)
@@ -537,7 +516,6 @@ class DrivingVideoPolicy(nn.Module):
     def forward(
         self,
         frames: torch.Tensor,
-        dt: torch.Tensor,
         state: Optional[TemporalState] = None,
         return_aux: bool = False,
         prev_action: Optional[torch.Tensor] = None,
@@ -580,7 +558,7 @@ class DrivingVideoPolicy(nn.Module):
         pooled_flat = pooled.reshape(pooled.shape[0], -1)
         
         visual_feat = self.fc_features(pooled_flat).reshape(b, t, self.cfg.d_model)
-        dt_feat = self._dt_features(dt, b, t, device=frames.device, dtype=visual_feat.dtype)
+        dt_feat = self._dt_features(b, t, device=frames.device, dtype=visual_feat.dtype)
         action_feat = self._last_action_features(prev_action, b, t, device=frames.device, dtype=visual_feat.dtype)
         fc_out = self.head_fusion(torch.cat([visual_feat, dt_feat, action_feat], dim=-1))
         
@@ -601,7 +579,6 @@ class DrivingVideoPolicy(nn.Module):
     def forward_step(
         self,
         frame: torch.Tensor,
-        dt: torch.Tensor,
         state: TemporalState,
         return_aux: bool = False,
         prev_action: Optional[torch.Tensor] = None,
@@ -636,7 +613,7 @@ class DrivingVideoPolicy(nn.Module):
         pooled_flat = pooled.reshape(b, -1)
 
         visual_feat = self.fc_features(pooled_flat)
-        dt_feat = self._dt_features(dt, b, 1, device=frame.device, dtype=visual_feat.dtype).reshape(b, self.cfg.d_model)
+        dt_feat = self._dt_features(b, 1, device=frame.device, dtype=visual_feat.dtype).reshape(b, self.cfg.d_model)
         action_feat = self._last_action_features(prev_action, b, 1, device=frame.device, dtype=visual_feat.dtype).reshape(
             b,
             self.cfg.d_model,

@@ -508,10 +508,8 @@ def main() -> None:
                         frame = frame.to(dtype=inference_dtype)
                     with torch.inference_mode():
                         frame_batch = frame.unsqueeze(0)
-                        dt = torch.tensor([float(cfg.prediction_dt)], device=device, dtype=frame_batch.dtype)
                         output, temporal_state = model.forward_step(
                             frame_batch,
-                            dt,
                             temporal_state,
                             prev_action=prev_action,
                         )
