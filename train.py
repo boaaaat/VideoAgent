@@ -54,12 +54,11 @@ class TrainConfig(ModelConfig):
     split_seed: int = 1337
     pos_weight_power: float = 0.5
     pos_weight_clamp: float = 8
-    button_threshold_from_pos_weight: bool = False
-    button_threshold_min: float = 0.5
+    button_threshold_from_pos_weight: bool = True
+    button_threshold_min: float = 0.2
     button_threshold_max: float = 0.9
 
     button_loss_weight: float = 1.0
-    button_focal_gamma: float = 1.0
     action_label_offset: int = 0
     last_action_sequence_dropout: float = 0.15
     last_action_key_dropout: float = 0.3
@@ -136,7 +135,6 @@ class TrainConfig(ModelConfig):
         self.button_threshold_min = float(min(max(self.button_threshold_min, 0.0), 1.0))
         self.button_threshold_max = float(min(max(self.button_threshold_max, self.button_threshold_min), 1.0))
         self.grad_clip = max(0.0, float(self.grad_clip))
-        self.button_focal_gamma = max(0.0, float(self.button_focal_gamma))
         self.action_label_offset = int(self.action_label_offset)
         self.last_action_sequence_dropout = float(min(max(self.last_action_sequence_dropout, 0.0), 1.0))
         self.last_action_key_dropout = float(min(max(self.last_action_key_dropout, 0.0), 1.0))
@@ -577,7 +575,8 @@ def decision_thresholds_from_pos_weight(pos_weight: torch.Tensor, cfg: TrainConf
     """Undo the logit prior introduced by weighted BCE when making binary decisions."""
     if not bool(cfg.button_threshold_from_pos_weight):
         return torch.full_like(pos_weight.float(), float(cfg.button_state_threshold))
-    thresholds = pos_weight.float() / (pos_weight.float() + 1.0)
+
+    thresholds = 1.0 / (pos_weight.float() + 1.0)
     return thresholds.clamp(min=float(cfg.button_threshold_min), max=float(cfg.button_threshold_max))
 
 
@@ -659,9 +658,6 @@ def compute_losses(
         pos_weight=button_pos_weight.view(1, 1, 1, -1).float(),
         reduction="none",
     )
-    button_prob = torch.sigmoid(button_logits)
-    p_t = button_prob * button_target + (1.0 - button_prob) * (1.0 - button_target)
-    button_loss_raw = button_loss_raw * (1.0 - p_t).clamp(min=0.0, max=1.0).pow(float(cfg.button_focal_gamma))
     loss_weight = valid_4d
     horizon_count = int(button_logits.size(2))
     if horizon_count > 1:
@@ -1080,7 +1076,6 @@ def parse_args() -> TrainConfig:
     add("--last-action-corruption-prob", type=float, default=None)
     add("--skip-key-names", default=None, help="Comma-separated key names to exclude from training labels.")
     add("--train-all-keys", action="store_true", help="Disable the default Greenville test filter for e,q,c,z.")
-    add("--button-focal-gamma", type=float, default=None)
     add("--button-label-smoothing", type=float, default=None)
     add("--aug-brightness", type=float, default=None)
     add("--aug-contrast", type=float, default=None)
@@ -1160,7 +1155,6 @@ def parse_args() -> TrainConfig:
         "last_action_sequence_dropout",
         "last_action_key_dropout",
         "last_action_corruption_prob",
-        "button_focal_gamma",
         "button_label_smoothing",
         "aug_brightness",
         "aug_contrast",
@@ -1259,7 +1253,6 @@ def train() -> None:
     print(
         "Loss supervision:",
         f"frames={supervised_start}-{supervised_end}",
-        f"focal_gamma={cfg.button_focal_gamma:.1f}",
     )
     print(
         "Last action conditioning:",

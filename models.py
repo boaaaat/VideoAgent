@@ -59,19 +59,18 @@ class ModelConfig:
     train_seq_stride: int = 40
     val_seq_stride: int = 80
     prediction_dt: float = 1.0 / 20.0
-    prediction_horizon: int = 1
+    prediction_horizon: int = 10
     prediction_horizon_offsets: Optional[Sequence[int]] = None
 
     key_names: Optional[List[str]] = None
     mouse_button_names: Optional[List[str]] = None
 
-    d_model: int = 256
+    d_model: int = 128
     spatial_dropout = 0.10
     head_dropout = 0.20
     zoneout = 0.10
 
     pooling: Tuple[int, int] = (16, 16)
-    pool_heads: int = 4
 
     button_state_threshold: float = 0.5
     button_state_thresholds: Optional[Sequence[float]] = None
@@ -107,7 +106,6 @@ class ModelConfig:
         self.zoneout = float(min(max(self.zoneout, 0.0), 0.9))
         pool_h, pool_w = self.pooling
         self.pooling = (max(1, int(pool_h)), max(1, int(pool_w)))
-        self.pool_heads = _largest_valid_head_count(CNN_FEATURE_CHANNELS, int(self.pool_heads))
 
         if self.key_names is None:
             self.key_names = get_key_names(self.selected_game)
