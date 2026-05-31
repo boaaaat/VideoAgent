@@ -128,7 +128,6 @@ def _coerce_config_types(cfg: ModelConfig) -> ModelConfig:
     cfg.train_seq_stride = int(cfg.train_seq_stride)
     cfg.val_seq_stride = int(cfg.val_seq_stride)
     cfg.model_size = int(cfg.model_size)
-    cfg.prediction_dt = float(cfg.prediction_dt)
     cfg.prediction_horizon = int(getattr(cfg, "prediction_horizon", 1))
     offsets = getattr(cfg, "prediction_horizon_offsets", None)
     if offsets is None:
@@ -687,12 +686,6 @@ def _policy_visuals_for_frame(
                 if bool(need_trajectory):
                     pooled = model.pool(temporal_feat)
                     visual_feat = model.fc_features(pooled.reshape(b, -1))
-                    dt_feat = model._dt_features(
-                        b,
-                        1,
-                        device=visual_feat.device,
-                        dtype=visual_feat.dtype,
-                    ).reshape(b, cfg.d_model)
                     if prev_action is None:
                         prev_for_head = torch.zeros((b, int(cfg.num_bin)), device=visual_feat.device, dtype=visual_feat.dtype)
                     else:
@@ -704,7 +697,7 @@ def _policy_visuals_for_frame(
                         device=visual_feat.device,
                         dtype=visual_feat.dtype,
                     ).reshape(b, cfg.d_model)
-                    fc_out = model.head_fusion(torch.cat([visual_feat, dt_feat, action_feat], dim=-1))
+                    fc_out = model.head_fusion(torch.cat([visual_feat, action_feat], dim=-1))
                     logits = model._horizon_button_logits(fc_out)[0].detach().float()
                     trajectory_probs = torch.sigmoid(logits).detach().cpu().numpy().astype(np.float32)
                     command_idx = min(int(cfg.prediction_horizon) - 1, 9)

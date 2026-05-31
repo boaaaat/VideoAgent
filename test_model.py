@@ -169,7 +169,6 @@ def load_ground_truth(csv_path: str, cfg: ModelConfig, total_frames: int) -> Dic
     count = min(int(total_frames), len(rows))
     buttons = np.zeros((total_frames, cfg.num_bin), dtype=np.float32)
     mouse_delta = np.zeros((total_frames, 2), dtype=np.float32)
-    dt = np.full((total_frames,), float(cfg.prediction_dt), dtype=np.float32)
     valid = np.zeros((total_frames,), dtype=bool)
 
     for idx in range(count):
@@ -183,14 +182,11 @@ def load_ground_truth(csv_path: str, cfg: ModelConfig, total_frames: int) -> Dic
             col += 1
         mouse_delta[idx, 0] = _parse_float(row.get("delta_x"))
         mouse_delta[idx, 1] = _parse_float(row.get("delta_y"))
-        if "dt" in row:
-            dt[idx] = np.clip(_parse_float(row.get("dt"), cfg.prediction_dt), 1.0 / 240.0, 0.5)
         valid[idx] = True
 
     return {
         "button_state": buttons,
         "mouse_delta": mouse_delta,
-        "dt": dt,
         "valid_mask": valid,
     }
 

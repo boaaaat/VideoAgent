@@ -225,7 +225,6 @@ def _coerce_config_types(cfg: RuntimeConfig) -> RuntimeConfig:
         cfg.prediction_horizon = len(cfg.prediction_horizon_offsets)
     cfg.command_horizon = max(1, min(int(cfg.command_horizon), int(cfg.prediction_horizon)))
     cfg.d_model = int(cfg.d_model)
-    cfg.prediction_dt = float(cfg.prediction_dt)
     cfg.mouse_buttons_enabled = bool(cfg.mouse_buttons_enabled)
     cfg.gru_memory_frames = max(1, int(getattr(cfg, "gru_memory_frames", 80)))
     cfg.num_bin = len(cfg.key_names) + len(cfg.mouse_button_names)

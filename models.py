@@ -58,7 +58,6 @@ class ModelConfig:
     seq_len: int = 80
     train_seq_stride: int = 40
     val_seq_stride: int = 80
-    prediction_dt: float = 1.0 / 20.0
     prediction_horizon: int = 10
     prediction_horizon_offsets: Optional[Sequence[int]] = None
 
@@ -85,7 +84,6 @@ class ModelConfig:
         self.seq_len = max(1, int(self.seq_len))
         self.train_seq_stride = max(1, int(self.train_seq_stride))
         self.val_seq_stride = max(1, int(self.val_seq_stride))
-        self.prediction_dt = max(1.0 / 240.0, float(self.prediction_dt))
         self.prediction_horizon = max(1, int(self.prediction_horizon))
         if self.prediction_horizon_offsets is None:
             self.prediction_horizon_offsets = _default_horizon_offsets(self.prediction_horizon)
@@ -330,9 +328,6 @@ class DrivingVideoPolicy(nn.Module):
             nn.ELU(inplace=True),
             nn.Dropout(cfg.head_dropout)
         )
-        self.dt_encoder = nn.Linear(1, self.cfg.d_model)
-        nn.init.zeros_(self.dt_encoder.weight)
-        nn.init.zeros_(self.dt_encoder.bias)
 
         action_hidden = max(4, min(32, cfg.num_bin * 2, self.cfg.d_model // 4))
         self.last_action_encoder = nn.Sequential(
@@ -347,8 +342,8 @@ class DrivingVideoPolicy(nn.Module):
             nn.init.zeros_(final_action_layer.bias)
 
         self.head_fusion = nn.Sequential(
-            nn.LayerNorm(self.cfg.d_model * 3),
-            nn.Linear(self.cfg.d_model * 3, self.cfg.d_model),
+            nn.LayerNorm(self.cfg.d_model * 2),
+            nn.Linear(self.cfg.d_model * 2, self.cfg.d_model),
             nn.ELU(inplace=True),
         )
         
@@ -446,19 +441,6 @@ class DrivingVideoPolicy(nn.Module):
         if frames.dtype == torch.uint8:
             frames = frames.float() / 255.0
         return frames.clamp(0.0, 1.0)
-
-    def _dt_features(
-        self,
-        batch_size: int,
-        time_steps: int,
-        *,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        dt_values = torch.full((batch_size, time_steps), float(self.cfg.prediction_dt), device=device, dtype=dtype)
-        base_dt = max(float(self.cfg.prediction_dt), 1.0 / 240.0)
-        dt_scaled = (dt_values / base_dt).clamp(0.25, 4.0) - 1.0
-        return self.dt_encoder(dt_scaled.reshape(batch_size, time_steps, 1)).to(dtype=dtype)
 
     def _last_action_features(
         self,
@@ -558,9 +540,8 @@ class DrivingVideoPolicy(nn.Module):
         pooled_flat = pooled.reshape(pooled.shape[0], -1)
         
         visual_feat = self.fc_features(pooled_flat).reshape(b, t, self.cfg.d_model)
-        dt_feat = self._dt_features(b, t, device=frames.device, dtype=visual_feat.dtype)
         action_feat = self._last_action_features(prev_action, b, t, device=frames.device, dtype=visual_feat.dtype)
-        fc_out = self.head_fusion(torch.cat([visual_feat, dt_feat, action_feat], dim=-1))
+        fc_out = self.head_fusion(torch.cat([visual_feat, action_feat], dim=-1))
         
         # 4. Action Mapping Prediction
         button = self._horizon_button_logits(fc_out)
@@ -613,12 +594,11 @@ class DrivingVideoPolicy(nn.Module):
         pooled_flat = pooled.reshape(b, -1)
 
         visual_feat = self.fc_features(pooled_flat)
-        dt_feat = self._dt_features(b, 1, device=frame.device, dtype=visual_feat.dtype).reshape(b, self.cfg.d_model)
         action_feat = self._last_action_features(prev_action, b, 1, device=frame.device, dtype=visual_feat.dtype).reshape(
             b,
             self.cfg.d_model,
         )
-        fc_out = self.head_fusion(torch.cat([visual_feat, dt_feat, action_feat], dim=-1))
+        fc_out = self.head_fusion(torch.cat([visual_feat, action_feat], dim=-1))
 
         # 5. Project to action space values
         button = self._horizon_button_logits(fc_out)

@@ -170,7 +170,6 @@ class TrainConfig(ModelConfig):
 
 @dataclass
 class WindowTargets:
-    dt: torch.Tensor
     button_horizon: torch.Tensor
     horizon_valid: torch.Tensor
     last_action: torch.Tensor
@@ -291,11 +290,8 @@ def load_run_arrays(csv_path: str, cfg: TrainConfig) -> Dict[str, np.ndarray]:
 
     t = len(rows)
     buttons = np.zeros((t, cfg.num_bin), dtype=np.float32)
-    timestamps = np.zeros((t,), dtype=np.float32)
-    explicit_dt = np.zeros((t,), dtype=np.float32) if "dt" in fieldnames else None
 
     for idx, row in enumerate(rows):
-        timestamps[idx] = _parse_float(row["timestamp"])
         col = 0
         for name in cfg.key_names:
             buttons[idx, col] = 1.0 if _parse_float(row[name]) > 0.5 else 0.0
@@ -303,18 +299,7 @@ def load_run_arrays(csv_path: str, cfg: TrainConfig) -> Dict[str, np.ndarray]:
         for name in cfg.mouse_button_names:
             buttons[idx, col] = 1.0 if _parse_float(row[name]) > 0.5 else 0.0
             col += 1
-        if explicit_dt is not None:
-            explicit_dt[idx] = _parse_float(row["dt"])
-
-    if explicit_dt is not None and bool(np.any(explicit_dt > 0.0)):
-        dt = explicit_dt.astype(np.float32)
-    elif t == 1:
-        dt = np.array([float(cfg.prediction_dt)], dtype=np.float32)
-    else:
-        dt = np.diff(timestamps, prepend=timestamps[0]).astype(np.float32)
-        dt[0] = dt[1] if t > 1 else float(cfg.prediction_dt)
-    dt = np.clip(dt, 1.0 / 240.0, 0.5).astype(np.float32)
-    return {"buttons": buttons, "dt": dt}
+    return {"buttons": buttons}
 
 
 def build_window_targets(
@@ -327,7 +312,6 @@ def build_window_targets(
     button_windows: List[np.ndarray] = []
     valid_windows: List[np.ndarray] = []
     last_action_windows: List[np.ndarray] = []
-    dt_windows: List[np.ndarray] = []
     meta: List[Tuple[str, int, int]] = []
 
     horizon_offsets = tuple(int(offset) for offset in cfg.prediction_horizon_offsets)
@@ -335,7 +319,6 @@ def build_window_targets(
     for video_path, csv_path in pairs:
         run = load_run_arrays(csv_path, cfg)
         buttons = run["buttons"]
-        dt = run["dt"].astype(np.float32)
         if buttons.shape[0] < cfg.seq_len:
             continue
 
@@ -363,7 +346,6 @@ def build_window_targets(
             button_windows.append(button_target)
             valid_windows.append(valid_target)
             last_action_windows.append(last_action)
-            dt_windows.append(dt[start:end])
             if return_meta:
                 meta.append((video_path, start, end))
 
@@ -374,7 +356,6 @@ def build_window_targets(
         return torch.from_numpy(np.stack(items, axis=0)).float()
 
     return WindowTargets(
-        dt=stack(dt_windows),
         button_horizon=stack(button_windows),
         horizon_valid=stack(valid_windows),
         last_action=stack(last_action_windows),
@@ -614,7 +595,6 @@ def resolve_amp_settings(amp: str) -> Tuple[torch.dtype, bool, bool]:
 
 def bundle_index(bundle: WindowTargets, indices: torch.Tensor) -> WindowTargets:
     return WindowTargets(
-        dt=bundle.dt[indices],
         button_horizon=bundle.button_horizon[indices],
         horizon_valid=bundle.horizon_valid[indices],
         last_action=bundle.last_action[indices],
@@ -624,7 +604,6 @@ def bundle_index(bundle: WindowTargets, indices: torch.Tensor) -> WindowTargets:
 
 def move_bundle_to_device(bundle: WindowTargets, device: torch.device) -> WindowTargets:
     return WindowTargets(
-        dt=bundle.dt.to(device, non_blocking=True),
         button_horizon=bundle.button_horizon.to(device, non_blocking=True),
         horizon_valid=bundle.horizon_valid.to(device, non_blocking=True),
         last_action=bundle.last_action.to(device, non_blocking=True),
@@ -634,7 +613,6 @@ def move_bundle_to_device(bundle: WindowTargets, device: torch.device) -> Window
 
 def pin_bundle(bundle: WindowTargets) -> WindowTargets:
     return WindowTargets(
-        dt=bundle.dt.pin_memory(),
         button_horizon=bundle.button_horizon.pin_memory(),
         horizon_valid=bundle.horizon_valid.pin_memory(),
         last_action=bundle.last_action.pin_memory(),
@@ -863,7 +841,6 @@ def load_batch(iterator, targets: WindowTargets, device: torch.device, cfg: Trai
         frames = frames.float()
     labels = normalize_dali_labels(batch["labels"]).to(device, non_blocking=True)
     target = WindowTargets(
-        dt=targets.dt[labels],
         button_horizon=targets.button_horizon[labels],
         horizon_valid=targets.horizon_valid[labels],
         last_action=targets.last_action[labels],
