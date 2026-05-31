@@ -63,7 +63,7 @@ class TrainConfig(ModelConfig):
     action_label_offset: int = 0
     last_action_sequence_dropout: float = 0.15
     last_action_key_dropout: float = 0.3
-    last_action_corruption_prob: float = 0.1
+    last_action_corruption_prob: float = 0.0
     skipped_key_names: Optional[Sequence[str]] = ("e", "q", "c", "z")
     button_label_smoothing: float = 0.02
 

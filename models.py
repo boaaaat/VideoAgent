@@ -59,7 +59,7 @@ class ModelConfig:
     train_seq_stride: int = 40
     val_seq_stride: int = 80
     prediction_dt: float = 1.0 / 20.0
-    prediction_horizon: int = 10
+    prediction_horizon: int = 1
     prediction_horizon_offsets: Optional[Sequence[int]] = None
 
     key_names: Optional[List[str]] = None
@@ -70,7 +70,7 @@ class ModelConfig:
     head_dropout = 0.20
     zoneout = 0.10
 
-    pooling: Tuple[int, int] = (5, 5)
+    pooling: Tuple[int, int] = (16, 16)
     pool_heads: int = 4
 
     button_state_threshold: float = 0.5
@@ -324,8 +324,8 @@ class DrivingVideoPolicy(nn.Module):
             ]
         )
         
-        # Learned multi-head pooling retains the configured spatial output layout for the classifier.
-        self.pool = LearnedMultiHeadSpatialPool2d(self.feat_channels, cfg.pooling, cfg.pool_heads)
+        # Preserve a real fixed spatial grid for the classifier head.
+        self.pool = nn.AdaptiveAvgPool2d(cfg.pooling)
         
         self.fc_features = nn.Sequential(
             nn.Linear(self.feat_channels * cfg.pooling[0] * cfg.pooling[1], self.cfg.d_model),
