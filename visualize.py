@@ -1167,7 +1167,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--layer",
         choices=["motion", "stage1", "stage2", "stage3", "stage4", "spatial", "tokens"],
-        default="tokens",
+        default="spatial",
         help=(
             "CNN signal to visualize. Policy checkpoints use masked RGB input for motion, stage1-stage4 for "
             "the spatial encoder blocks, final spatial features for spatial, and ConvGRU hidden features for tokens. "

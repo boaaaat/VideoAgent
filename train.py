@@ -61,9 +61,11 @@ class TrainConfig(ModelConfig):
 
     button_loss_weight: float = 1.0
     streaming_state_training: bool = True
+    streaming_segment_min_chunks: int = 2
+    streaming_segment_max_chunks: int = 20
     action_label_offset: int = 0
-    last_action_sequence_dropout: float = 0.25
-    last_action_key_dropout: float = 0.8
+    last_action_sequence_dropout: float = 0.2
+    last_action_key_dropout: float = 0.4
     last_action_corruption_prob: float = 0.05
     skipped_key_names: Optional[Sequence[str]] = ("e", "q", "c", "z")
     button_label_smoothing: float = 0.02
@@ -139,6 +141,8 @@ class TrainConfig(ModelConfig):
         self.button_threshold_min = float(min(max(self.button_threshold_min, 0.0), 1.0))
         self.button_threshold_max = float(min(max(self.button_threshold_max, self.button_threshold_min), 1.0))
         self.streaming_state_training = bool(self.streaming_state_training)
+        self.streaming_segment_min_chunks = max(1, int(self.streaming_segment_min_chunks))
+        self.streaming_segment_max_chunks = max(self.streaming_segment_min_chunks, int(self.streaming_segment_max_chunks))
         self.grad_clip = max(0.0, float(self.grad_clip))
         self.action_label_offset = int(self.action_label_offset)
         self.last_action_sequence_dropout = float(min(max(self.last_action_sequence_dropout, 0.0), 1.0))
@@ -381,6 +385,86 @@ def write_window_file_list(
         for idx in use_indices:
             video_path, start, end = meta[idx]
             file_obj.write(f"{video_path} {idx} {start} {end}\n")
+
+
+def _contiguous_window_streams(meta: List[Tuple[str, int, int]]) -> List[List[int]]:
+    by_video: Dict[str, Dict[int, int]] = {}
+    for idx, (video_path, start, _) in enumerate(meta):
+        by_video.setdefault(video_path, {})[int(start)] = idx
+
+    streams: List[List[int]] = []
+    for start_to_idx in by_video.values():
+        starts = sorted(start_to_idx)
+        start_set = set(starts)
+        end_set = {int(meta[idx][2]) for idx in start_to_idx.values()}
+        for start in starts:
+            if int(start) in end_set:
+                continue
+
+            stream: List[int] = []
+            cursor = int(start)
+            while cursor in start_set:
+                stream_idx = start_to_idx[cursor]
+                stream.append(stream_idx)
+                _, _, cursor = meta[stream_idx]
+            if stream:
+                streams.append(stream)
+    return streams
+
+
+def _split_stream_random_segments(
+    stream: Sequence[int],
+    *,
+    min_chunks: int,
+    max_chunks: int,
+    rng: random.Random,
+) -> List[List[int]]:
+    stream = list(stream)
+    if not stream:
+        return []
+
+    min_chunks = max(1, int(min_chunks))
+    max_chunks = max(min_chunks, int(max_chunks))
+    segments: List[List[int]] = []
+    cursor = 0
+    while cursor < len(stream):
+        remaining = len(stream) - cursor
+        if remaining < min_chunks and segments:
+            segments[-1].extend(stream[cursor:])
+            break
+        if remaining <= max_chunks:
+            length = remaining
+        else:
+            length = rng.randint(min_chunks, max_chunks)
+            trailing = remaining - length
+            if 0 < trailing < min_chunks:
+                length = remaining - min_chunks
+        segments.append(stream[cursor : cursor + length])
+        cursor += length
+    return segments
+
+
+def streaming_window_order(
+    meta: List[Tuple[str, int, int]],
+    cfg: TrainConfig,
+    *,
+    seed: int,
+) -> Tuple[List[int], set[int]]:
+    rng = random.Random(int(seed))
+    segments: List[List[int]] = []
+    for stream in _contiguous_window_streams(meta):
+        segments.extend(
+            _split_stream_random_segments(
+                stream,
+                min_chunks=cfg.streaming_segment_min_chunks,
+                max_chunks=cfg.streaming_segment_max_chunks,
+                rng=rng,
+            )
+        )
+    rng.shuffle(segments)
+    order = [idx for segment in segments for idx in segment]
+    reset_indices = {segment[0] for segment in segments if segment}
+    return order, reset_indices
 
 
 @pipeline_def
@@ -865,15 +949,20 @@ def _streaming_initial_state(
     labels: torch.Tensor,
     targets: WindowTargets,
     cache: StreamingStateCache,
+    reset_indices: Optional[set[int]] = None,
 ) -> Optional[TemporalState]:
     if targets.meta is None or not cache:
         return None
 
+    reset_indices = reset_indices or set()
     sample_states: List[Optional[torch.Tensor]] = []
     template: Optional[torch.Tensor] = None
     for label_idx in _labels_to_indices(labels):
         video_path, start, _ = targets.meta[label_idx]
-        hidden = cache.get(video_path, {}).pop(int(start), None)
+        video_cache = cache.get(video_path, {})
+        hidden = video_cache.pop(int(start), None)
+        if label_idx in reset_indices:
+            hidden = None
         sample_states.append(hidden)
         if hidden is not None and template is None:
             template = hidden
@@ -924,6 +1013,7 @@ def run_epoch(
     optimizer: Optional[torch.optim.Optimizer] = None,
     total_steps: int = 1,
     global_step: int = 0,
+    streaming_reset_indices: Optional[set[int]] = None,
 ) -> Tuple[Dict[str, float], int]:
     is_train = optimizer is not None
     model.train(is_train)
@@ -952,7 +1042,7 @@ def run_epoch(
                     else batch_targets.last_action
                 )
                 if use_streaming_state:
-                    initial_state = _streaming_initial_state(labels, targets, streaming_cache)
+                    initial_state = _streaming_initial_state(labels, targets, streaming_cache, streaming_reset_indices)
                     output, next_state = model(
                         frames,
                         state=initial_state,
@@ -1124,6 +1214,8 @@ def parse_args() -> TrainConfig:
     add("--button-threshold-max", type=float, default=None)
     add("--streaming-state-training", dest="streaming_state_training", action="store_true", default=None)
     add("--no-streaming-state-training", dest="streaming_state_training", action="store_false")
+    add("--streaming-segment-min-chunks", type=int, default=None)
+    add("--streaming-segment-max-chunks", type=int, default=None)
     add("--action-label-offset", type=int, default=None)
     add("--last-action-sequence-dropout", type=float, default=None)
     add("--last-action-key-dropout", type=float, default=None)
@@ -1210,6 +1302,8 @@ def parse_args() -> TrainConfig:
         "button_threshold_min",
         "button_threshold_max",
         "streaming_state_training",
+        "streaming_segment_min_chunks",
+        "streaming_segment_max_chunks",
         "action_label_offset",
         "last_action_sequence_dropout",
         "last_action_key_dropout",
@@ -1318,8 +1412,8 @@ def train() -> None:
     print(
         "Streaming state training:",
         f"enabled={bool(cfg.streaming_state_training)}",
-        f"requires_contiguous_chunks=True",
-        f"train_shuffle={bool(cfg.dali_train_random_shuffle)}",
+        "shuffle=stream_segments" if cfg.streaming_state_training else f"train_shuffle={bool(cfg.dali_train_random_shuffle)}",
+        f"segment_chunks={int(cfg.streaming_segment_min_chunks)}-{int(cfg.streaming_segment_max_chunks)}",
         f"train_stride={int(cfg.train_seq_stride)}",
         f"seq_len={int(cfg.seq_len)}",
     )
@@ -1365,17 +1459,22 @@ def train() -> None:
     ]
     print("Button decision thresholds:", " ".join(threshold_parts))
 
+    if cfg.streaming_state_training and int(cfg.batch_size) != 1:
+        raise ValueError("streaming_state_training currently requires batch_size=1 so chunks can carry state sequentially.")
+
     train_targets = move_bundle_to_device(train_targets, device)
     if val_targets is not None:
         val_targets = move_bundle_to_device(val_targets, device)
 
-    train_iter = make_dali_iterator(
-        train_file_list,
-        cfg,
-        batch_size=cfg.batch_size,
-        random_shuffle=cfg.dali_train_random_shuffle,
-        last_batch_policy=LastBatchPolicy.DROP,
-    )
+    train_iter = None
+    if not cfg.streaming_state_training:
+        train_iter = make_dali_iterator(
+            train_file_list,
+            cfg,
+            batch_size=cfg.batch_size,
+            random_shuffle=cfg.dali_train_random_shuffle,
+            last_batch_policy=LastBatchPolicy.DROP,
+        )
     train_batches = int(train_targets.button_horizon.shape[0]) // int(cfg.batch_size)
     if cfg.max_train_batches is not None:
         train_batches = min(train_batches, cfg.max_train_batches)
@@ -1423,10 +1522,32 @@ def train() -> None:
     final_horizon_offset = int(horizon_offsets[-1])
 
     for epoch in range(start_epoch, cfg.num_epochs):
+        streaming_reset_indices: Optional[set[int]] = None
+        epoch_train_iter = train_iter
+        if cfg.streaming_state_training:
+            if train_targets.meta is None:
+                raise RuntimeError("Streaming state training requires training window metadata.")
+            stream_order, streaming_reset_indices = streaming_window_order(
+                train_targets.meta,
+                cfg,
+                seed=int(cfg.dali_shuffle_seed) + int(epoch),
+            )
+            if not stream_order:
+                raise RuntimeError("No streaming train windows found.")
+            write_window_file_list(train_targets.meta, train_file_list, indices=stream_order)
+            epoch_train_iter = make_dali_iterator(
+                train_file_list,
+                cfg,
+                batch_size=cfg.batch_size,
+                random_shuffle=False,
+                last_batch_policy=LastBatchPolicy.DROP,
+            )
+        if epoch_train_iter is None:
+            raise RuntimeError("Training iterator was not initialized.")
         train_metrics, global_step = run_epoch(
             desc=f"Epoch {epoch + 1}/{cfg.num_epochs} [train]",
             model=model,
-            iterator=train_iter,
+            iterator=epoch_train_iter,
             batches=train_batches,
             targets=train_targets,
             cfg=cfg,
@@ -1437,6 +1558,7 @@ def train() -> None:
             optimizer=optimizer,
             total_steps=total_steps,
             global_step=global_step,
+            streaming_reset_indices=streaming_reset_indices,
         )
 
         val_metrics = None

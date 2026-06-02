@@ -50,7 +50,7 @@ class ModelConfig:
 
     model_size: int = 256
     seq_len: int = 80
-    train_seq_stride: int = 40
+    train_seq_stride: int = 20
     val_seq_stride: int = 80
     prediction_horizon: int = 10
     prediction_horizon_offsets: Optional[Sequence[int]] = None
