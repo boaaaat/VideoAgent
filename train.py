@@ -30,14 +30,15 @@ from models import (
     DrivingVideoPolicy,
     ModelConfig,
     PolicyOutput,
+    TemporalState,
 )
 
 
 @dataclass
 class TrainConfig(ModelConfig):
-    batch_size: int = 2
+    batch_size: int = 1
     target_effective_batch: int = 16
-    grad_accum: int = 8
+    grad_accum: int = 16
     num_epochs: int = 100
 
     lr: float = 2e-4
@@ -59,6 +60,7 @@ class TrainConfig(ModelConfig):
     button_threshold_max: float = 0.9
 
     button_loss_weight: float = 1.0
+    streaming_state_training: bool = True
     action_label_offset: int = 0
     last_action_sequence_dropout: float = 0.25
     last_action_key_dropout: float = 0.8
@@ -66,10 +68,10 @@ class TrainConfig(ModelConfig):
     skipped_key_names: Optional[Sequence[str]] = ("e", "q", "c", "z")
     button_label_smoothing: float = 0.02
 
-    aug_brightness: float = 0.08
-    aug_contrast: float = 0.10
+    aug_brightness: float = 0.1
+    aug_contrast: float = 0.15
     aug_noise_std: float = 0.006
-    aug_gray_prob: float = 0.02
+    aug_gray_prob: float = 0.03
     aug_translate_frac: float = 0.0
     aug_scale_frac: float = 0.0
     aug_edges_crop_prob: float = 0.0
@@ -122,6 +124,8 @@ class TrainConfig(ModelConfig):
         self.num_epochs = max(1, int(self.num_epochs))
         self.dali_prefetch_queue_depth = max(1, int(self.dali_prefetch_queue_depth))
         self.dali_reader_prefetch_queue_depth = max(1, int(self.dali_reader_prefetch_queue_depth))
+        self.dali_train_random_shuffle = bool(self.dali_train_random_shuffle)
+        self.dali_val_random_shuffle = bool(self.dali_val_random_shuffle)
         self.save_every = max(1, int(self.save_every))
         self.print_every = max(1, int(self.print_every))
         self.grad_accum = max(1, int(math.ceil(self.target_effective_batch / float(self.batch_size))))
@@ -134,6 +138,7 @@ class TrainConfig(ModelConfig):
         self.button_threshold_from_pos_weight = bool(self.button_threshold_from_pos_weight)
         self.button_threshold_min = float(min(max(self.button_threshold_min, 0.0), 1.0))
         self.button_threshold_max = float(min(max(self.button_threshold_max, self.button_threshold_min), 1.0))
+        self.streaming_state_training = bool(self.streaming_state_training)
         self.grad_clip = max(0.0, float(self.grad_clip))
         self.action_label_offset = int(self.action_label_offset)
         self.last_action_sequence_dropout = float(min(max(self.last_action_sequence_dropout, 0.0), 1.0))
@@ -174,6 +179,9 @@ class WindowTargets:
     horizon_valid: torch.Tensor
     last_action: torch.Tensor
     meta: Optional[List[Tuple[str, int, int]]] = None
+
+
+StreamingStateCache = Dict[str, Dict[int, torch.Tensor]]
 
 
 @dataclass
@@ -829,7 +837,7 @@ def make_dali_iterator(
     )
 
 
-def load_batch(iterator, targets: WindowTargets, device: torch.device, cfg: TrainConfig) -> Tuple[torch.Tensor, WindowTargets]:
+def load_batch(iterator, targets: WindowTargets, device: torch.device, cfg: TrainConfig) -> Tuple[torch.Tensor, WindowTargets, torch.Tensor]:
     batch = next(iterator)[0]
     frames = ensure_fchw_layout(batch["frames"])
     if frames.device != device:
@@ -846,7 +854,58 @@ def load_batch(iterator, targets: WindowTargets, device: torch.device, cfg: Trai
         last_action=targets.last_action[labels],
         meta=None,
     )
-    return frames, target
+    return frames, target, labels
+
+
+def _labels_to_indices(labels: torch.Tensor) -> List[int]:
+    return [int(item) for item in labels.detach().cpu().reshape(-1).tolist()]
+
+
+def _streaming_initial_state(
+    labels: torch.Tensor,
+    targets: WindowTargets,
+    cache: StreamingStateCache,
+) -> Optional[TemporalState]:
+    if targets.meta is None or not cache:
+        return None
+
+    sample_states: List[Optional[torch.Tensor]] = []
+    template: Optional[torch.Tensor] = None
+    for label_idx in _labels_to_indices(labels):
+        video_path, start, _ = targets.meta[label_idx]
+        hidden = cache.get(video_path, {}).pop(int(start), None)
+        sample_states.append(hidden)
+        if hidden is not None and template is None:
+            template = hidden
+
+    if template is None:
+        return None
+
+    stacked = torch.stack(
+        [hidden if hidden is not None else torch.zeros_like(template) for hidden in sample_states],
+        dim=1,
+    )
+    return TemporalState(hidden_state=stacked)
+
+
+def _update_streaming_cache(
+    labels: torch.Tensor,
+    targets: WindowTargets,
+    state: Optional[TemporalState],
+    cache: StreamingStateCache,
+    cfg: TrainConfig,
+) -> None:
+    if targets.meta is None or state is None or state.hidden_state is None:
+        return
+
+    hidden = state.hidden_state.detach()
+    max_pending = max(2, int(math.ceil(float(cfg.seq_len) / float(max(1, cfg.train_seq_stride)))) + 2)
+    for batch_idx, label_idx in enumerate(_labels_to_indices(labels)):
+        video_path, _, end = targets.meta[label_idx]
+        video_cache = cache.setdefault(video_path, {})
+        video_cache[int(end)] = hidden[:, batch_idx].detach()
+        while len(video_cache) > max_pending:
+            video_cache.pop(min(video_cache))
 
 
 
@@ -876,11 +935,13 @@ def run_epoch(
     step1_stats = BinaryStats(cfg.num_bin, device)
     final_stats = BinaryStats(cfg.num_bin, device)
     steps = 0
+    streaming_cache: StreamingStateCache = {}
+    use_streaming_state = bool(is_train and cfg.streaming_state_training)
 
     iterator_it = iter(iterator)
     pbar = tqdm(range(int(batches)), desc=desc, dynamic_ncols=True)
     for batch_idx in pbar:
-        frames, batch_targets = load_batch(iterator_it, targets, device, cfg)
+        frames, batch_targets, labels = load_batch(iterator_it, targets, device, cfg)
         if is_train:
             frames = augment_frames(frames, cfg)
         with torch.set_grad_enabled(is_train):
@@ -890,7 +951,17 @@ def run_epoch(
                     if is_train
                     else batch_targets.last_action
                 )
-                output = model(frames, prev_action=prev_action)
+                if use_streaming_state:
+                    initial_state = _streaming_initial_state(labels, targets, streaming_cache)
+                    output, next_state = model(
+                        frames,
+                        state=initial_state,
+                        return_aux=True,
+                        prev_action=prev_action,
+                    )
+                    _update_streaming_cache(labels, targets, next_state, streaming_cache, cfg)
+                else:
+                    output = model(frames, prev_action=prev_action)
                 loss, details = compute_losses(
                     output,
                     batch_targets,
@@ -1051,6 +1122,8 @@ def parse_args() -> TrainConfig:
     add("--flat-button-threshold", dest="button_threshold_from_pos_weight", action="store_false", default=None)
     add("--button-threshold-min", type=float, default=None)
     add("--button-threshold-max", type=float, default=None)
+    add("--streaming-state-training", dest="streaming_state_training", action="store_true", default=None)
+    add("--no-streaming-state-training", dest="streaming_state_training", action="store_false")
     add("--action-label-offset", type=int, default=None)
     add("--last-action-sequence-dropout", type=float, default=None)
     add("--last-action-key-dropout", type=float, default=None)
@@ -1082,6 +1155,10 @@ def parse_args() -> TrainConfig:
     add("--no-compile", dest="compile_model", action="store_false", default=None)
     add("--compile-mode", default=None)
     add("--dali-resize-mode", choices=["video_resize", "video_then_resize", "none"], default=None)
+    add("--dali-train-random-shuffle", dest="dali_train_random_shuffle", action="store_true", default=None)
+    add("--no-dali-train-random-shuffle", dest="dali_train_random_shuffle", action="store_false")
+    add("--dali-val-random-shuffle", dest="dali_val_random_shuffle", action="store_true", default=None)
+    add("--no-dali-val-random-shuffle", dest="dali_val_random_shuffle", action="store_false")
     add("--dali-read-ahead", dest="dali_read_ahead", action="store_true")
     add("--no-dali-read-ahead", dest="dali_read_ahead", action="store_false")
     add("--dali-dont-use-mmap", dest="dali_dont_use_mmap", action="store_true")
@@ -1132,6 +1209,7 @@ def parse_args() -> TrainConfig:
         "button_threshold_from_pos_weight",
         "button_threshold_min",
         "button_threshold_max",
+        "streaming_state_training",
         "action_label_offset",
         "last_action_sequence_dropout",
         "last_action_key_dropout",
@@ -1160,6 +1238,8 @@ def parse_args() -> TrainConfig:
         "compile_model",
         "compile_mode",
         "dali_resize_mode",
+        "dali_train_random_shuffle",
+        "dali_val_random_shuffle",
         "dali_read_ahead",
         "dali_dont_use_mmap",
         "dataset_cache_root",
@@ -1234,6 +1314,14 @@ def train() -> None:
     print(
         "Loss supervision:",
         f"frames={supervised_start}-{supervised_end}",
+    )
+    print(
+        "Streaming state training:",
+        f"enabled={bool(cfg.streaming_state_training)}",
+        f"requires_contiguous_chunks=True",
+        f"train_shuffle={bool(cfg.dali_train_random_shuffle)}",
+        f"train_stride={int(cfg.train_seq_stride)}",
+        f"seq_len={int(cfg.seq_len)}",
     )
     print(
         "Last action conditioning:",

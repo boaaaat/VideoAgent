@@ -13,12 +13,13 @@ from action_space import (
 )
 
 
-CNN_FEATURE_CHANNELS = 72
+SPATIAL_FEATURE_CHANNELS = 128
+TEMPORAL_HIDDEN_CHANNELS = 192
+CNN_FEATURE_CHANNELS = TEMPORAL_HIDDEN_CHANNELS
 POLICY_INPUT_CHANNELS = 3
-TEMPORAL_RNN_LAYERS = 1
+TEMPORAL_RNN_LAYERS = 2
 LAST_ACTION_EMBEDDING_DROPOUT = 0.25
 LAST_ACTION_FEATURE_SCALE = 1.0
-GROUP_NORM_GROUPS = 8
 DEFAULT_HORIZON_OFFSETS = (1, 2, 3, 5, 7, 10, 13, 16, 20, 24)
 
 
@@ -28,13 +29,6 @@ def _largest_valid_head_count(channels: int, requested_heads: int) -> int:
         if channels % heads == 0:
             return heads
     return 1
-
-
-def _group_norm(channels: int) -> nn.GroupNorm:
-    groups = max(1, min(int(GROUP_NORM_GROUPS), int(channels)))
-    while int(channels) % groups != 0:
-        groups -= 1
-    return nn.GroupNorm(groups, int(channels))
 
 
 def _default_horizon_offsets(prediction_horizon: int) -> Tuple[int, ...]:
@@ -64,12 +58,12 @@ class ModelConfig:
     key_names: Optional[List[str]] = None
     mouse_button_names: Optional[List[str]] = None
 
-    d_model: int = 64
+    d_model: int = 128
     spatial_dropout = 0.10
     head_dropout = 0.20
     zoneout = 0.10
 
-    pooling: Tuple[int, int] = (16, 16)
+    pooling: Tuple[int, int] = (7, 7)
 
     button_state_threshold: float = 0.5
     button_state_thresholds: Optional[Sequence[float]] = None
@@ -142,71 +136,79 @@ class TemporalState:
     previous_frame: Optional[torch.Tensor] = None
 
 
-class ResBlock(nn.Module):
-    """ Lightweight 2D Residual block for regularizing spatial primitives """
-    def __init__(self, channels: int, dropout: float = 0.1):
+class ResidualBlock(nn.Module):
+    """2D residual block used by the exact-width policy encoder."""
+
+    def __init__(self, channels: int, dropout: float = 0.0):
         super().__init__()
-        self.conv = nn.Sequential(
+        layers: List[nn.Module] = [
             nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
-            _group_norm(channels),
-            nn.ELU(inplace=True),
+            nn.BatchNorm2d(channels),
+            nn.SiLU(inplace=True),
             nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
-            _group_norm(channels),
-            nn.Dropout2d(dropout)
-        )
-        self.elu = nn.ELU(inplace=True)
+            nn.BatchNorm2d(channels),
+        ]
+        if dropout > 0.0:
+            layers.append(nn.Dropout2d(dropout))
+        self.conv = nn.Sequential(*layers)
+        self.act = nn.SiLU(inplace=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.elu(x + self.conv(x))
+        return self.act(x + self.conv(x))
 
 
 class CustomSpatialEncoder(nn.Module):
     """
-    Preserves /4 detail features and fuses them into /8 semantic features.
-    Outputs a feature map scale of [B, CNN_FEATURE_CHANNELS, H/8, W/8].
+    Exact-width residual CNN encoder.
+    Outputs [B, SPATIAL_FEATURE_CHANNELS, H/4, W/4] for square policy inputs.
     """
     def __init__(self, in_channels: int = 3, dropout: float = 0.2):
         super().__init__()
         self.stem = nn.Sequential(
-            nn.Conv2d(in_channels, 24, kernel_size=7, stride=2, padding=3, bias=False),  # /2
-            _group_norm(24),
-            nn.ELU(inplace=True),
+            nn.Conv2d(in_channels, 32, kernel_size=7, stride=2, padding=3, bias=False),  # /2
+            nn.BatchNorm2d(32),
+            nn.SiLU(inplace=True),
         )
         self.detail = nn.Sequential(
-            nn.Conv2d(24, 48, kernel_size=3, stride=2, padding=1, bias=False),          # /4
-            _group_norm(48),
-            nn.ELU(inplace=True),
-            ResBlock(48, dropout),
+            nn.Conv2d(32, 64, kernel_size=5, stride=2, padding=2, bias=False),           # /4
+            nn.BatchNorm2d(64),
+            nn.SiLU(inplace=True),
         )
-        self.semantic = nn.Sequential(
-            nn.Conv2d(48, CNN_FEATURE_CHANNELS, kernel_size=3, stride=2, padding=1, bias=False),          # /8
-            _group_norm(CNN_FEATURE_CHANNELS),
-            nn.ELU(inplace=True),
-            ResBlock(CNN_FEATURE_CHANNELS, dropout),
+        self.residual_blocks = nn.Sequential(
+            ResidualBlock(64, dropout),
+            ResidualBlock(64, dropout),
         )
-        self.detail_to_semantic = nn.Sequential(
-            nn.Conv2d(48, 48, kernel_size=3, stride=2, padding=1, bias=False),          # /4 -> /8
-            _group_norm(48),
-            nn.ELU(inplace=True),
-            ResBlock(48, dropout * 0.5),
-        )
-        self.fuse = nn.Sequential(
-            nn.Conv2d(CNN_FEATURE_CHANNELS + 48, CNN_FEATURE_CHANNELS, kernel_size=1, bias=False),
-            _group_norm(CNN_FEATURE_CHANNELS),
-            nn.ELU(inplace=True),
-            ResBlock(CNN_FEATURE_CHANNELS, dropout)
+        self.proj = nn.Sequential(
+            nn.Conv2d(64, SPATIAL_FEATURE_CHANNELS, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(SPATIAL_FEATURE_CHANNELS),
+            nn.SiLU(inplace=True),
         )
 
     def feature_stages(self, x: torch.Tensor) -> List[torch.Tensor]:
         stem = self.stem(x)
         detail = self.detail(stem)
-        semantic = self.semantic(detail)
-        detail_semantic = self.detail_to_semantic(detail)
-        fused = self.fuse(torch.cat([semantic, detail_semantic], dim=1))
-        return [stem, detail, semantic, fused]
+        residual = self.residual_blocks(detail)
+        projected = self.proj(residual)
+        return [stem, detail, residual, projected]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.feature_stages(x)[-1]
+
+
+class SpatialLayerNorm2d(nn.Module):
+    """LayerNorm-style normalization over each channel's spatial feature grid."""
+
+    def __init__(self, channels: int, eps: float = 1e-5):
+        super().__init__()
+        self.eps = float(eps)
+        self.weight = nn.Parameter(torch.ones(1, channels, 1, 1))
+        self.bias = nn.Parameter(torch.zeros(1, channels, 1, 1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        mean = x.mean(dim=(-2, -1), keepdim=True)
+        variance = x.var(dim=(-2, -1), unbiased=False, keepdim=True)
+        normalized = (x - mean) * torch.rsqrt(variance + self.eps)
+        return normalized * self.weight + self.bias
 
 
 class ConvGRUCell(nn.Module):
@@ -235,6 +237,16 @@ class ConvGRUCell(nn.Module):
             padding=padding,
             bias=True
         )
+        self.spatial_norm = SpatialLayerNorm2d(hidden_dim)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        nn.init.orthogonal_(self.gates_conv.weight)
+        nn.init.orthogonal_(self.candidate_conv.weight)
+        if self.gates_conv.bias is not None:
+            nn.init.zeros_(self.gates_conv.bias)
+        if self.candidate_conv.bias is not None:
+            nn.init.zeros_(self.candidate_conv.bias)
 
     def forward(self, x: torch.Tensor, h_prev: torch.Tensor) -> torch.Tensor:
         combined = torch.cat([x, h_prev], dim=1)
@@ -247,7 +259,8 @@ class ConvGRUCell(nn.Module):
         combined_candidate = torch.cat([x, r_gate * h_prev], dim=1)
         candidate = torch.tanh(self.candidate_conv(combined_candidate))
         
-        h_next = (1.0 - z_gate) * h_prev + z_gate * candidate
+        gru_output = (1.0 - z_gate) * h_prev + z_gate * candidate
+        h_next = self.spatial_norm(gru_output + h_prev)
         if self.zoneout <= 0.0:
             return h_next
         if self.training:
@@ -307,17 +320,23 @@ class DrivingVideoPolicy(nn.Module):
         self.spatial_encoder = CustomSpatialEncoder(in_channels=POLICY_INPUT_CHANNELS, dropout=cfg.spatial_dropout)
         
         # ConvGRU tracking state
-        self.feat_channels = CNN_FEATURE_CHANNELS
+        self.spatial_feat_channels = SPATIAL_FEATURE_CHANNELS
+        self.feat_channels = TEMPORAL_HIDDEN_CHANNELS
         self.temporal_rnns = nn.ModuleList(
             [
                 ConvGRUCell(
-                    input_dim=self.feat_channels,
+                    input_dim=self.spatial_feat_channels if layer_idx == 0 else self.feat_channels,
                     hidden_dim=self.feat_channels,
                     kernel_size=3,
                     zoneout=cfg.zoneout,
                 )
-                for _ in range(TEMPORAL_RNN_LAYERS)
+                for layer_idx in range(TEMPORAL_RNN_LAYERS)
             ]
+        )
+        self.temporal_spatial_fusion = (
+            nn.Identity()
+            if self.spatial_feat_channels == self.feat_channels
+            else nn.Conv2d(self.spatial_feat_channels, self.feat_channels, kernel_size=1, bias=False)
         )
         
         # Preserve a real fixed spatial grid for the classifier head.
@@ -409,7 +428,12 @@ class DrivingVideoPolicy(nn.Module):
             return self._initial_temporal_state(batch_size, height, width, device=device, dtype=dtype)
 
         hidden = state.hidden_state.to(device=device, dtype=dtype)
+        expected_single = (batch_size, self.feat_channels, height, width)
         if hidden.dim() == 4:
+            if tuple(hidden.shape) != expected_single:
+                raise ValueError(
+                    f"Expected temporal hidden state {expected_single}, got {tuple(hidden.shape)}."
+                )
             first = hidden
             remaining = self._initial_temporal_state(batch_size, height, width, device=device, dtype=dtype)[1:]
             return torch.cat([first.unsqueeze(0), remaining], dim=0)
@@ -417,6 +441,11 @@ class DrivingVideoPolicy(nn.Module):
             raise ValueError(f"Expected temporal hidden state [L,B,C,H,W], got {tuple(hidden.shape)}.")
         if hidden.size(0) != len(self.temporal_rnns):
             raise ValueError(f"Expected {len(self.temporal_rnns)} temporal layers, got {hidden.size(0)}.")
+        expected_stacked = (len(self.temporal_rnns), *expected_single)
+        if tuple(hidden.shape) != expected_stacked:
+            raise ValueError(
+                f"Expected temporal hidden state {expected_stacked}, got {tuple(hidden.shape)}."
+            )
         return hidden
 
     def _temporal_step(self, x_t: torch.Tensor, hidden_state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -514,8 +543,8 @@ class DrivingVideoPolicy(nn.Module):
         if x.is_cuda:
             x = x.contiguous(memory_format=torch.channels_last)
         spatial_feats = self.spatial_encoder(x)
-        _, cf, hf, wf = spatial_feats.shape
-        spatial_feats = spatial_feats.reshape(b, t, cf, hf, wf)
+        _, spatial_channels, hf, wf = spatial_feats.shape
+        spatial_feats = spatial_feats.reshape(b, t, spatial_channels, hf, wf)
         
         # 2. Temporal ConvGRU Rollout Loop
         h_t = self._prepare_temporal_state(
@@ -527,19 +556,17 @@ class DrivingVideoPolicy(nn.Module):
             dtype=spatial_feats.dtype,
         )
             
-        temporal_outputs = []
+        visual_steps = []
         for step in range(t):
-            temporal_feat, h_t = self._temporal_step(spatial_feats[:, step], h_t)
-            temporal_outputs.append(temporal_feat.unsqueeze(1))
-            
-        temporal_out = torch.cat(temporal_outputs, dim=1)  # [B, T, C_feat, H_feat, W_feat]
+            spatial_step = spatial_feats[:, step]
+            temporal_feat, h_t = self._temporal_step(spatial_step, h_t)
+            fused = temporal_feat + self.temporal_spatial_fusion(spatial_step)
+            pooled = self.pool(fused)
+            pooled_flat = pooled.reshape(b, -1)
+            visual_steps.append(self.fc_features(pooled_flat))
         
         # 3. Linear Downsampling for Classifier Heads
-        temporal_flat = temporal_out.reshape(b * t, cf, hf, wf)
-        pooled = self.pool(temporal_flat)
-        pooled_flat = pooled.reshape(pooled.shape[0], -1)
-        
-        visual_feat = self.fc_features(pooled_flat).reshape(b, t, self.cfg.d_model)
+        visual_feat = torch.stack(visual_steps, dim=1)
         action_feat = self._last_action_features(prev_action, b, t, device=frames.device, dtype=visual_feat.dtype)
         fc_out = self.head_fusion(torch.cat([visual_feat, action_feat], dim=-1))
         
@@ -555,6 +582,8 @@ class DrivingVideoPolicy(nn.Module):
                 for idx, offset in enumerate(self.cfg.prediction_horizon_offsets)
             },
         )
+        if return_aux:
+            return output, TemporalState(hidden_state=h_t.detach())
         return output
 
     def forward_step(
@@ -575,7 +604,7 @@ class DrivingVideoPolicy(nn.Module):
         if x.is_cuda:
             x = x.contiguous(memory_format=torch.channels_last)
         spatial_feat = self.spatial_encoder(x)
-        cf, hf, wf = spatial_feat.shape[1:]
+        _, hf, wf = spatial_feat.shape[1:]
 
         # 3. Evaluate a single temporal rollout transition step
         h_t = self._prepare_temporal_state(
@@ -588,9 +617,10 @@ class DrivingVideoPolicy(nn.Module):
         )
 
         temporal_feat, new_hidden = self._temporal_step(spatial_feat, h_t)
+        fused = temporal_feat + self.temporal_spatial_fusion(spatial_feat)
 
         # 4. Map the new hidden states through the learned spatial pooling layout
-        pooled = self.pool(temporal_feat)
+        pooled = self.pool(fused)
         pooled_flat = pooled.reshape(b, -1)
 
         visual_feat = self.fc_features(pooled_flat)
