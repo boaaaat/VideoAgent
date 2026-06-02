@@ -168,7 +168,7 @@ class CustomSpatialEncoder(nn.Module):
     def __init__(self, in_channels: int = 3, dropout: float = 0.2):
         super().__init__()
         self.stem = nn.Sequential(
-            nn.Conv2d(in_channels, 24, kernel_size=5, stride=2, padding=2, bias=False),  # /2
+            nn.Conv2d(in_channels, 24, kernel_size=7, stride=2, padding=3, bias=False),  # /2
             _group_norm(24),
             nn.ELU(inplace=True),
         )

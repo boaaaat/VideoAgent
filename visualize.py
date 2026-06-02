@@ -1195,7 +1195,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--no-trajectory",
         action="store_true",
         help="Disable the FSD-style policy trajectory overlay.",
-        default=False,
+        default=True,
     )
     parser.add_argument(
         "--no-real-trajectory",
