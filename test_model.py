@@ -153,7 +153,7 @@ def load_model_checkpoint(
     ]
     if load_result.missing_keys or bad_unexpected:
         raise RuntimeError(
-            "Checkpoint does not match the current frame-token policy model. "
+            "Checkpoint does not match the current CNN variable-grid policy model. "
             f"missing={load_result.missing_keys} unexpected={bad_unexpected}"
         )
     model.eval()
@@ -711,14 +711,13 @@ def main() -> None:
         f"checkpoint={checkpoint_path}",
         f"video={video_path}",
         f"game={cfg.selected_game}",
-        "architecture=fastvit_hybrid_frame_transformer",
-        f"fastvit_depth={cfg.fastvit_depth}",
-        f"fastvit_kernel={cfg.fastvit_kernel_size}",
+        "architecture=cnn_variable_grid_transformer",
         f"temporal_layers={cfg.temporal_layers}",
         f"temporal_context={cfg.temporal_context}",
-        "spatial_source=cnn_feature_grid",
-        f"recent_full_frames={cfg.recent_spatial_context}",
-        f"current_spatial_grid={cfg.pooling[0]}x{cfg.pooling[1]}",
+        "spatial_source=custom_cnn_feature_grid",
+        f"high_res_frames={cfg.high_res_spatial_context}",
+        f"high_res_grid={cfg.high_res_pooling[0]}x{cfg.high_res_pooling[1]}",
+        f"low_res_grid={cfg.low_res_pooling[0]}x{cfg.low_res_pooling[1]}",
         f"seq={cfg.seq_len}",
         f"horizon={cfg.prediction_horizon}",
         f"horizon_offsets={','.join(str(int(offset)) for offset in cfg.prediction_horizon_offsets)}",

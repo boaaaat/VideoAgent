@@ -1103,7 +1103,6 @@ def maybe_resume(
     cfg: TrainConfig,
     device: torch.device,
 ) -> Tuple[int, int, float]:
-    allowed_missing_prefixes = ("recent_visual_age_embed", "motion_", "visual_motion_")
     if not cfg.resume:
         return 0, 0, -1e9
     if cfg.resume_path is not None:
@@ -1118,11 +1117,7 @@ def maybe_resume(
         missing, unexpected = model.load_state_dict(state["model_state"], strict=False)
         missing_set = set(missing)
         unexpected_set = set(unexpected)
-        bad_missing = [
-            name
-            for name in missing
-            if not any(name == prefix or name.startswith(prefix) for prefix in allowed_missing_prefixes)
-        ]
+        bad_missing = list(missing)
         bad_unexpected = [
             name for name in unexpected if not is_legacy_learned_pooling_state_key(name)
         ]
@@ -1152,7 +1147,7 @@ def maybe_resume(
 
 
 def parse_args() -> TrainConfig:
-    parser = argparse.ArgumentParser(description="Train the FastViT + temporal Transformer behavioral cloning policy.")
+    parser = argparse.ArgumentParser(description="Train the CNN + variable-grid Transformer behavioral cloning policy.")
     add = parser.add_argument
     add("--data-root", default=None)
     add("--ckpt-dir", default=None)
@@ -1175,6 +1170,9 @@ def parse_args() -> TrainConfig:
     add("--temporal-context", type=int, default=None)
     add("--pooling", default=None, help="Average-pooled spatial grid size, e.g. 16,16 or 16x16.")
     add("--recent-spatial-context", type=int, default=None)
+    add("--high-res-spatial-context", type=int, default=None)
+    add("--high-res-pooling", default=None, help="Recent-frame spatial grid size, e.g. 5,5 or 5x5.")
+    add("--low-res-pooling", default=None, help="Older-frame spatial grid size, e.g. 3,3 or 3x3.")
     add("--train-seq-stride", type=int, default=None)
     add("--val-seq-stride", type=int, default=None)
     add("--target-effective-batch", type=int, default=None)
@@ -1266,6 +1264,9 @@ def parse_args() -> TrainConfig:
         "temporal_context",
         "pooling",
         "recent_spatial_context",
+        "high_res_spatial_context",
+        "high_res_pooling",
+        "low_res_pooling",
         "train_seq_stride",
         "val_seq_stride",
         "target_effective_batch",
@@ -1369,16 +1370,14 @@ def train() -> None:
     print(f"Training action keys: {', '.join(cfg.key_names + cfg.mouse_button_names)}")
     print(
         "Policy architecture:",
-        "fastvit_hybrid_frame_transformer",
-        f"fastvit_depth={cfg.fastvit_depth}",
-        f"fastvit_kernel={cfg.fastvit_kernel_size}",
+        "cnn_variable_grid_transformer",
         f"temporal_layers={cfg.temporal_layers}",
         f"temporal_heads={cfg.temporal_heads}",
         f"temporal_context={cfg.temporal_context}",
-        "spatial_source=cnn_feature_grid",
-        f"spatial_pooling={cfg.pooling[0]}x{cfg.pooling[1]}",
-        f"recent_full_frames={cfg.recent_spatial_context}",
-        f"current_spatial_grid={cfg.pooling[0]}x{cfg.pooling[1]}",
+        "spatial_source=custom_cnn_feature_grid",
+        f"high_res_frames={cfg.high_res_spatial_context}",
+        f"high_res_grid={cfg.high_res_pooling[0]}x{cfg.high_res_pooling[1]}",
+        f"low_res_grid={cfg.low_res_pooling[0]}x{cfg.low_res_pooling[1]}",
     )
     horizon_offsets = tuple(int(offset) for offset in cfg.prediction_horizon_offsets)
     first_horizon_offset = int(horizon_offsets[0])

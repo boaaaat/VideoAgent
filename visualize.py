@@ -158,6 +158,9 @@ def _coerce_config_types(cfg: ModelConfig) -> ModelConfig:
     cfg.temporal_context = max(1, int(cfg.temporal_context))
     cfg.pooling = normalize_pooling_shape(getattr(cfg, "pooling", (16, 16)))
     cfg.recent_spatial_context = max(1, int(getattr(cfg, "recent_spatial_context", 10)))
+    cfg.high_res_spatial_context = max(1, int(getattr(cfg, "high_res_spatial_context", 20)))
+    cfg.high_res_pooling = normalize_pooling_shape(getattr(cfg, "high_res_pooling", (5, 5)))
+    cfg.low_res_pooling = normalize_pooling_shape(getattr(cfg, "low_res_pooling", (3, 3)))
     cfg.num_bin = len(cfg.key_names) + len(cfg.mouse_button_names)
     return cfg
 
@@ -267,7 +270,7 @@ def load_model_from_checkpoint(
     ]
     if bad_missing or bad_unexpected:
         raise RuntimeError(
-            f"Policy checkpoint {ckpt_path} is incompatible with the current frame-token architecture. "
+            f"Policy checkpoint {ckpt_path} is incompatible with the current CNN variable-grid architecture. "
             "Train a fresh policy checkpoint or pass a matching checkpoint."
         )
 
@@ -416,7 +419,7 @@ def _compute_feature_map(
         if layer == "spatial":
             return stages[-1], current, policy_state
         if layer == "tokens":
-            return _policy_token_attention_heat_from_features(model, model.fastvit_mixer(stages[-1])), current, policy_state
+            return _policy_token_attention_heat_from_features(model, stages[-1]), current, policy_state
         raise ValueError(f"Unknown policy layer {layer!r}.")
 
     x, current = _inverse_encoder_input(frame_rgb, previous_frame_rgb)
@@ -697,7 +700,7 @@ def _policy_visuals_for_frame(
                 elif layer == "spatial":
                     feat = stages[-1]
                 elif layer == "tokens":
-                    feat = _policy_token_attention_heat_from_features(model, model.fastvit_mixer(stages[-1]))
+                    feat = _policy_token_attention_heat_from_features(model, stages[-1])
                 else:
                     raise ValueError(f"Unknown policy layer {layer!r}.")
 
@@ -1201,7 +1204,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="spatial",
         help=(
             "Encoder signal to visualize. Policy checkpoints use masked RGB input for motion, stage1-stage4 for "
-            "the spatial encoder blocks, final pre-FastViT features for spatial, and FastViT-mixed features for tokens. "
+            "the spatial encoder blocks, final CNN features for spatial, and projected CNN token energy for tokens. "
             "Inverse checkpoints support "
             "motion and stage1-stage4."
         ),

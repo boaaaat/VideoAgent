@@ -234,6 +234,9 @@ def _coerce_config_types(cfg: RuntimeConfig) -> RuntimeConfig:
     cfg.temporal_context = max(1, int(cfg.temporal_context))
     cfg.pooling = normalize_pooling_shape(getattr(cfg, "pooling", (16, 16)))
     cfg.recent_spatial_context = max(1, int(getattr(cfg, "recent_spatial_context", 10)))
+    cfg.high_res_spatial_context = max(1, int(getattr(cfg, "high_res_spatial_context", 20)))
+    cfg.high_res_pooling = normalize_pooling_shape(getattr(cfg, "high_res_pooling", (5, 5)))
+    cfg.low_res_pooling = normalize_pooling_shape(getattr(cfg, "low_res_pooling", (3, 3)))
     cfg.prediction_dt = float(cfg.prediction_dt)
     cfg.mouse_buttons_enabled = bool(cfg.mouse_buttons_enabled)
     cfg.num_bin = len(cfg.key_names) + len(cfg.mouse_button_names)
@@ -458,12 +461,7 @@ def main() -> None:
         missing, unexpected = model.load_state_dict(model_state, strict=False)
         missing_set = set(missing)
         unexpected_set = set(unexpected)
-        allowed_missing_prefixes = ("recent_visual_age_embed", "motion_", "visual_motion_")
-        bad_missing = [
-            name
-            for name in missing
-            if not any(name == prefix or name.startswith(prefix) for prefix in allowed_missing_prefixes)
-        ]
+        bad_missing = list(missing)
         bad_unexpected = [
             name for name in unexpected if not is_legacy_learned_pooling_state_key(name)
         ]
@@ -472,15 +470,10 @@ def main() -> None:
                 f"missing={sorted(bad_missing)} unexpected={sorted(bad_unexpected)}"
             )
         if missing_set:
-            with torch.no_grad():
-                if "recent_visual_age_embed" in missing_set:
-                    model.recent_visual_age_embed.zero_()
-            print(
-                "Checkpoint predates visual motion/age embeddings. Retrain to use the updated architecture."
-            )
+            raise RuntimeError(f"missing={sorted(missing_set)} unexpected={sorted(unexpected_set)}")
     except RuntimeError as exc:
         raise RuntimeError(
-            "Checkpoint is incompatible with the current frame-token policy architecture. "
+            "Checkpoint is incompatible with the current CNN variable-grid policy architecture. "
             "Train a fresh policy checkpoint before running realtime control."
         ) from exc
     print(
@@ -490,15 +483,13 @@ def main() -> None:
         f"command_horizon={cfg.command_horizon}",
         f"command_offset=+{int(cfg.prediction_horizon_offsets[cfg.command_horizon - 1])}",
         f"d_model={cfg.d_model}",
-        "architecture=fastvit_hybrid_frame_transformer",
-        f"fastvit_depth={cfg.fastvit_depth}",
-        f"fastvit_kernel={cfg.fastvit_kernel_size}",
+        "architecture=cnn_variable_grid_transformer",
         f"temporal_layers={cfg.temporal_layers}",
         f"temporal_context={cfg.temporal_context}",
-        "spatial_source=cnn_feature_grid",
-        f"spatial_pooling={cfg.pooling[0]}x{cfg.pooling[1]}",
-        f"recent_full_frames={cfg.recent_spatial_context}",
-        f"current_spatial_grid={cfg.pooling[0]}x{cfg.pooling[1]}",
+        "spatial_source=custom_cnn_feature_grid",
+        f"high_res_frames={cfg.high_res_spatial_context}",
+        f"high_res_grid={cfg.high_res_pooling[0]}x{cfg.high_res_pooling[1]}",
+        f"low_res_grid={cfg.low_res_pooling[0]}x{cfg.low_res_pooling[1]}",
         "input=masked_full_frame+gated_last_action",
     )
     print(
