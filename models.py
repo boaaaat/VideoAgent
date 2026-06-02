@@ -237,6 +237,7 @@ class ConvGRUCell(nn.Module):
             padding=padding,
             bias=True
         )
+        self.residual_scale = nn.Parameter(torch.tensor(0.10))
         self.spatial_norm = SpatialLayerNorm2d(hidden_dim)
         self.reset_parameters()
 
@@ -245,6 +246,7 @@ class ConvGRUCell(nn.Module):
         nn.init.orthogonal_(self.candidate_conv.weight)
         if self.gates_conv.bias is not None:
             nn.init.zeros_(self.gates_conv.bias)
+            nn.init.constant_(self.gates_conv.bias[self.hidden_dim:], 1.0)
         if self.candidate_conv.bias is not None:
             nn.init.zeros_(self.candidate_conv.bias)
 
@@ -260,7 +262,7 @@ class ConvGRUCell(nn.Module):
         candidate = torch.tanh(self.candidate_conv(combined_candidate))
         
         gru_output = (1.0 - z_gate) * h_prev + z_gate * candidate
-        h_next = self.spatial_norm(gru_output + h_prev)
+        h_next = self.spatial_norm(gru_output + self.residual_scale * h_prev)
         if self.zoneout <= 0.0:
             return h_next
         if self.training:

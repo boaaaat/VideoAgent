@@ -684,7 +684,8 @@ def _policy_visuals_for_frame(
                     feat = temporal_feat
 
                 if bool(need_trajectory):
-                    pooled = model.pool(temporal_feat)
+                    fused = temporal_feat + model.temporal_spatial_fusion(spatial_feat)
+                    pooled = model.pool(fused)
                     visual_feat = model.fc_features(pooled.reshape(b, -1))
                     if prev_action is None:
                         prev_for_head = torch.zeros((b, int(cfg.num_bin)), device=visual_feat.device, dtype=visual_feat.dtype)
@@ -1190,7 +1191,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fp16", action="store_true", help="Use fp16 autocast on CUDA instead of bf16.")
     parser.add_argument("--no-amp", action="store_true", help="Disable autocast during encoder inference.")
     parser.add_argument("--cpu", action="store_true", help="Force CPU execution.")
-    parser.add_argument("--max-frames", type=int, default=5000, help="Stop after this many frames.")
+    parser.add_argument("--max-frames", type=int, default=8000, help="Stop after this many frames.")
     parser.add_argument(
         "--no-trajectory",
         action="store_true",

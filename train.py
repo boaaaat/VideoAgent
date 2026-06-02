@@ -61,6 +61,7 @@ class TrainConfig(ModelConfig):
 
     button_loss_weight: float = 1.0
     streaming_state_training: bool = True
+    streaming_state_validation: bool = True
     streaming_segment_min_chunks: int = 2
     streaming_segment_max_chunks: int = 20
     action_label_offset: int = 0
@@ -141,6 +142,7 @@ class TrainConfig(ModelConfig):
         self.button_threshold_min = float(min(max(self.button_threshold_min, 0.0), 1.0))
         self.button_threshold_max = float(min(max(self.button_threshold_max, self.button_threshold_min), 1.0))
         self.streaming_state_training = bool(self.streaming_state_training)
+        self.streaming_state_validation = bool(self.streaming_state_validation)
         self.streaming_segment_min_chunks = max(1, int(self.streaming_segment_min_chunks))
         self.streaming_segment_max_chunks = max(self.streaming_segment_min_chunks, int(self.streaming_segment_max_chunks))
         self.grad_clip = max(0.0, float(self.grad_clip))
@@ -950,13 +952,14 @@ def _streaming_initial_state(
     targets: WindowTargets,
     cache: StreamingStateCache,
     reset_indices: Optional[set[int]] = None,
-) -> Optional[TemporalState]:
+) -> Tuple[Optional[TemporalState], int, int]:
     if targets.meta is None or not cache:
-        return None
+        return None, 0, int(labels.numel())
 
     reset_indices = reset_indices or set()
     sample_states: List[Optional[torch.Tensor]] = []
     template: Optional[torch.Tensor] = None
+    carried = 0
     for label_idx in _labels_to_indices(labels):
         video_path, start, _ = targets.meta[label_idx]
         video_cache = cache.get(video_path, {})
@@ -966,15 +969,17 @@ def _streaming_initial_state(
         sample_states.append(hidden)
         if hidden is not None and template is None:
             template = hidden
+        if hidden is not None:
+            carried += 1
 
     if template is None:
-        return None
+        return None, carried, len(sample_states)
 
     stacked = torch.stack(
         [hidden if hidden is not None else torch.zeros_like(template) for hidden in sample_states],
         dim=1,
     )
-    return TemporalState(hidden_state=stacked)
+    return TemporalState(hidden_state=stacked), carried, len(sample_states)
 
 
 def _update_streaming_cache(
@@ -1026,7 +1031,11 @@ def run_epoch(
     final_stats = BinaryStats(cfg.num_bin, device)
     steps = 0
     streaming_cache: StreamingStateCache = {}
-    use_streaming_state = bool(is_train and cfg.streaming_state_training)
+    use_streaming_state = bool(
+        cfg.streaming_state_training and (is_train or cfg.streaming_state_validation)
+    )
+    stream_carried = 0
+    stream_total = 0
 
     iterator_it = iter(iterator)
     pbar = tqdm(range(int(batches)), desc=desc, dynamic_ncols=True)
@@ -1042,7 +1051,14 @@ def run_epoch(
                     else batch_targets.last_action
                 )
                 if use_streaming_state:
-                    initial_state = _streaming_initial_state(labels, targets, streaming_cache, streaming_reset_indices)
+                    initial_state, carried, total = _streaming_initial_state(
+                        labels,
+                        targets,
+                        streaming_cache,
+                        streaming_reset_indices if is_train else None,
+                    )
+                    stream_carried += int(carried)
+                    stream_total += int(total)
                     output, next_state = model(
                         frames,
                         state=initial_state,
@@ -1090,12 +1106,13 @@ def run_epoch(
             detail_sums[name] += value.float()
         steps += 1
         if cfg.print_every and ((batch_idx + 1) % cfg.print_every == 0 or batch_idx + 1 == batches):
-            pbar.set_postfix(
-                {
-                    "loss": float((loss_sum / max(1, steps)).item()),
-                    "btn": float((detail_sums["button"] / max(1, steps)).item()),
-                }
-            )
+            postfix = {
+                "loss": float((loss_sum / max(1, steps)).item()),
+                "btn": float((detail_sums["button"] / max(1, steps)).item()),
+            }
+            if use_streaming_state:
+                postfix["carry"] = float(stream_carried / max(1, stream_total))
+            pbar.set_postfix(postfix)
     iterator.reset()
 
     step1 = step1_stats.compute()
@@ -1114,6 +1131,8 @@ def run_epoch(
         "step1_button_rows": binary_stats_rows(step1_stats, button_names),
         "final_button_rows": binary_stats_rows(final_stats, button_names),
     }
+    if use_streaming_state:
+        metrics["stream_state_carry_rate"] = float(stream_carried / max(1, stream_total))
     return metrics, global_step
 
 
@@ -1214,6 +1233,8 @@ def parse_args() -> TrainConfig:
     add("--button-threshold-max", type=float, default=None)
     add("--streaming-state-training", dest="streaming_state_training", action="store_true", default=None)
     add("--no-streaming-state-training", dest="streaming_state_training", action="store_false")
+    add("--streaming-state-validation", dest="streaming_state_validation", action="store_true", default=None)
+    add("--no-streaming-state-validation", dest="streaming_state_validation", action="store_false")
     add("--streaming-segment-min-chunks", type=int, default=None)
     add("--streaming-segment-max-chunks", type=int, default=None)
     add("--action-label-offset", type=int, default=None)
@@ -1302,6 +1323,7 @@ def parse_args() -> TrainConfig:
         "button_threshold_min",
         "button_threshold_max",
         "streaming_state_training",
+        "streaming_state_validation",
         "streaming_segment_min_chunks",
         "streaming_segment_max_chunks",
         "action_label_offset",
@@ -1412,6 +1434,7 @@ def train() -> None:
     print(
         "Streaming state training:",
         f"enabled={bool(cfg.streaming_state_training)}",
+        f"val_streaming={bool(cfg.streaming_state_validation)}",
         "shuffle=stream_segments" if cfg.streaming_state_training else f"train_shuffle={bool(cfg.dali_train_random_shuffle)}",
         f"segment_chunks={int(cfg.streaming_segment_min_chunks)}-{int(cfg.streaming_segment_max_chunks)}",
         f"train_stride={int(cfg.train_seq_stride)}",
@@ -1620,6 +1643,8 @@ def train() -> None:
             f"tr_loss={train_metrics['loss']:.4f}",
             f"tr_f1@+{first_horizon_offset}={train_metrics['step1_button_macro_f1']:.4f}",
         ]
+        if "stream_state_carry_rate" in train_metrics:
+            parts.append(f"tr_carry={train_metrics['stream_state_carry_rate']:.3f}")
         if int(cfg.prediction_horizon) > 1:
             parts.append(f"tr_f1@+{final_horizon_offset}={train_metrics['final_button_macro_f1']:.4f}")
         if val_metrics is not None:
@@ -1627,6 +1652,11 @@ def train() -> None:
                 [
                     f"va_loss={val_metrics['loss']:.4f}",
                     f"va_f1@+{first_horizon_offset}={val_metrics['step1_button_macro_f1']:.4f}",
+                    (
+                        f"va_carry={val_metrics['stream_state_carry_rate']:.3f}"
+                        if "stream_state_carry_rate" in val_metrics
+                        else ""
+                    ),
                     f"best={best_score:.4f}",
                     val_metrics["per_class_summary"],
                 ]
