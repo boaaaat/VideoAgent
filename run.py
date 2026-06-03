@@ -1,9 +1,8 @@
 import csv
-import os
 import sys
 import time
 import ctypes  # Added for high-res clock period adjustments
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -50,7 +49,7 @@ def disable_high_resolution_timer():
 @dataclass
 class RuntimeConfig(ModelConfig):
     ckpt_dir: str = "./checkpoints_rt"
-    ckpt_path: Optional[str] = r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\checkpoints_rt\model_latest.pt'
+    ckpt_path: Optional[str] = None
     pos_weight_power: float = 0.5
     pos_weight_clamp: float = 8.0
     button_threshold_from_pos_weight: bool = False
@@ -302,18 +301,27 @@ def _derive_button_thresholds_from_csv(cfg: RuntimeConfig) -> Optional[Tuple[flo
 def _apply_checkpoint_config(cfg: RuntimeConfig, overrides: Dict) -> RuntimeConfig:
     use_checkpoint_thresholds = bool(getattr(cfg, "use_checkpoint_button_thresholds", False))
     checkpoint_has_thresholds = use_checkpoint_thresholds and overrides.get("button_state_thresholds") is not None
-    threshold_keys = {
-        "button_state_threshold",
-        "button_state_thresholds",
-        "button_threshold_from_pos_weight",
-        "button_threshold_min",
-        "button_threshold_max",
-    }
-    for key, value in overrides.items():
-        if key in threshold_keys and not use_checkpoint_thresholds:
-            continue
-        if hasattr(cfg, key):
-            setattr(cfg, key, value)
+
+    model_fields = {field.name for field in fields(ModelConfig)}
+    runtime_fields = {field.name for field in fields(RuntimeConfig)} - model_fields
+    runtime_values = {key: getattr(cfg, key) for key in runtime_fields}
+    cfg_kwargs = {key: value for key, value in overrides.items() if key in model_fields}
+    if not use_checkpoint_thresholds:
+        key_names = cfg_kwargs.get("key_names", getattr(cfg, "key_names", []))
+        mouse_button_names = cfg_kwargs.get("mouse_button_names", getattr(cfg, "mouse_button_names", []))
+        expected_num_bin = len(key_names or []) + len(mouse_button_names or [])
+        runtime_thresholds = getattr(cfg, "button_state_thresholds", None)
+
+        cfg_kwargs.pop("button_state_threshold", None)
+        cfg_kwargs.pop("button_state_thresholds", None)
+        cfg_kwargs["button_state_threshold"] = float(getattr(cfg, "button_state_threshold", 0.5))
+        if runtime_thresholds is not None:
+            threshold_values = tuple(float(value) for value in runtime_thresholds)
+            if expected_num_bin > 0 and len(threshold_values) == expected_num_bin:
+                cfg_kwargs["button_state_thresholds"] = threshold_values
+    cfg_kwargs.update(runtime_values)
+
+    cfg = RuntimeConfig(**cfg_kwargs)
     cfg = _coerce_config_types(cfg)
     if not checkpoint_has_thresholds:
         derived = _derive_button_thresholds_from_csv(cfg)
@@ -322,19 +330,40 @@ def _apply_checkpoint_config(cfg: RuntimeConfig, overrides: Dict) -> RuntimeConf
     return cfg
 
 
+def _existing_path(path: str) -> Optional[Path]:
+    raw_path = Path(path).expanduser()
+    base_dir = Path(__file__).resolve().parent
+    candidates = [raw_path] if raw_path.is_absolute() else [Path.cwd() / raw_path, base_dir / raw_path]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+    return None
+
+
 def _checkpoint_path(cfg: RuntimeConfig) -> str:
     if cfg.ckpt_path is not None:
-        if not os.path.exists(cfg.ckpt_path):
+        resolved = _existing_path(cfg.ckpt_path)
+        if resolved is None:
             raise FileNotFoundError(f"Checkpoint not found: {cfg.ckpt_path}")
-        return cfg.ckpt_path
+        return str(resolved)
 
-    best_path = os.path.join(cfg.ckpt_dir, "model_best.pt")
-    if os.path.exists(best_path):
-        return best_path
-    latest_path = os.path.join(cfg.ckpt_dir, "model_latest.pt")
-    if os.path.exists(latest_path):
-        return latest_path
-    raise FileNotFoundError(f"Expected checkpoint at {best_path!r} or {latest_path!r}.")
+    ckpt_dir = _existing_path(cfg.ckpt_dir)
+    if ckpt_dir is None or not ckpt_dir.is_dir():
+        raise FileNotFoundError(f"Checkpoint directory not found: {cfg.ckpt_dir}")
+
+    candidates = [
+        ckpt_dir / "model_best.pt",
+        ckpt_dir / "model_latest.pt",
+    ]
+    epoch_candidates = sorted(
+        ckpt_dir.glob("model_epoch_*.pt"),
+        key=lambda path: path.stat().st_mtime,
+    )
+    candidates.extend(reversed(epoch_candidates))
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate.resolve())
+    raise FileNotFoundError(f"Expected checkpoint under {str(ckpt_dir)!r}.")
 
 
 def load_checkpoint(

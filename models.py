@@ -14,7 +14,7 @@ from action_space import (
 )
 
 
-SPATIAL_FEATURE_CHANNELS = 80
+SPATIAL_FEATURE_CHANNELS = 96
 CNN_FEATURE_CHANNELS = SPATIAL_FEATURE_CHANNELS
 POLICY_INPUT_CHANNELS = 3
 LAST_ACTION_EMBEDDING_DROPOUT = 0.25
@@ -108,20 +108,20 @@ class ModelConfig:
     key_names: Optional[List[str]] = None
     mouse_button_names: Optional[List[str]] = None
 
-    d_model: int = 256
+    d_model: int = 384
     spatial_dropout: float = 0.05
     head_dropout: float = 0.1
 
     fastvit_depth: int = 2
     fastvit_kernel_size: int = 3
-    temporal_layers: int = 4
-    temporal_heads: int = 4
+    temporal_layers: int = 6
+    temporal_heads: int = 8
     temporal_context: int = 80
 
     pooling: Tuple[int, int] = (16, 16)
     recent_spatial_context: int = 10
     high_res_spatial_context: int = 20
-    high_res_pooling: Tuple[int, int] = (5, 5)
+    high_res_pooling: Tuple[int, int] = (7, 7)
     low_res_pooling: Tuple[int, int] = (3, 3)
 
     button_state_threshold: float = 0.5
@@ -518,7 +518,7 @@ class DrivingVideoPolicy(nn.Module):
         tokens: torch.Tensor,
         dt: Optional[torch.Tensor],
         prev_action: Optional[torch.Tensor],
-        prev_action_scale: float = 1.0,
+        prev_action_scale: float = 0.6,
     ) -> torch.Tensor:
         if tokens.dim() != 4:
             raise ValueError(f"Expected tokens [B,T,K,D], got {tuple(tokens.shape)}.")
@@ -566,7 +566,7 @@ class DrivingVideoPolicy(nn.Module):
         frames: torch.Tensor,
         dt: Optional[torch.Tensor],
         prev_action: Optional[torch.Tensor],
-        prev_action_scale: float = 1.0,
+        prev_action_scale: float = 0.6,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         features = self._cnn_features_from_masked_frames(frames)
         low_tokens = self._tokens_from_features(
@@ -700,7 +700,7 @@ class DrivingVideoPolicy(nn.Module):
         self,
         frame_features: torch.Tensor,
         prev_action: Optional[torch.Tensor] = None,
-        persistence_scale: float = 1.0,
+        persistence_scale: float = 0.3,
     ) -> torch.Tensor:
         if frame_features.dim() == 2:
             frame_features = frame_features.unsqueeze(1)
@@ -736,7 +736,7 @@ class DrivingVideoPolicy(nn.Module):
         time_steps: int,
         device: torch.device,
         dtype: torch.dtype,
-        persistence_scale: float = 1.0,
+        persistence_scale: float = 0.3,
     ) -> torch.Tensor:
         if prev_action is None:
             action_values = torch.zeros((batch_size, time_steps, self.cfg.num_bin), device=device, dtype=dtype)
@@ -799,8 +799,8 @@ class DrivingVideoPolicy(nn.Module):
         state: Optional[TemporalState] = None,
         return_aux: bool = False,
         prev_action: Optional[torch.Tensor] = None,
-        prev_action_scale: float = 1.0,
-        persistence_scale: float = 1.0,
+        prev_action_scale: float = 0.6,
+        persistence_scale: float = 0.3,
     ):
         del return_aux
         if frames.dim() != 5:
@@ -849,8 +849,8 @@ class DrivingVideoPolicy(nn.Module):
         state: TemporalState,
         return_aux: bool = False,
         prev_action: Optional[torch.Tensor] = None,
-        prev_action_scale: float = 1.0,
-        persistence_scale: float = 1.0,
+        prev_action_scale: float = 0.6,
+        persistence_scale: float = 0.3,
     ):
         del return_aux
         if frame.dim() != 4 or int(frame.size(1)) != POLICY_INPUT_CHANNELS:
