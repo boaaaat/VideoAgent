@@ -368,11 +368,10 @@ def _checkpoint_path(cfg: RuntimeConfig) -> str:
 
 def load_checkpoint(
     cfg: RuntimeConfig,
-    device: torch.device,
 ) -> Tuple[RuntimeConfig, Dict]:
     ckpt_path = _checkpoint_path(cfg)
     print(f"Loading checkpoint: {ckpt_path}")
-    state = torch.load(ckpt_path, map_location=device)
+    state = torch.load(ckpt_path, map_location="cpu")
     if not isinstance(state, dict) or not isinstance(state.get("config"), dict) or not isinstance(state.get("model_state"), dict):
         raise RuntimeError("Current checkpoints must contain dict keys: config and model_state.")
 
@@ -477,15 +476,19 @@ def main() -> None:
         torch.backends.cudnn.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
         torch.set_float32_matmul_precision("high")
+        if hasattr(torch.backends.cuda, "enable_flash_sdp"):
+            torch.backends.cuda.enable_flash_sdp(True)
+        if hasattr(torch.backends.cuda, "enable_mem_efficient_sdp"):
+            torch.backends.cuda.enable_mem_efficient_sdp(True)
 
-    cfg, model_state = load_checkpoint(cfg, device)
+    cfg, model_state = load_checkpoint(cfg)
     
     # Custom sensitivity optimization overrides (Tweak these variables to adjust turning rules!)
     # w, a, s, d
     # cfg.button_state_thresholds = (0.50, 0.5, 0.4, 0.5)
     RUNTIME_CFG = cfg
 
-    model = DrivingVideoPolicy(cfg).to(device)
+    model = DrivingVideoPolicy(cfg)
     try:
         missing, unexpected = model.load_state_dict(model_state, strict=False)
         missing_set = set(missing)
@@ -505,6 +508,10 @@ def main() -> None:
             "Checkpoint is incompatible with the current CNN variable-grid policy architecture. "
             "Train a fresh policy checkpoint before running realtime control."
         ) from exc
+    del model_state
+    model = model.to(device)
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
     print(
         "Model:",
         f"size={cfg.model_size}",
@@ -534,7 +541,19 @@ def main() -> None:
         f"buttons_enabled={cfg.mouse_buttons_enabled}",
     )
 
+    use_autocast = False
     inference_dtype = torch.float32
+    if device.type == "cuda":
+        if bool(getattr(torch.cuda, "is_bf16_supported", lambda: False)()):
+            inference_dtype = torch.bfloat16
+        else:
+            inference_dtype = torch.float16
+        use_autocast = True
+    print(
+        "Inference precision:",
+        f"dtype={inference_dtype}",
+        f"autocast={use_autocast}",
+    )
 
     model.eval()
     controller = ActionController(cfg)
@@ -573,12 +592,17 @@ def main() -> None:
                     with torch.inference_mode():
                         frame_batch = frame.unsqueeze(0)
                         dt = torch.tensor([float(cfg.prediction_dt)], device=device, dtype=frame_batch.dtype)
-                        output, temporal_state = model.forward_step(
-                            frame_batch,
-                            dt,
-                            temporal_state,
-                            prev_action=prev_action,
-                        )
+                        with torch.amp.autocast(
+                            device_type=device.type,
+                            dtype=inference_dtype,
+                            enabled=use_autocast,
+                        ):
+                            output, temporal_state = model.forward_step(
+                                frame_batch,
+                                dt,
+                                temporal_state,
+                                prev_action=prev_action,
+                            )
                         button_logits = output.horizon_button_logits
                     command_idx = max(0, min(int(cfg.command_horizon) - 1, int(cfg.prediction_horizon) - 1))
                     button_probs = torch.sigmoid(button_logits[0, command_idx])

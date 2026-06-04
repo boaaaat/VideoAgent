@@ -14,7 +14,7 @@ from action_space import (
 )
 
 
-SPATIAL_FEATURE_CHANNELS = 96
+SPATIAL_FEATURE_CHANNELS = 128
 CNN_FEATURE_CHANNELS = SPATIAL_FEATURE_CHANNELS
 POLICY_INPUT_CHANNELS = 3
 LAST_ACTION_EMBEDDING_DROPOUT = 0.25
@@ -121,7 +121,7 @@ class ModelConfig:
     pooling: Tuple[int, int] = (16, 16)
     recent_spatial_context: int = 10
     high_res_spatial_context: int = 20
-    high_res_pooling: Tuple[int, int] = (7, 7)
+    high_res_pooling: Tuple[int, int] = (16, 16)
     low_res_pooling: Tuple[int, int] = (3, 3)
 
     button_state_threshold: float = 0.5
@@ -290,8 +290,8 @@ class DrivingVideoPolicy(nn.Module):
         nn.init.normal_(self.spatial_coord_projector.weight, mean=0.0, std=0.02)
         nn.init.zeros_(self.spatial_coord_projector.bias)
 
-        self.low_res_token_embed = nn.Parameter(torch.empty(1, 1, 1, self.cfg.d_model))
-        self.high_res_token_embed = nn.Parameter(torch.empty(1, 1, 1, self.cfg.d_model))
+        self.low_res_token_embed = nn.Parameter(torch.empty(self.cfg.d_model))
+        self.high_res_token_embed = nn.Parameter(torch.empty(self.cfg.d_model))
         nn.init.normal_(self.low_res_token_embed, mean=0.0, std=0.02)
         nn.init.normal_(self.high_res_token_embed, mean=0.0, std=0.02)
 
@@ -367,6 +367,15 @@ class DrivingVideoPolicy(nn.Module):
         final_button_layer = self.button_head[-1]
         if isinstance(final_button_layer, nn.Linear):
             nn.init.zeros_(final_button_layer.bias)
+
+    def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
+        if isinstance(state_dict, dict):
+            state_dict = dict(state_dict)
+            for name in ("low_res_token_embed", "high_res_token_embed"):
+                value = state_dict.get(name)
+                if isinstance(value, torch.Tensor) and tuple(value.shape) == (1, 1, 1, self.cfg.d_model):
+                    state_dict[name] = value.reshape(self.cfg.d_model)
+        return super().load_state_dict(state_dict, strict=strict, assign=assign)
 
     def _max_context_tokens(self) -> int:
         return int(self.cfg.temporal_context)
@@ -557,9 +566,10 @@ class DrivingVideoPolicy(nn.Module):
         b, t, c, h, w = features.shape
         pool_h, pool_w = normalize_pooling_shape(pool_shape)
         flat = features.reshape(b * t, c, h, w)
-        pooled = F.adaptive_avg_pool2d(flat, (pool_h, pool_w))
+        pooled = F.adaptive_max_pool2d(flat, (pool_h, pool_w))
         tokens = self._project_spatial_features(pooled).reshape(b, t, pool_h * pool_w, self.cfg.d_model)
-        return tokens + token_embed.to(device=tokens.device, dtype=tokens.dtype)
+        token_embed = token_embed.to(device=tokens.device, dtype=tokens.dtype).view(1, 1, 1, self.cfg.d_model)
+        return tokens + token_embed
 
     def _token_grids_from_masked_frames(
         self,
@@ -587,7 +597,7 @@ class DrivingVideoPolicy(nn.Module):
         features = self._cnn_features_from_masked_frames(frames)
         b, t, c, h, w = features.shape
         pool_h, pool_w = self._high_res_pool_shape()
-        pooled = F.adaptive_avg_pool2d(features.reshape(b * t, c, h, w), (pool_h, pool_w))
+        pooled = F.adaptive_max_pool2d(features.reshape(b * t, c, h, w), (pool_h, pool_w))
         tokens = self._project_spatial_features(pooled)
         return tokens.reshape(b, t, pool_h * pool_w, self.cfg.d_model)
 
