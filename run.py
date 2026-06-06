@@ -1,4 +1,3 @@
-import csv
 import sys
 import time
 import ctypes  # Added for high-res clock period adjustments
@@ -18,11 +17,12 @@ from pynput import keyboard
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from models import (  # noqa: E402
+    ARCHITECTURE_VERSION,
+    MODEL_FAMILY,
     DrivingVideoPolicy,
     ModelConfig,
     TemporalState,
-    is_legacy_learned_pooling_state_key,
-    normalize_pooling_shape,
+    validate_policy_checkpoint,
 )
 
 pdi.FAILSAFE = True
@@ -48,14 +48,8 @@ def disable_high_resolution_timer():
 
 @dataclass
 class RuntimeConfig(ModelConfig):
-    ckpt_dir: str = "./checkpoints_rt"
+    ckpt_dir: str = "./checkpoints_multihorizon"
     ckpt_path: Optional[str] = None
-    pos_weight_power: float = 0.5
-    pos_weight_clamp: float = 8.0
-    button_threshold_from_pos_weight: bool = False
-    button_threshold_min: float = 0.5  # Lowered to help sensitivity sliders
-    button_threshold_max: float = 0.9
-    use_checkpoint_button_thresholds: bool = False
 
     decision_interval: float = 1.0 / 20.0
     command_horizon: int = 1
@@ -68,12 +62,6 @@ class RuntimeConfig(ModelConfig):
         super().__post_init__()
         self.decision_interval = float(self.decision_interval)
         self.command_horizon = max(1, int(self.command_horizon))
-        self.pos_weight_power = max(0.0, float(self.pos_weight_power))
-        self.pos_weight_clamp = max(1.0, float(self.pos_weight_clamp))
-        self.button_threshold_from_pos_weight = bool(self.button_threshold_from_pos_weight)
-        self.use_checkpoint_button_thresholds = bool(self.use_checkpoint_button_thresholds)
-        self.button_threshold_min = float(np.clip(float(self.button_threshold_min), 0.0, 1.0))
-        self.button_threshold_max = float(np.clip(float(self.button_threshold_max), self.button_threshold_min, 1.0))
         self.mouse_buttons_enabled = bool(self.mouse_buttons_enabled)
 
 
@@ -83,16 +71,22 @@ MOUSE_NAME_MAP = {
     "right_click": "right",
     "middle_click": "middle",
 }
+SCROLL_ACTIONS = {
+    "scroll_up": 1,
+    "scroll_down": -1,
+}
 
 
 def release_all() -> None:
     for key_name in RUNTIME_CFG.key_names:
         mapped = key_name.split(".", 1)[1] if key_name.startswith("Key.") else key_name
         pdi.keyUp(mapped, _pause=False)
+        button_states[key_name] = False
     for button_name in RUNTIME_CFG.mouse_button_names:
         mapped = MOUSE_NAME_MAP.get(button_name)
         if mapped is not None:
             pdi.mouseUp(button=mapped, _pause=False)
+        button_states[button_name] = False
 
 
 def on_press(key) -> None:
@@ -203,131 +197,19 @@ def capture_frame(cfg: RuntimeConfig) -> Optional[torch.Tensor]:
 
 
 def _coerce_config_types(cfg: RuntimeConfig) -> RuntimeConfig:
-    cfg.seq_len = int(cfg.seq_len)
-    cfg.train_seq_stride = int(cfg.train_seq_stride)
-    cfg.val_seq_stride = int(cfg.val_seq_stride)
-    cfg.model_size = int(cfg.model_size)
-    cfg.prediction_horizon = int(cfg.prediction_horizon)
-    offsets = getattr(cfg, "prediction_horizon_offsets", None)
-    if offsets is None:
-        cfg.prediction_horizon_offsets = tuple(range(1, cfg.prediction_horizon + 1))
-    else:
-        cfg.prediction_horizon_offsets = tuple(int(offset) for offset in offsets)
-        if not cfg.prediction_horizon_offsets:
-            cfg.prediction_horizon_offsets = tuple(range(1, cfg.prediction_horizon + 1))
-        if any(offset <= 0 for offset in cfg.prediction_horizon_offsets):
-            raise ValueError(f"prediction_horizon_offsets must be positive, got {cfg.prediction_horizon_offsets}.")
-        if any(curr <= prev for prev, curr in zip(cfg.prediction_horizon_offsets, cfg.prediction_horizon_offsets[1:])):
-            raise ValueError(
-                f"prediction_horizon_offsets must be strictly increasing, got {cfg.prediction_horizon_offsets}."
-            )
-        cfg.prediction_horizon = len(cfg.prediction_horizon_offsets)
     cfg.command_horizon = max(1, min(int(cfg.command_horizon), int(cfg.prediction_horizon)))
-    cfg.d_model = int(cfg.d_model)
-    cfg.fastvit_depth = max(0, int(cfg.fastvit_depth))
-    cfg.fastvit_kernel_size = max(3, int(cfg.fastvit_kernel_size))
-    if cfg.fastvit_kernel_size % 2 == 0:
-        cfg.fastvit_kernel_size += 1
-    cfg.temporal_layers = max(1, int(cfg.temporal_layers))
-    cfg.temporal_heads = max(1, int(cfg.temporal_heads))
-    cfg.temporal_context = max(1, int(cfg.temporal_context))
-    cfg.pooling = normalize_pooling_shape(getattr(cfg, "pooling", (16, 16)))
-    cfg.recent_spatial_context = max(1, int(getattr(cfg, "recent_spatial_context", 10)))
-    cfg.high_res_spatial_context = max(1, int(getattr(cfg, "high_res_spatial_context", 20)))
-    cfg.high_res_pooling = normalize_pooling_shape(getattr(cfg, "high_res_pooling", (5, 5)))
-    cfg.low_res_pooling = normalize_pooling_shape(getattr(cfg, "low_res_pooling", (3, 3)))
-    cfg.prediction_dt = float(cfg.prediction_dt)
+    cfg.decision_interval = max(0.0, float(cfg.decision_interval))
     cfg.mouse_buttons_enabled = bool(cfg.mouse_buttons_enabled)
-    cfg.num_bin = len(cfg.key_names) + len(cfg.mouse_button_names)
-    cfg.button_state_threshold = float(np.clip(float(cfg.button_state_threshold), 0.0, 1.0))
-    cfg.use_checkpoint_button_thresholds = bool(getattr(cfg, "use_checkpoint_button_thresholds", False))
-    
-    if cfg.button_state_thresholds is None:
-        cfg.button_state_thresholds = tuple(float(cfg.button_state_threshold) for _ in range(cfg.num_bin))
-    else:
-        thresholds = tuple(float(np.clip(float(x), 0.0, 1.0)) for x in cfg.button_state_thresholds)
-        if len(thresholds) != cfg.num_bin:
-            thresholds = tuple(float(cfg.button_state_threshold) for _ in range(cfg.num_bin))
-        # FIX 2: Removed hardcoded (0.5, 0.5, 0.5, 0.3) line to support custom decision configurations
-        cfg.button_state_thresholds = thresholds
     return cfg
 
 
-def _thresholds_from_counts(pos: np.ndarray, total: int, cfg: RuntimeConfig) -> Tuple[float, ...]:
-    if total <= 0 or not bool(cfg.button_threshold_from_pos_weight):
-        return tuple(float(cfg.button_state_threshold) for _ in range(cfg.num_bin))
-    neg = np.maximum(float(total) - pos.astype(np.float64), 0.0)
-    weights = np.power(neg / np.maximum(pos.astype(np.float64), 1.0), float(cfg.pos_weight_power))
-    weights = np.clip(weights, 1.0, float(cfg.pos_weight_clamp))
-    thresholds = weights / (weights + 1.0)
-    thresholds = np.clip(thresholds, float(cfg.button_threshold_min), float(cfg.button_threshold_max))
-    return tuple(float(x) for x in thresholds)
-
-
-def _derive_button_thresholds_from_csv(cfg: RuntimeConfig) -> Optional[Tuple[float, ...]]:
-    roots = []
-    if cfg.data_root:
-        roots.append(Path(str(cfg.data_root)))
-    roots.append(Path(__file__).resolve().parent / "data" / str(cfg.selected_game))
-
-    names = list(cfg.key_names) + list(cfg.mouse_button_names)
-    pos = np.zeros(len(names), dtype=np.float64)
-    total = 0
-    seen_paths = set()
-    for root in roots:
-        if not root.exists():
-            continue
-        for csv_path in root.glob(f"*{cfg.csv_ext}"):
-            resolved = str(csv_path.resolve())
-            if resolved in seen_paths:
-                continue
-            seen_paths.add(resolved)
-            with csv_path.open("r", newline="", encoding="utf-8") as handle:
-                reader = csv.DictReader(handle)
-                if reader.fieldnames is None or any(name not in reader.fieldnames for name in names):
-                    continue
-                for row in reader:
-                    total += 1
-                    for idx, name in enumerate(names):
-                        try:
-                            pos[idx] += 1.0 if float(row.get(name, 0.0)) > 0.5 else 0.0
-                        except (TypeError, ValueError):
-                            pass
-    if total <= 0:
-        return None
-    return _thresholds_from_counts(pos, total, cfg)
-
-
 def _apply_checkpoint_config(cfg: RuntimeConfig, overrides: Dict) -> RuntimeConfig:
-    use_checkpoint_thresholds = bool(getattr(cfg, "use_checkpoint_button_thresholds", False))
-    checkpoint_has_thresholds = use_checkpoint_thresholds and overrides.get("button_state_thresholds") is not None
-
     model_fields = {field.name for field in fields(ModelConfig)}
     runtime_fields = {field.name for field in fields(RuntimeConfig)} - model_fields
     runtime_values = {key: getattr(cfg, key) for key in runtime_fields}
     cfg_kwargs = {key: value for key, value in overrides.items() if key in model_fields}
-    if not use_checkpoint_thresholds:
-        key_names = cfg_kwargs.get("key_names", getattr(cfg, "key_names", []))
-        mouse_button_names = cfg_kwargs.get("mouse_button_names", getattr(cfg, "mouse_button_names", []))
-        expected_num_bin = len(key_names or []) + len(mouse_button_names or [])
-        runtime_thresholds = getattr(cfg, "button_state_thresholds", None)
-
-        cfg_kwargs.pop("button_state_threshold", None)
-        cfg_kwargs.pop("button_state_thresholds", None)
-        cfg_kwargs["button_state_threshold"] = float(getattr(cfg, "button_state_threshold", 0.5))
-        if runtime_thresholds is not None:
-            threshold_values = tuple(float(value) for value in runtime_thresholds)
-            if expected_num_bin > 0 and len(threshold_values) == expected_num_bin:
-                cfg_kwargs["button_state_thresholds"] = threshold_values
     cfg_kwargs.update(runtime_values)
-
-    cfg = RuntimeConfig(**cfg_kwargs)
-    cfg = _coerce_config_types(cfg)
-    if not checkpoint_has_thresholds:
-        derived = _derive_button_thresholds_from_csv(cfg)
-        if derived is not None:
-            cfg.button_state_thresholds = derived
-    return cfg
+    return _coerce_config_types(RuntimeConfig(**cfg_kwargs))
 
 
 def _existing_path(path: str) -> Optional[Path]:
@@ -374,15 +256,15 @@ def load_checkpoint(
     state = torch.load(ckpt_path, map_location="cpu")
     if not isinstance(state, dict) or not isinstance(state.get("config"), dict) or not isinstance(state.get("model_state"), dict):
         raise RuntimeError("Current checkpoints must contain dict keys: config and model_state.")
+    if state.get("model_family") != MODEL_FAMILY or int(state.get("architecture_version", -1)) != ARCHITECTURE_VERSION:
+        raise RuntimeError(f"Checkpoint must be {MODEL_FAMILY} v{ARCHITECTURE_VERSION}; legacy checkpoints are unsupported.")
 
     checkpoint_config = dict(state["config"])
-    model_state = state["model_state"]
-
     cfg = _apply_checkpoint_config(cfg, checkpoint_config)
-    cfg = _coerce_config_types(cfg)
+    validate_policy_checkpoint(state, cfg)
     cfg.ckpt_path = ckpt_path
     print(f"Checkpoint: epoch={state.get('epoch')} step={state.get('global_step')} best={state.get('best_score')}")
-    return cfg, model_state
+    return cfg, state["ema_model_state"]
 
 
 class ActionController:
@@ -393,7 +275,11 @@ class ActionController:
         self.last_print_step = 0
         self.key_name_map = {name: (name.split(".", 1)[1] if name.startswith("Key.") else name) for name in cfg.key_names}
         self.mouse_name_map = dict(MOUSE_NAME_MAP)
-        unsupported_buttons = [name for name in cfg.mouse_button_names if name not in self.mouse_name_map]
+        unsupported_buttons = [
+            name
+            for name in cfg.mouse_button_names
+            if name not in self.mouse_name_map and name not in SCROLL_ACTIONS
+        ]
         if unsupported_buttons:
             raise ValueError(f"Unsupported runtime mouse buttons: {unsupported_buttons}")
         button_states.clear()
@@ -418,6 +304,11 @@ class ActionController:
             button_states[key_name] = False
 
     def _set_mouse_button_state(self, button_name: str, should_press: bool) -> None:
+        if button_name in SCROLL_ACTIONS:
+            if should_press and not button_states[button_name]:
+                pdi.scroll(SCROLL_ACTIONS[button_name], _pause=False)
+            button_states[button_name] = should_press
+            return
         mapped = self.mouse_name_map[button_name]
         if should_press and not button_states[button_name]:
             pdi.mouseDown(button=mapped, _pause=False)
@@ -482,34 +373,17 @@ def main() -> None:
             torch.backends.cuda.enable_mem_efficient_sdp(True)
 
     cfg, model_state = load_checkpoint(cfg)
-    
-    # Custom sensitivity optimization overrides (Tweak these variables to adjust turning rules!)
-    # w, a, s, d
-    # cfg.button_state_thresholds = (0.50, 0.5, 0.4, 0.5)
     RUNTIME_CFG = cfg
 
     model = DrivingVideoPolicy(cfg)
     try:
-        missing, unexpected = model.load_state_dict(model_state, strict=False)
-        missing_set = set(missing)
-        unexpected_set = set(unexpected)
-        bad_missing = list(missing)
-        bad_unexpected = [
-            name for name in unexpected if not is_legacy_learned_pooling_state_key(name)
-        ]
-        if bad_missing or bad_unexpected:
-            raise RuntimeError(
-                f"missing={sorted(bad_missing)} unexpected={sorted(bad_unexpected)}"
-            )
-        if missing_set:
-            raise RuntimeError(f"missing={sorted(missing_set)} unexpected={sorted(unexpected_set)}")
+        model.load_state_dict(model_state, strict=True)
     except RuntimeError as exc:
         raise RuntimeError(
-            "Checkpoint is incompatible with the current CNN variable-grid policy architecture. "
-            "Train a fresh policy checkpoint before running realtime control."
+            f"Checkpoint is incompatible with {MODEL_FAMILY} v{ARCHITECTURE_VERSION}."
         ) from exc
     del model_state
-    model = model.to(device)
+    model = model.to(device).to(memory_format=torch.channels_last)
     if device.type == "cuda":
         torch.cuda.empty_cache()
     print(
@@ -517,23 +391,24 @@ def main() -> None:
         f"size={cfg.model_size}",
         f"horizon={cfg.prediction_horizon}",
         f"command_horizon={cfg.command_horizon}",
-        f"command_offset=+{int(cfg.prediction_horizon_offsets[cfg.command_horizon - 1])}",
+        f"command_frame_offset=+{int(cfg.prediction_horizon_offsets[cfg.command_horizon - 1])}",
+        f"action_label_offset={int(cfg.action_label_offset):+d}",
+        f"effective_target_offset=+{int(cfg.prediction_horizon_offsets[cfg.command_horizon - 1]) + int(cfg.action_label_offset)}",
         f"d_model={cfg.d_model}",
-        "architecture=cnn_variable_grid_transformer",
+        f"architecture={MODEL_FAMILY}_v{ARCHITECTURE_VERSION}",
+        f"spatial_gru={cfg.spatial_channels}@{cfg.model_size // 16}x{cfg.model_size // 16}",
+        f"spatial_queries={cfg.spatial_query_count}",
         f"temporal_layers={cfg.temporal_layers}",
         f"temporal_context={cfg.temporal_context}",
-        "spatial_source=custom_cnn_feature_grid",
-        f"high_res_frames={cfg.high_res_spatial_context}",
-        f"high_res_grid={cfg.high_res_pooling[0]}x{cfg.high_res_pooling[1]}",
-        f"low_res_grid={cfg.low_res_pooling[0]}x{cfg.low_res_pooling[1]}",
-        "input=masked_full_frame+gated_last_action",
+        "input=masked_rgb+frame_difference+learned_action_context",
     )
+    command_idx = max(0, min(int(cfg.command_horizon) - 1, int(cfg.prediction_horizon) - 1))
+    command_thresholds = tuple(float(value) for value in cfg.horizon_button_thresholds[command_idx])
     print(
-        "Button thresholds:",
-        f"use_checkpoint={cfg.use_checkpoint_button_thresholds}",
+        f"Button thresholds @+{int(cfg.prediction_horizon_offsets[command_idx]) + int(cfg.action_label_offset)}:",
         " ".join(
             f"{name}={threshold:.3f}"
-            for name, threshold in zip(cfg.key_names + cfg.mouse_button_names, cfg.button_state_thresholds)
+            for name, threshold in zip(cfg.key_names + cfg.mouse_button_names, command_thresholds)
         ),
     )
     print(
@@ -560,6 +435,7 @@ def main() -> None:
 
     temporal_state = TemporalState()
     prev_action = torch.zeros((1, cfg.num_bin), device=device, dtype=inference_dtype)
+    last_frame_time: Optional[float] = None
     was_autopilot = False
 
     print("=" * 60)
@@ -573,11 +449,13 @@ def main() -> None:
             if autopilot and not was_autopilot:
                 temporal_state = TemporalState()
                 prev_action = torch.zeros((1, cfg.num_bin), device=device, dtype=inference_dtype)
+                last_frame_time = None
                 print("Autopilot ENABLED - temporal state reset")
 
             if (not autopilot) and was_autopilot:
                 temporal_state = TemporalState()
                 prev_action = torch.zeros((1, cfg.num_bin), device=device, dtype=inference_dtype)
+                last_frame_time = None
                 release_all()
                 print("Autopilot DISABLED - temporal state reset")
 
@@ -586,12 +464,16 @@ def main() -> None:
             if autopilot:
                 frame_cpu = capture_frame(cfg)
                 if frame_cpu is not None:
+                    frame_time = time.perf_counter()
+                    frame_dt = float(cfg.prediction_dt) if last_frame_time is None else frame_time - last_frame_time
+                    last_frame_time = frame_time
+                    frame_dt = min(max(frame_dt, 1.0 / 240.0), 0.5)
                     frame = frame_cpu.to(device, non_blocking=True)
                     if frame.dtype != inference_dtype:
                         frame = frame.to(dtype=inference_dtype)
                     with torch.inference_mode():
                         frame_batch = frame.unsqueeze(0)
-                        dt = torch.tensor([float(cfg.prediction_dt)], device=device, dtype=frame_batch.dtype)
+                        dt = torch.tensor([frame_dt], device=device, dtype=frame_batch.dtype)
                         with torch.amp.autocast(
                             device_type=device.type,
                             dtype=inference_dtype,
@@ -604,10 +486,9 @@ def main() -> None:
                                 prev_action=prev_action,
                             )
                         button_logits = output.horizon_button_logits
-                    command_idx = max(0, min(int(cfg.command_horizon) - 1, int(cfg.prediction_horizon) - 1))
                     button_probs = torch.sigmoid(button_logits[0, command_idx])
                     thresholds = torch.tensor(
-                        list(cfg.button_state_thresholds),
+                        list(command_thresholds),
                         device=button_probs.device,
                         dtype=button_probs.dtype,
                     )

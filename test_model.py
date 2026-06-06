@@ -12,10 +12,13 @@ import torch
 from tqdm.auto import tqdm
 
 from models import (
+    ARCHITECTURE_VERSION,
+    BURN_IN_FRAMES,
+    MODEL_FAMILY,
     DrivingVideoPolicy,
     ModelConfig,
     TemporalState,
-    is_legacy_learned_pooling_state_key,
+    validate_policy_checkpoint,
 )
 
 
@@ -126,38 +129,26 @@ def _default_video(data_root: str, video_ext: str) -> str:
 def load_model_checkpoint(
     checkpoint_path: str,
     device: torch.device,
-    *,
-    use_checkpoint_thresholds: bool,
-) -> Tuple[torch.nn.Module, ModelConfig, Dict[str, object]]:
+) -> Tuple[torch.nn.Module, ModelConfig]:
     state = torch.load(checkpoint_path, map_location=device)
     if not isinstance(state, dict) or not isinstance(state.get("config"), dict):
         raise RuntimeError("Checkpoint must contain a config dict.")
     if not isinstance(state.get("model_state"), dict):
         raise RuntimeError("Checkpoint must contain a model_state dict.")
+    if state.get("model_family") != MODEL_FAMILY or int(state.get("architecture_version", -1)) != ARCHITECTURE_VERSION:
+        raise RuntimeError(f"Checkpoint must be {MODEL_FAMILY} v{ARCHITECTURE_VERSION}.")
 
     config_dict = dict(state["config"])
-    model_state = state["model_state"]
     valid_keys = {field.name for field in fields(ModelConfig)}
     cfg_kwargs = {key: value for key, value in config_dict.items() if key in valid_keys}
-    if not use_checkpoint_thresholds:
-        cfg_kwargs.pop("button_state_thresholds", None)
     cfg = ModelConfig(**cfg_kwargs)
-    if "mouse_velocity_scales" in state:
-        cfg.mouse_velocity_scales = tuple(float(x) for x in state["mouse_velocity_scales"])
-        cfg.__post_init__()
 
     model = DrivingVideoPolicy(cfg).to(device)
-    load_result = model.load_state_dict(model_state, strict=False)
-    bad_unexpected = [
-        name for name in load_result.unexpected_keys if not is_legacy_learned_pooling_state_key(name)
-    ]
-    if load_result.missing_keys or bad_unexpected:
-        raise RuntimeError(
-            "Checkpoint does not match the current CNN variable-grid policy model. "
-            f"missing={load_result.missing_keys} unexpected={bad_unexpected}"
-        )
+    validate_policy_checkpoint(state, cfg)
+    model_state = state["ema_model_state"]
+    model.load_state_dict(model_state, strict=True)
     model.eval()
-    return model, cfg, config_dict
+    return model, cfg
 
 
 def load_ground_truth(csv_path: str, cfg: ModelConfig, total_frames: int) -> Dict[str, np.ndarray]:
@@ -195,40 +186,22 @@ def load_ground_truth(csv_path: str, cfg: ModelConfig, total_frames: int) -> Dic
             dt[idx] = np.clip(_parse_float(row.get("dt"), cfg.prediction_dt), 1.0 / 240.0, 0.5)
         valid[idx] = True
 
+    button_change = np.zeros_like(buttons)
+    if total_frames > 1:
+        button_change[1:] = np.abs(buttons[1:] - buttons[:-1])
     return {
         "button_state": buttons,
+        "button_change": button_change,
         "mouse_delta": mouse_delta,
         "dt": dt,
         "valid_mask": valid,
     }
 
 
-def _resolve_thresholds(cfg: ModelConfig, threshold: Optional[float]) -> np.ndarray:
+def _resolve_horizon_thresholds(cfg: ModelConfig, threshold: Optional[float]) -> np.ndarray:
     if threshold is not None:
-        return np.full((cfg.num_bin,), float(threshold), dtype=np.float32)
-    return np.asarray(list(cfg.button_state_thresholds), dtype=np.float32)
-
-
-def _resolve_change_thresholds(
-    cfg: ModelConfig,
-    threshold: Optional[float],
-    raw_config: Optional[Dict[str, object]] = None,
-) -> np.ndarray:
-    if threshold is not None:
-        return np.full((cfg.num_bin,), float(threshold), dtype=np.float32)
-    raw_config = raw_config or {}
-    values = raw_config.get("change_thresholds")
-    if values is not None:
-        try:
-            thresholds = np.asarray(list(values), dtype=np.float32)
-            if thresholds.shape == (cfg.num_bin,):
-                return np.clip(thresholds, 0.0, 1.0).astype(np.float32)
-        except TypeError:
-            pass
-    base_threshold = raw_config.get("change_threshold", 0.5)
-    if base_threshold is None:
-        base_threshold = 0.5
-    return np.full((cfg.num_bin,), float(base_threshold), dtype=np.float32)
+        return np.full((cfg.prediction_horizon, cfg.num_bin), float(threshold), dtype=np.float32)
+    return np.asarray([list(row) for row in cfg.horizon_button_thresholds], dtype=np.float32)
 
 
 def infer_video(
@@ -240,7 +213,7 @@ def infer_video(
     *,
     command_horizon: int,
     action_label_offset: int,
-    thresholds: np.ndarray,
+    horizon_thresholds: np.ndarray,
     max_frames: Optional[int],
     use_autocast: bool,
     inference_dtype: torch.dtype,
@@ -261,15 +234,29 @@ def infer_video(
         "button_state": np.zeros((total_frames, cfg.num_bin), dtype=np.float32),
         "source_frame": np.full((total_frames,), -1, dtype=np.int32),
         "valid_mask": np.zeros((total_frames,), dtype=bool),
+        "all_horizon_button_logits": np.zeros(
+            (cfg.prediction_horizon, total_frames, cfg.num_bin),
+            dtype=np.float32,
+        ),
+        "all_horizon_button_state": np.zeros(
+            (cfg.prediction_horizon, total_frames, cfg.num_bin),
+            dtype=np.float32,
+        ),
+        "all_horizon_change_logits": np.zeros(
+            (cfg.prediction_horizon, total_frames, cfg.num_bin),
+            dtype=np.float32,
+        ),
+        "all_horizon_source_frame": np.full((cfg.prediction_horizon, total_frames), -1, dtype=np.int32),
+        "all_horizon_valid_mask": np.zeros((cfg.prediction_horizon, total_frames), dtype=bool),
     }
 
     state = TemporalState()
     prev_action = torch.zeros((1, cfg.num_bin), device=device, dtype=inference_dtype)
     h_idx = max(0, min(int(command_horizon) - 1, int(cfg.prediction_horizon) - 1))
     horizon_offsets = tuple(int(offset) for offset in cfg.prediction_horizon_offsets)
-    target_offset = horizon_offsets[h_idx] - 1 + int(action_label_offset)
+    target_offset = horizon_offsets[h_idx] + int(action_label_offset)
     threshold_tensor = torch.tensor(
-        list(thresholds),
+        horizon_thresholds,
         device=device,
         dtype=torch.float32,
     )
@@ -298,17 +285,33 @@ def infer_video(
                         prev_action=prev_action,
                     )
                     button_logits = output.horizon_button_logits[:, h_idx]
-                    predicted_action = (torch.sigmoid(button_logits.float()) >= threshold_tensor.view(1, -1)).to(
+                    predicted_action = (torch.sigmoid(button_logits.float()) >= threshold_tensor[h_idx].view(1, -1)).to(
                         dtype=inference_dtype
                     )
-                    prev_action = predicted_action.detach().to(dtype=inference_dtype)
+                    applied_action = torch.from_numpy(gt["button_state"][source_idx]).reshape(1, cfg.num_bin)
+                    prev_action = applied_action.to(device=device, dtype=inference_dtype)
+
+            all_logits = output.horizon_button_logits[0].detach().cpu().float().numpy()
+            all_change_logits = output.horizon_change_logits[0].detach().cpu().float().numpy()
+            all_state = (
+                torch.sigmoid(output.horizon_button_logits[0].float())
+                >= threshold_tensor
+            ).detach().cpu().float().numpy()
+            for horizon_idx, horizon_offset in enumerate(horizon_offsets):
+                horizon_target_idx = source_idx + horizon_offset + int(action_label_offset)
+                if 0 <= horizon_target_idx < total_frames:
+                    predictions["all_horizon_button_logits"][horizon_idx, horizon_target_idx] = all_logits[horizon_idx]
+                    predictions["all_horizon_button_state"][horizon_idx, horizon_target_idx] = all_state[horizon_idx]
+                    predictions["all_horizon_change_logits"][horizon_idx, horizon_target_idx] = all_change_logits[horizon_idx]
+                    predictions["all_horizon_source_frame"][horizon_idx, horizon_target_idx] = source_idx
+                    predictions["all_horizon_valid_mask"][horizon_idx, horizon_target_idx] = source_idx >= BURN_IN_FRAMES
 
             target_idx = source_idx + target_offset
             if 0 <= target_idx < total_frames:
                 predictions["button_logits"][target_idx] = output.horizon_button_logits[0, h_idx].detach().cpu().float().numpy()
                 predictions["button_state"][target_idx] = predicted_action[0].detach().cpu().float().numpy()
                 predictions["source_frame"][target_idx] = source_idx
-                predictions["valid_mask"][target_idx] = True
+                predictions["valid_mask"][target_idx] = source_idx >= BURN_IN_FRAMES
             pbar.update(1)
         pbar.close()
     finally:
@@ -655,22 +658,82 @@ def print_final_stats(
         )
 
 
+def print_all_horizon_stats(
+    predictions: Dict[str, np.ndarray],
+    gt: Dict[str, np.ndarray],
+    cfg: ModelConfig,
+    horizon_thresholds: np.ndarray,
+    action_label_offset: int,
+) -> None:
+    def macro_f1_from_logits(logits: np.ndarray, target: np.ndarray, valid: np.ndarray) -> float:
+        valid = valid.astype(bool)
+        if not bool(valid.any()):
+            return 0.0
+        pred = (sigmoid_np(logits[valid]) >= 0.5).astype(np.float32)
+        true = target[valid].astype(np.float32)
+        tp = (pred * true).sum(axis=0)
+        fp = (pred * (1.0 - true)).sum(axis=0)
+        fn = ((1.0 - pred) * true).sum(axis=0)
+        precision = tp / np.maximum(tp + fp, 1.0)
+        recall = tp / np.maximum(tp + fn, 1.0)
+        f1 = 2.0 * precision * recall / np.maximum(precision + recall, 1e-8)
+        measured = (tp + fp + fn) > 0.0
+        return float(f1[measured].mean()) if bool(measured.any()) else 0.0
+
+    total_frames = int(gt["button_state"].shape[0])
+    print("All-horizon evaluation:")
+    for horizon_idx, offset in enumerate(cfg.prediction_horizon_offsets):
+        horizon_predictions = {
+            "button_logits": predictions["all_horizon_button_logits"][horizon_idx],
+            "button_state": predictions["all_horizon_button_state"][horizon_idx],
+            "valid_mask": predictions["all_horizon_valid_mask"][horizon_idx],
+        }
+        model_stats = compute_summary_stats(horizon_predictions, gt, horizon_thresholds[horizon_idx])
+        horizon_valid = predictions["all_horizon_valid_mask"][horizon_idx] & gt["valid_mask"]
+        change_f1 = macro_f1_from_logits(
+            predictions["all_horizon_change_logits"][horizon_idx],
+            gt["button_change"],
+            horizon_valid,
+        )
+
+        persistence_state = np.zeros((total_frames, cfg.num_bin), dtype=np.float32)
+        persistence_valid = np.zeros((total_frames,), dtype=bool)
+        for source_idx in range(max(1, BURN_IN_FRAMES), total_frames):
+            target_idx = source_idx + int(offset) + int(action_label_offset)
+            if 0 <= target_idx < total_frames:
+                persistence_state[target_idx] = gt["button_state"][source_idx - 1]
+                persistence_valid[target_idx] = bool(gt["valid_mask"][source_idx - 1])
+        persistence_stats = compute_summary_stats(
+            {
+                "button_logits": np.where(persistence_state > 0.5, 20.0, -20.0).astype(np.float32),
+                "button_state": persistence_state,
+                "valid_mask": persistence_valid,
+            },
+            gt,
+            np.full((cfg.num_bin,), 0.5, dtype=np.float32),
+        )
+        print(
+            f"  +{int(offset):2d} frames: "
+            f"model_f1={model_stats['macro_f1']:.4f} "
+            f"change_f1={change_f1:.4f} "
+            f"persistence_f1={persistence_stats['macro_f1']:.4f} "
+            f"delta={model_stats['macro_f1'] - persistence_stats['macro_f1']:+.4f}"
+        )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Overlay policy predictions vs CSV ground truth on a dataset video.")
     parser.add_argument("--checkpoint", default=None, help="Path to policy checkpoint. Defaults to ckpt dir best/latest.")
-    parser.add_argument("--ckpt-dir", default="./checkpoints_rt", help="Checkpoint directory used when --checkpoint is omitted.")
-    parser.add_argument("--video", default=r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\data\greenville\run_20260521_182038.mp4', help="Input dataset video. Defaults to the first run_*.mp4 in --data-root.")
+    parser.add_argument("--ckpt-dir", default="./checkpoints_multihorizon", help="Checkpoint directory used when --checkpoint is omitted.")
+    parser.add_argument("--video", default=None, help="Input dataset video. Defaults to the first run_*.mp4 in --data-root.")
     parser.add_argument("--labels", default=None, help="Ground-truth CSV. Defaults to the video path with .csv extension.")
     parser.add_argument("--data-root", default="./data/greenville", help="Dataset root used when --video is omitted.")
     parser.add_argument("--output", default="./data/test_model.mp4", help="Output annotated MP4 path.")
     parser.add_argument("--command-horizon", type=int, default=1, help="1-based horizon index to visualize.")
-    parser.add_argument("--action-label-offset", type=int, default=None, help="Override checkpoint action_label_offset.")
     parser.add_argument("--threshold", type=float, default=None, help="Override button threshold. Defaults to checkpoint thresholds.")
-    parser.add_argument("--change-threshold", type=float, default=None, help="Ignored for current direct-state policy checkpoints.")
     parser.add_argument("--max-frames", type=int, default=None, help="Optional frame limit for quick tests.")
     parser.add_argument("--panel-width", type=int, default=720, help="Width of the side stats panel.")
     parser.add_argument("--cpu", action="store_true", help="Force CPU inference.")
-    parser.add_argument("--use-checkpoint-thresholds", action="store_true", help="Use saved button thresholds if present.")
     parser.add_argument("--ffmpeg-path", default=None, help="Optional explicit ffmpeg path.")
     parser.add_argument("--output-codec", default="hevc_nvenc", help="FFmpeg encoder for the stats MP4.")
     parser.add_argument("--output-quality", type=int, default=20, help="NVENC CQ or x264 CRF value.")
@@ -688,12 +751,14 @@ def main() -> None:
     device = torch.device("cpu" if args.cpu or not torch.cuda.is_available() else "cuda")
     use_autocast = device.type == "cuda" and bool(getattr(torch.cuda, "is_bf16_supported", lambda: False)())
     inference_dtype = torch.bfloat16 if use_autocast else torch.float32
-    model, cfg, raw_config = load_model_checkpoint(
-        checkpoint_path,
-        device,
-        use_checkpoint_thresholds=bool(args.use_checkpoint_thresholds),
+    model, cfg = load_model_checkpoint(checkpoint_path, device)
+    action_label_offset = int(cfg.action_label_offset)
+    effective_offsets = tuple(
+        int(offset) + action_label_offset
+        for offset in cfg.prediction_horizon_offsets
     )
-    action_label_offset = int(raw_config.get("action_label_offset", 0) if args.action_label_offset is None else args.action_label_offset)
+    if any(offset <= 0 for offset in effective_offsets):
+        raise ValueError(f"All evaluated targets must be strictly future-facing, got effective offsets {effective_offsets}.")
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -704,20 +769,19 @@ def main() -> None:
         total_frames = min(total_frames, int(args.max_frames))
 
     gt = load_ground_truth(label_path, cfg, total_frames)
-    thresholds = _resolve_thresholds(cfg, args.threshold)
+    horizon_thresholds = _resolve_horizon_thresholds(cfg, args.threshold)
     command_idx = max(0, min(int(args.command_horizon) - 1, int(cfg.prediction_horizon) - 1))
+    thresholds = horizon_thresholds[command_idx]
     print(
         "Loaded policy:",
         f"checkpoint={checkpoint_path}",
         f"video={video_path}",
         f"game={cfg.selected_game}",
-        "architecture=cnn_variable_grid_transformer",
+        f"architecture={MODEL_FAMILY}_v{ARCHITECTURE_VERSION}",
+        f"spatial_gru={cfg.spatial_channels}@{cfg.model_size // 16}x{cfg.model_size // 16}",
+        f"spatial_queries={cfg.spatial_query_count}",
         f"temporal_layers={cfg.temporal_layers}",
         f"temporal_context={cfg.temporal_context}",
-        "spatial_source=custom_cnn_feature_grid",
-        f"high_res_frames={cfg.high_res_spatial_context}",
-        f"high_res_grid={cfg.high_res_pooling[0]}x{cfg.high_res_pooling[1]}",
-        f"low_res_grid={cfg.low_res_pooling[0]}x{cfg.low_res_pooling[1]}",
         f"seq={cfg.seq_len}",
         f"horizon={cfg.prediction_horizon}",
         f"horizon_offsets={','.join(str(int(offset)) for offset in cfg.prediction_horizon_offsets)}",
@@ -736,7 +800,7 @@ def main() -> None:
         device,
         command_horizon=int(args.command_horizon),
         action_label_offset=action_label_offset,
-        thresholds=thresholds,
+        horizon_thresholds=horizon_thresholds,
         max_frames=args.max_frames,
         use_autocast=use_autocast,
         inference_dtype=inference_dtype,
@@ -758,6 +822,7 @@ def main() -> None:
         preset=str(args.output_preset),
     )
     print_final_stats(predictions, gt, cfg, thresholds)
+    print_all_horizon_stats(predictions, gt, cfg, horizon_thresholds, action_label_offset)
     print(f"Wrote stats video: {output_path}")
 
 

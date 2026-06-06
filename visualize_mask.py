@@ -44,7 +44,8 @@ def mask_frame_bgr(frame_bgr: np.ndarray, model: DrivingVideoPolicy, model_size:
     frame = torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0)
 
     with torch.no_grad():
-        masked = model._apply_masks(model._normalize_frames(frame))[0]
+        visual_input, _ = model.prepare_visual_input(frame)
+        masked = visual_input[0, :3]
 
     masked_rgb = (masked.permute(1, 2, 0).detach().cpu().numpy().clip(0.0, 1.0) * 255.0).astype(np.uint8)
     masked_bgr = cv2.cvtColor(masked_rgb, cv2.COLOR_RGB2BGR)

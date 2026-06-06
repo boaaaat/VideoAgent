@@ -1,4 +1,5 @@
 import argparse
+import copy
 import csv
 import glob
 import math
@@ -27,10 +28,13 @@ from action_space import game_data_root
 from augmentations import augment_frames
 from dataset_wsl_sync import sync_dataset_for_training
 from models import (
+    ARCHITECTURE_VERSION,
+    BURN_IN_FRAMES,
+    MODEL_FAMILY,
     DrivingVideoPolicy,
     ModelConfig,
     PolicyOutput,
-    is_legacy_learned_pooling_state_key,
+    validate_policy_checkpoint,
 )
 
 
@@ -60,14 +64,10 @@ class TrainConfig(ModelConfig):
     button_threshold_max: float = 0.9
 
     button_loss_weight: float = 1.0
-    action_label_offset: int = 0
-    last_action_sequence_dropout: float = 0.2
-    last_action_key_dropout: float = 0.4
-    last_action_corruption_prob: float = 0.0
-    last_action_curriculum_warmup_epochs: int = 0
-    last_action_curriculum_ramp_epochs: int = 0
-    skipped_key_names: Optional[Sequence[str]] = ("e", "q", "c", "z")
+    change_loss_weight: float = 0.25
+    skipped_key_names: Optional[Sequence[str]] = None
     button_label_smoothing: float = 0.02
+    ema_decay: float = 0.999
 
     aug_brightness: float = 0.08
     aug_contrast: float = 0.10
@@ -100,9 +100,9 @@ class TrainConfig(ModelConfig):
     dataset_sync_delete_stale: Optional[bool] = None
     dataset_sync_hash_same_size: bool = True
 
-    resume: bool = True
+    resume: bool = False
     resume_path: Optional[str] = None
-    ckpt_dir: str = "./checkpoints_rt"
+    ckpt_dir: str = "./checkpoints_multihorizon"
     save_every: int = 1
     print_every: int = 20
     max_train_batches: Optional[int] = None
@@ -110,7 +110,8 @@ class TrainConfig(ModelConfig):
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        skipped = tuple(str(name) for name in (self.skipped_key_names or ()))
+        default_skipped = ("e", "q", "c", "z") if self.selected_game in {"greenville", "greenville_test"} else ()
+        skipped = tuple(str(name) for name in (default_skipped if self.skipped_key_names is None else self.skipped_key_names))
         if skipped:
             skip_set = set(skipped)
             self.key_names = [name for name in self.key_names if name not in skip_set]
@@ -119,6 +120,10 @@ class TrainConfig(ModelConfig):
                 raise ValueError("At least one action key/button must remain after skipped_key_names filtering.")
             if self.button_state_thresholds is None or len(tuple(self.button_state_thresholds)) != self.num_bin:
                 self.button_state_thresholds = tuple(float(self.button_state_threshold) for _ in range(self.num_bin))
+            self.horizon_button_thresholds = tuple(
+                tuple(float(value) for value in self.button_state_thresholds)
+                for _ in self.prediction_horizon_offsets
+            )
         self.skipped_key_names = skipped
         self.batch_size = max(1, int(self.batch_size))
         self.target_effective_batch = max(1, int(self.target_effective_batch))
@@ -138,13 +143,9 @@ class TrainConfig(ModelConfig):
         self.button_threshold_min = float(min(max(self.button_threshold_min, 0.0), 1.0))
         self.button_threshold_max = float(min(max(self.button_threshold_max, self.button_threshold_min), 1.0))
         self.grad_clip = max(0.0, float(self.grad_clip))
-        self.action_label_offset = int(self.action_label_offset)
-        self.last_action_sequence_dropout = float(min(max(self.last_action_sequence_dropout, 0.0), 1.0))
-        self.last_action_key_dropout = float(min(max(self.last_action_key_dropout, 0.0), 1.0))
-        self.last_action_corruption_prob = float(min(max(self.last_action_corruption_prob, 0.0), 1.0))
-        self.last_action_curriculum_warmup_epochs = max(0, int(self.last_action_curriculum_warmup_epochs))
-        self.last_action_curriculum_ramp_epochs = max(0, int(self.last_action_curriculum_ramp_epochs))
+        self.change_loss_weight = max(0.0, float(self.change_loss_weight))
         self.button_label_smoothing = float(min(max(self.button_label_smoothing, 0.0), 0.2))
+        self.ema_decay = float(min(max(self.ema_decay, 0.0), 0.99999))
         self.aug_brightness = float(min(max(self.aug_brightness, 0.0), 0.5))
         self.aug_contrast = float(min(max(self.aug_contrast, 0.0), 0.5))
         self.aug_noise_std = float(min(max(self.aug_noise_std, 0.0), 0.1))
@@ -177,19 +178,10 @@ class TrainConfig(ModelConfig):
 class WindowTargets:
     dt: torch.Tensor
     button_horizon: torch.Tensor
+    change_horizon: torch.Tensor
     horizon_valid: torch.Tensor
     last_action: torch.Tensor
     meta: Optional[List[Tuple[str, int, int]]] = None
-
-
-@dataclass(frozen=True)
-class LastActionCurriculum:
-    alpha: float
-    sequence_dropout: float
-    key_dropout: float
-    corruption_prob: float
-    context_scale: float
-    persistence_scale: float
 
 
 @dataclass
@@ -256,6 +248,52 @@ class BinaryStats:
             "fp": self.fp,
             "fn": self.fn,
         }
+
+
+class HorizonThresholdCalibrator:
+    def __init__(self, horizon_count: int, action_count: int, device: torch.device) -> None:
+        self.thresholds = torch.linspace(0.10, 0.90, 33, device=device, dtype=torch.float32)
+        shape = (int(horizon_count), int(action_count), int(self.thresholds.numel()))
+        self.tp = torch.zeros(shape, device=device, dtype=torch.float64)
+        self.fp = torch.zeros(shape, device=device, dtype=torch.float64)
+        self.fn = torch.zeros(shape, device=device, dtype=torch.float64)
+
+    @torch.no_grad()
+    def update(self, logits: torch.Tensor, targets: torch.Tensor, valid: torch.Tensor) -> None:
+        probs = torch.sigmoid(logits.float()).unsqueeze(-1)
+        pred = probs >= self.thresholds.view(1, 1, 1, 1, -1)
+        true = (targets > 0.5).unsqueeze(-1)
+        mask = (valid > 0.5).unsqueeze(-1).unsqueeze(-1)
+        dims = (0, 1)
+        self.tp += (pred & true & mask).sum(dim=dims, dtype=torch.float64)
+        self.fp += (pred & ~true & mask).sum(dim=dims, dtype=torch.float64)
+        self.fn += (~pred & true & mask).sum(dim=dims, dtype=torch.float64)
+
+    def best_thresholds(self) -> Tuple[Tuple[float, ...], ...]:
+        f1 = 2.0 * self.tp / (2.0 * self.tp + self.fp + self.fn).clamp(min=1.0)
+        best = f1.argmax(dim=-1)
+        values = self.thresholds[best].detach().cpu()
+        has_positive = ((self.tp + self.fn)[..., 0] > 0.0).detach().cpu()
+        values = torch.where(has_positive, values, torch.full_like(values, 0.5))
+        return tuple(tuple(float(value) for value in row.tolist()) for row in values)
+
+
+class ModelEMA:
+    def __init__(self, model: torch.nn.Module, decay: float) -> None:
+        self.decay = float(decay)
+        self.model = copy.deepcopy(model).eval()
+        for parameter in self.model.parameters():
+            parameter.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model: torch.nn.Module) -> None:
+        source = model.state_dict()
+        for name, value in self.model.state_dict().items():
+            source_value = source[name].detach()
+            if value.is_floating_point():
+                value.mul_(self.decay).add_(source_value, alpha=1.0 - self.decay)
+            else:
+                value.copy_(source_value)
 
 
 def find_runs(data_root: str, video_ext: str, csv_ext: str) -> List[Tuple[str, str]]:
@@ -340,6 +378,7 @@ def build_window_targets(
     return_meta: bool = False,
 ) -> WindowTargets:
     button_windows: List[np.ndarray] = []
+    change_windows: List[np.ndarray] = []
     valid_windows: List[np.ndarray] = []
     last_action_windows: List[np.ndarray] = []
     dt_windows: List[np.ndarray] = []
@@ -358,24 +397,29 @@ def build_window_targets(
         for start in range(0, max_start + 1, max(1, int(stride))):
             end = start + cfg.seq_len
             button_target = np.zeros((cfg.seq_len, horizon, cfg.num_bin), dtype=np.float32)
+            change_target = np.zeros((cfg.seq_len, horizon, cfg.num_bin), dtype=np.float32)
             valid_target = np.zeros((cfg.seq_len, horizon), dtype=np.float32)
             last_action = np.zeros((cfg.seq_len, cfg.num_bin), dtype=np.float32)
 
             frame_indices = np.arange(start, end)
-            context_indices = frame_indices - 1 + int(cfg.action_label_offset)
+            context_indices = frame_indices - 1
             context_valid = (context_indices >= 0) & (context_indices < buttons.shape[0])
             if np.any(context_valid):
                 last_action[context_valid] = buttons[context_indices[context_valid]]
             for horizon_idx, horizon_offset in enumerate(horizon_offsets):
-                target_indices = frame_indices + horizon_offset - 1 + int(cfg.action_label_offset)
+                target_indices = frame_indices + horizon_offset + int(cfg.action_label_offset)
                 prev_indices = target_indices - 1
                 valid = (target_indices >= 0) & (target_indices < buttons.shape[0]) & (prev_indices >= 0)
                 if np.any(valid):
                     valid_target_indices = target_indices[valid]
                     button_target[valid, horizon_idx] = buttons[valid_target_indices]
+                    change_target[valid, horizon_idx] = np.abs(
+                        buttons[valid_target_indices] - buttons[prev_indices[valid]]
+                    )
                     valid_target[valid, horizon_idx] = 1.0
 
             button_windows.append(button_target)
+            change_windows.append(change_target)
             valid_windows.append(valid_target)
             last_action_windows.append(last_action)
             dt_windows.append(dt[start:end])
@@ -391,6 +435,7 @@ def build_window_targets(
     return WindowTargets(
         dt=stack(dt_windows),
         button_horizon=stack(button_windows),
+        change_horizon=stack(change_windows),
         horizon_valid=stack(valid_windows),
         last_action=stack(last_action_windows),
         meta=meta if return_meta else None,
@@ -567,7 +612,7 @@ def compute_pos_weight(
 
 
 def supervised_start_frame(seq_len: int) -> int:
-    return max(0, int(seq_len) // 4)
+    return min(BURN_IN_FRAMES, max(0, int(seq_len)))
 
 
 def supervised_frame_range(seq_len: int) -> Tuple[int, int]:
@@ -595,10 +640,15 @@ def decision_thresholds_from_pos_weight(pos_weight: torch.Tensor, cfg: TrainConf
 
 
 def button_threshold_tensor(cfg: TrainConfig, *, device: torch.device, dtype: torch.dtype = torch.float32) -> torch.Tensor:
-    thresholds = getattr(cfg, "button_state_thresholds", None)
+    thresholds = getattr(cfg, "horizon_button_thresholds", None)
     if thresholds is None:
-        return torch.full((int(cfg.num_bin),), float(cfg.button_state_threshold), device=device, dtype=dtype)
-    return torch.tensor(list(thresholds), device=device, dtype=dtype)
+        return torch.full(
+            (int(cfg.prediction_horizon), int(cfg.num_bin)),
+            float(cfg.button_state_threshold),
+            device=device,
+            dtype=dtype,
+        )
+    return torch.tensor([list(row) for row in thresholds], device=device, dtype=dtype)
 
 
 def warmup_cosine_lr(step: int, *, total_steps: int, base_lr: float, min_lr: float, warmup_steps: int) -> float:
@@ -611,32 +661,6 @@ def warmup_cosine_lr(step: int, *, total_steps: int, base_lr: float, min_lr: flo
     progress = min(max(progress, 0.0), 1.0)
     cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
     return float(min_lr) + (float(base_lr) - float(min_lr)) * cosine
-
-
-def last_action_curriculum_for_epoch(cfg: TrainConfig, epoch: int) -> LastActionCurriculum:
-    warmup_epochs = max(0, int(cfg.last_action_curriculum_warmup_epochs))
-    ramp_epochs = max(0, int(cfg.last_action_curriculum_ramp_epochs))
-    epoch = max(0, int(epoch))
-
-    if warmup_epochs == 0 and ramp_epochs == 0:
-        alpha = 1.0
-    elif epoch < warmup_epochs:
-        alpha = 0.0
-    elif ramp_epochs <= 0:
-        alpha = 1.0
-    else:
-        alpha = min(1.0, max(0.0, float(epoch - warmup_epochs + 1) / float(ramp_epochs)))
-
-    sequence_dropout = 1.0 - alpha * (1.0 - float(cfg.last_action_sequence_dropout))
-    key_dropout = 1.0 - alpha * (1.0 - float(cfg.last_action_key_dropout))
-    return LastActionCurriculum(
-        alpha=alpha,
-        sequence_dropout=float(min(max(sequence_dropout, 0.0), 1.0)),
-        key_dropout=float(min(max(key_dropout, 0.0), 1.0)),
-        corruption_prob=float(min(max(alpha * float(cfg.last_action_corruption_prob), 0.0), 1.0)),
-        context_scale=float(alpha),
-        persistence_scale=float(alpha),
-    )
 
 
 def resolve_amp_settings(amp: str) -> Tuple[torch.dtype, bool, bool]:
@@ -652,6 +676,7 @@ def bundle_index(bundle: WindowTargets, indices: torch.Tensor) -> WindowTargets:
     return WindowTargets(
         dt=bundle.dt[indices],
         button_horizon=bundle.button_horizon[indices],
+        change_horizon=bundle.change_horizon[indices],
         horizon_valid=bundle.horizon_valid[indices],
         last_action=bundle.last_action[indices],
         meta=None,
@@ -662,6 +687,7 @@ def move_bundle_to_device(bundle: WindowTargets, device: torch.device) -> Window
     return WindowTargets(
         dt=bundle.dt.to(device, non_blocking=True),
         button_horizon=bundle.button_horizon.to(device, non_blocking=True),
+        change_horizon=bundle.change_horizon.to(device, non_blocking=True),
         horizon_valid=bundle.horizon_valid.to(device, non_blocking=True),
         last_action=bundle.last_action.to(device, non_blocking=True),
         meta=bundle.meta,
@@ -672,6 +698,7 @@ def pin_bundle(bundle: WindowTargets) -> WindowTargets:
     return WindowTargets(
         dt=bundle.dt.pin_memory(),
         button_horizon=bundle.button_horizon.pin_memory(),
+        change_horizon=bundle.change_horizon.pin_memory(),
         horizon_valid=bundle.horizon_valid.pin_memory(),
         last_action=bundle.last_action.pin_memory(),
         meta=bundle.meta,
@@ -684,6 +711,7 @@ def compute_losses(
     cfg: TrainConfig,
     *,
     button_pos_weight: torch.Tensor,
+    change_pos_weight: torch.Tensor,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     valid = second_half_only(targets.horizon_valid).float()
     valid_4d = valid.unsqueeze(-1)
@@ -698,78 +726,33 @@ def compute_losses(
         pos_weight=button_pos_weight.view(1, 1, 1, -1).float(),
         reduction="none",
     )
-    loss_weight = valid_4d
+    change_loss_raw = F.binary_cross_entropy_with_logits(
+        output.horizon_change_logits.float(),
+        targets.change_horizon.float(),
+        pos_weight=change_pos_weight.view(1, 1, 1, -1).float(),
+        reduction="none",
+    )
     horizon_count = int(button_logits.size(2))
-    if horizon_count > 1:
-        base_horizon_weights = torch.tensor(
-            (2.00, 1.25, 0.90, 0.65, 0.50, 0.35, 0.25, 0.20, 0.15, 0.15),
-            device=button_logits.device,
-            dtype=button_logits.dtype,
-        )
-        if horizon_count <= int(base_horizon_weights.numel()):
-            horizon_weight = base_horizon_weights[:horizon_count]
-        else:
-            tail = base_horizon_weights[-1].expand(horizon_count - int(base_horizon_weights.numel()))
-            horizon_weight = torch.cat([base_horizon_weights, tail], dim=0)
-        horizon_weight = horizon_weight.view(1, 1, horizon_count, 1)
-        loss_weight = loss_weight * horizon_weight
+    base_horizon_weights = torch.tensor(
+        (1.0, 1.0, 0.9, 0.8, 0.7, 0.6),
+        device=button_logits.device,
+        dtype=button_logits.dtype,
+    )
+    if horizon_count <= int(base_horizon_weights.numel()):
+        horizon_weight = base_horizon_weights[:horizon_count]
+    else:
+        tail = base_horizon_weights[-1].expand(horizon_count - int(base_horizon_weights.numel()))
+        horizon_weight = torch.cat((base_horizon_weights, tail), dim=0)
+    horizon_weight = horizon_weight / horizon_weight.mean().clamp(min=1e-6)
+    loss_weight = valid_4d * horizon_weight.view(1, 1, horizon_count, 1)
     button_loss = (button_loss_raw * loss_weight).sum() / (loss_weight.sum() * cfg.num_bin).clamp(min=1.0)
+    change_loss = (change_loss_raw * loss_weight).sum() / (loss_weight.sum() * cfg.num_bin).clamp(min=1.0)
 
-    total = cfg.button_loss_weight * button_loss
+    total = cfg.button_loss_weight * button_loss + cfg.change_loss_weight * change_loss
     return total, {
         "button": button_loss.detach(),
+        "change": change_loss.detach(),
     }
-
-
-def regularize_last_action_context(
-    last_action: torch.Tensor,
-    cfg: TrainConfig,
-    curriculum: Optional[LastActionCurriculum] = None,
-) -> torch.Tensor:
-    prev_action = last_action.float()
-    if prev_action.dim() != 3:
-        raise ValueError(f"Expected last_action [B,T,C], got {tuple(prev_action.shape)}.")
-
-    sequence_dropout = (
-        float(curriculum.sequence_dropout)
-        if curriculum is not None
-        else float(cfg.last_action_sequence_dropout)
-    )
-    key_dropout = (
-        float(curriculum.key_dropout)
-        if curriculum is not None
-        else float(cfg.last_action_key_dropout)
-    )
-    corruption_prob = (
-        float(curriculum.corruption_prob)
-        if curriculum is not None
-        else float(cfg.last_action_corruption_prob)
-    )
-
-    batch_size = int(prev_action.size(0))
-    if batch_size > 1 and corruption_prob > 0.0:
-        replace = (
-            torch.rand((batch_size, 1, 1), device=prev_action.device)
-            < corruption_prob
-        )
-        permuted = prev_action[torch.randperm(batch_size, device=prev_action.device)]
-        prev_action = torch.where(replace, permuted, prev_action)
-
-    if sequence_dropout > 0.0:
-        keep_sequence = (
-            torch.rand((batch_size, 1, 1), device=prev_action.device)
-            >= sequence_dropout
-        ).to(dtype=prev_action.dtype)
-        prev_action = prev_action * keep_sequence
-
-    if key_dropout > 0.0:
-        keep_key = (
-            torch.rand((batch_size, 1, int(prev_action.size(-1))), device=prev_action.device)
-            >= key_dropout
-        ).to(dtype=prev_action.dtype)
-        prev_action = prev_action * keep_key
-
-    return prev_action
 
 
 @torch.no_grad()
@@ -778,11 +761,20 @@ def update_metrics(
     targets: WindowTargets,
     cfg: TrainConfig,
     horizon_stats: Sequence[BinaryStats],
+    change_horizon_stats: Sequence[BinaryStats],
+    calibrator: HorizonThresholdCalibrator,
 ) -> None:
     valid = second_half_only(targets.horizon_valid)
-    thresholds = button_threshold_tensor(cfg, device=output.horizon_button_logits.device).view(1, 1, -1)
-    pred = torch.sigmoid(output.horizon_button_logits.float()) >= thresholds.unsqueeze(2)
+    thresholds = button_threshold_tensor(cfg, device=output.horizon_button_logits.device).view(
+        1,
+        1,
+        int(cfg.prediction_horizon),
+        int(cfg.num_bin),
+    )
+    pred = torch.sigmoid(output.horizon_button_logits.float()) >= thresholds
+    change_pred = torch.sigmoid(output.horizon_change_logits.float()) >= 0.5
     true = targets.button_horizon > 0.5
+    change_true = targets.change_horizon > 0.5
     horizon_count = min(int(output.horizon_button_logits.size(2)), len(horizon_stats))
     for horizon_idx in range(horizon_count):
         horizon_stats[horizon_idx].update(
@@ -790,6 +782,12 @@ def update_metrics(
             true[:, :, horizon_idx],
             valid[:, :, horizon_idx] > 0.5,
         )
+        change_horizon_stats[horizon_idx].update(
+            change_pred[:, :, horizon_idx],
+            change_true[:, :, horizon_idx],
+            valid[:, :, horizon_idx] > 0.5,
+        )
+    calibrator.update(output.horizon_button_logits, targets.button_horizon, valid)
 
 
 def per_class_f1_summary(stats: BinaryStats, names: Sequence[str], count: int = 8) -> str:
@@ -825,19 +823,27 @@ def binary_stats_rows(stats: BinaryStats, names: Sequence[str]) -> List[Dict[str
     return rows
 
 
-def persistence_baseline_metrics(targets: WindowTargets, cfg: TrainConfig) -> Dict[str, float]:
-    stats = BinaryStats(cfg.num_bin, torch.device("cpu"))
-    current = targets.button_horizon[:, :, 0].new_zeros(targets.button_horizon[:, :, 0].shape)
-    current[:, 1:] = targets.button_horizon[:, :-1, 0]
-    valid = second_half_only(targets.horizon_valid[:, :, 0] > 0.5)
-    valid[:, 0] = False
-    stats.update(current > 0.5, targets.button_horizon[:, :, 0] > 0.5, valid)
-    result = stats.compute()
-    result["per_class_summary"] = per_class_f1_summary(stats, list(cfg.key_names) + list(cfg.mouse_button_names))
-    return result
+def persistence_baseline_metrics(targets: WindowTargets, cfg: TrainConfig) -> Dict[str, object]:
+    names = list(cfg.key_names) + list(cfg.mouse_button_names)
+    valid = second_half_only(targets.horizon_valid > 0.5)
+    results: List[Dict[str, float]] = []
+    rows: List[List[Dict[str, float | int | str]]] = []
+    for horizon_idx in range(int(cfg.prediction_horizon)):
+        stats = BinaryStats(cfg.num_bin, torch.device("cpu"))
+        stats.update(
+            targets.last_action > 0.5,
+            targets.button_horizon[:, :, horizon_idx] > 0.5,
+            valid[:, :, horizon_idx],
+        )
+        results.append(stats.compute())
+        rows.append(binary_stats_rows(stats, names))
+    return {
+        "horizon_macro_f1": [float(item["macro_f1"]) for item in results],
+        "horizon_rows": rows,
+    }
 
 
-def driving_score(metrics: Dict[str, float], cfg: TrainConfig) -> float:
+def driving_score(metrics: Dict[str, object], cfg: TrainConfig) -> float:
     def score_rows(rows: object, fallback: float) -> float:
         if not isinstance(rows, list):
             return float(fallback)
@@ -925,6 +931,7 @@ def load_batch(iterator, targets: WindowTargets, device: torch.device, cfg: Trai
     target = WindowTargets(
         dt=targets.dt[labels],
         button_horizon=targets.button_horizon[labels],
+        change_horizon=targets.change_horizon[labels],
         horizon_valid=targets.horizon_valid[labels],
         last_action=targets.last_action[labels],
         meta=None,
@@ -945,27 +952,25 @@ def run_epoch(
     amp_dtype: torch.dtype,
     use_autocast: bool,
     button_pos_weight: torch.Tensor,
+    change_pos_weight: torch.Tensor,
     optimizer: Optional[torch.optim.Optimizer] = None,
+    ema: Optional[ModelEMA] = None,
+    ema_source: Optional[torch.nn.Module] = None,
     total_steps: int = 1,
     global_step: int = 0,
-    last_action_curriculum: Optional[LastActionCurriculum] = None,
-) -> Tuple[Dict[str, float], int]:
+) -> Tuple[Dict[str, object], int]:
     is_train = optimizer is not None
     model.train(is_train)
     if is_train:
         optimizer.zero_grad(set_to_none=True)
 
     loss_sum = torch.zeros((), device=device)
-    detail_sums = {name: torch.zeros((), device=device) for name in ("button",)}
+    detail_sums = {name: torch.zeros((), device=device) for name in ("button", "change")}
     horizon_count = int(cfg.prediction_horizon)
     horizon_stats = [BinaryStats(cfg.num_bin, device) for _ in range(horizon_count)]
+    change_horizon_stats = [BinaryStats(cfg.num_bin, device) for _ in range(horizon_count)]
+    calibrator = HorizonThresholdCalibrator(horizon_count, cfg.num_bin, device)
     steps = 0
-    if last_action_curriculum is None:
-        context_scale = torch.ones((), device=device)
-        persistence_scale = torch.ones((), device=device)
-    else:
-        context_scale = torch.tensor(float(last_action_curriculum.context_scale), device=device)
-        persistence_scale = torch.tensor(float(last_action_curriculum.persistence_scale), device=device)
 
     iterator_it = iter(iterator)
     pbar = tqdm(range(int(batches)), desc=desc, dynamic_ncols=True)
@@ -975,23 +980,17 @@ def run_epoch(
             frames = augment_frames(frames, cfg)
         with torch.set_grad_enabled(is_train):
             with torch.amp.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_autocast):
-                prev_action = (
-                    regularize_last_action_context(batch_targets.last_action, cfg, last_action_curriculum)
-                    if is_train
-                    else batch_targets.last_action
-                )
                 output = model(
                     frames,
                     dt=batch_targets.dt,
-                    prev_action=prev_action,
-                    prev_action_scale=context_scale,
-                    persistence_scale=persistence_scale,
+                    prev_action=batch_targets.last_action,
                 )
                 loss, details = compute_losses(
                     output,
                     batch_targets,
                     cfg,
                     button_pos_weight=button_pos_weight,
+                    change_pos_weight=change_pos_weight,
                 )
                 loss_div = loss / max(1, int(cfg.grad_accum))
 
@@ -1011,6 +1010,10 @@ def run_epoch(
                         group["lr"] = lr
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
+                    if ema is not None:
+                        if ema_source is None:
+                            raise RuntimeError("EMA updates require the eager source model.")
+                        ema.update(ema_source)
                     global_step += 1
 
         update_metrics(
@@ -1018,6 +1021,8 @@ def run_epoch(
             batch_targets,
             cfg,
             horizon_stats,
+            change_horizon_stats,
+            calibrator,
         )
         loss_sum += loss.detach().float()
         for name, value in details.items():
@@ -1028,11 +1033,13 @@ def run_epoch(
                 {
                     "loss": float((loss_sum / max(1, steps)).item()),
                     "btn": float((detail_sums["button"] / max(1, steps)).item()),
+                    "chg": float((detail_sums["change"] / max(1, steps)).item()),
                 }
             )
     iterator.reset()
 
     horizon_results = [stats.compute() for stats in horizon_stats]
+    change_horizon_results = [stats.compute() for stats in change_horizon_stats]
     first_idx = 0
     middle_idx = min(horizon_count - 1, horizon_count // 2)
     final_idx = horizon_count - 1
@@ -1044,7 +1051,12 @@ def run_epoch(
     metrics = {
         "loss": float((loss_sum / max(1, steps)).item()),
         "button_loss": float((detail_sums["button"] / max(1, steps)).item()),
+        "change_loss": float((detail_sums["change"] / max(1, steps)).item()),
         "horizon_button_macro_f1": horizon_macro_f1,
+        "horizon_change_macro_f1": [float(item["macro_f1"]) for item in change_horizon_results],
+        "horizon_button_rows": [binary_stats_rows(stats, button_names) for stats in horizon_stats],
+        "horizon_change_rows": [binary_stats_rows(stats, button_names) for stats in change_horizon_stats],
+        "calibrated_thresholds": calibrator.best_thresholds(),
         "step1_button_macro_f1": step1["macro_f1"],
         "step1_button_macro_precision": step1["macro_precision"],
         "step1_button_macro_recall": step1["macro_recall"],
@@ -1073,6 +1085,7 @@ def save_checkpoint(
     path: str,
     *,
     model: torch.nn.Module,
+    ema_model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     cfg: TrainConfig,
     epoch: int,
@@ -1081,7 +1094,16 @@ def save_checkpoint(
 ) -> None:
     torch.save(
         {
+            "model_family": MODEL_FAMILY,
+            "architecture_version": ARCHITECTURE_VERSION,
+            "horizon_offsets": tuple(int(offset) for offset in cfg.prediction_horizon_offsets),
+            "action_names": tuple(list(cfg.key_names) + list(cfg.mouse_button_names)),
+            "horizon_button_thresholds": tuple(
+                tuple(float(value) for value in row)
+                for row in cfg.horizon_button_thresholds
+            ),
             "model_state": model.state_dict(),
+            "ema_model_state": ema_model.state_dict(),
             "optimizer_state": optimizer.state_dict(),
             "config": asdict(cfg),
             "epoch": int(epoch),
@@ -1094,6 +1116,7 @@ def save_checkpoint(
 
 def maybe_resume(
     model: torch.nn.Module,
+    ema_model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     cfg: TrainConfig,
     device: torch.device,
@@ -1108,42 +1131,28 @@ def maybe_resume(
         return 0, 0, -1e9
     print(f"Resuming from {ckpt_path}")
     state = torch.load(ckpt_path, map_location=device)
-    try:
-        missing, unexpected = model.load_state_dict(state["model_state"], strict=False)
-        missing_set = set(missing)
-        unexpected_set = set(unexpected)
-        bad_missing = list(missing)
-        bad_unexpected = [
-            name for name in unexpected if not is_legacy_learned_pooling_state_key(name)
-        ]
-        if bad_missing or bad_unexpected:
-            raise RuntimeError(
-                f"missing={sorted(bad_missing)} unexpected={sorted(bad_unexpected)}"
-            )
-    except RuntimeError as exc:
-        if cfg.resume_path is None:
-            print(
-                f"Skipping incompatible checkpoint {ckpt_path}. "
-                "Starting a fresh run for the current model/action configuration."
-            )
-            return 0, 0, -1e9
-        raise RuntimeError(
-            f"Cannot resume checkpoint {ckpt_path}: it does not match the current policy model. "
-            "Start a fresh run or pass --no-resume."
-        ) from exc
-    if missing_set or unexpected_set:
-        print(
-            "Checkpoint has compatible model weights but a stale optimizer layout; "
-            "loaded matching model weights and starting a fresh optimizer state."
+    stored_thresholds = ()
+    if isinstance(state, dict):
+        stored_thresholds = tuple(
+            tuple(float(value) for value in row)
+            for row in state.get("horizon_button_thresholds", ())
         )
-    else:
-        optimizer.load_state_dict(state["optimizer_state"])
+    if stored_thresholds:
+        cfg.horizon_button_thresholds = stored_thresholds
+        cfg.button_state_thresholds = stored_thresholds[0]
+    validate_policy_checkpoint(state, cfg, require_optimizer_state=True)
+    model.load_state_dict(state["model_state"], strict=True)
+    ema_model.load_state_dict(state["ema_model_state"], strict=True)
+    optimizer.load_state_dict(state["optimizer_state"])
     return int(state["epoch"]), int(state["global_step"]), float(state["best_score"])
 
 
 def parse_args() -> TrainConfig:
-    parser = argparse.ArgumentParser(description="Train the CNN + variable-grid Transformer behavioral cloning policy.")
+    parser = argparse.ArgumentParser(description="Train the causal multi-horizon video policy.")
     add = parser.add_argument
+    add("--selected-game", default=None)
+    add("--key-names", default=None, help="Optional comma-separated action key override.")
+    add("--mouse-button-names", default=None, help="Optional comma-separated mouse-button action override.")
     add("--data-root", default=None)
     add("--ckpt-dir", default=None)
     add("--resume", dest="resume", action="store_true", default=None)
@@ -1152,22 +1161,23 @@ def parse_args() -> TrainConfig:
     add("--num-epochs", type=int, default=None)
     add("--batch-size", type=int, default=None)
     add("--seq-len", type=int, default=None)
-    add("--prediction-horizon", type=int, default=None)
     add("--prediction-horizon-offsets", default=None, help="Comma-separated future frame offsets for horizon heads.")
     add("--model-size", type=int, default=None)
+    add("--cnn-channels", default=None, help="Four comma-separated CNN stage widths.")
+    add("--spatial-channels", type=int, default=None)
+    add("--spatial-query-count", type=int, default=None)
+    add("--spatial-attention-heads", type=int, default=None)
     add("--d-model", type=int, default=None)
     add("--spatial-dropout", type=float, default=None)
+    add("--temporal-dropout", type=float, default=None)
     add("--head-dropout", type=float, default=None)
-    add("--fastvit-depth", type=int, default=None)
-    add("--fastvit-kernel-size", type=int, default=None)
     add("--temporal-layers", type=int, default=None)
     add("--temporal-heads", type=int, default=None)
     add("--temporal-context", type=int, default=None)
-    add("--pooling", default=None, help="Average-pooled spatial grid size, e.g. 16,16 or 16x16.")
-    add("--recent-spatial-context", type=int, default=None)
-    add("--high-res-spatial-context", type=int, default=None)
-    add("--high-res-pooling", default=None, help="Recent-frame spatial grid size, e.g. 5,5 or 5x5.")
-    add("--low-res-pooling", default=None, help="Older-frame spatial grid size, e.g. 3,3 or 3x3.")
+    add("--horizon-layers", type=int, default=None)
+    add("--horizon-heads", type=int, default=None)
+    add("--action-sequence-dropout", type=float, default=None)
+    add("--action-key-dropout", type=float, default=None)
     add("--train-seq-stride", type=int, default=None)
     add("--val-seq-stride", type=int, default=None)
     add("--target-effective-batch", type=int, default=None)
@@ -1183,11 +1193,8 @@ def parse_args() -> TrainConfig:
     add("--button-threshold-min", type=float, default=None)
     add("--button-threshold-max", type=float, default=None)
     add("--action-label-offset", type=int, default=None)
-    add("--last-action-sequence-dropout", type=float, default=None)
-    add("--last-action-key-dropout", type=float, default=None)
-    add("--last-action-corruption-prob", type=float, default=None)
-    add("--last-action-curriculum-warmup-epochs", type=int, default=None)
-    add("--last-action-curriculum-ramp-epochs", type=int, default=None)
+    add("--change-loss-weight", type=float, default=None)
+    add("--ema-decay", type=float, default=None)
     add("--skip-key-names", default=None, help="Comma-separated key names to exclude from training labels.")
     add("--train-all-keys", action="store_true", help="Disable the default Greenville test filter for e,q,c,z.")
     add("--button-label-smoothing", type=float, default=None)
@@ -1238,6 +1245,7 @@ def parse_args() -> TrainConfig:
     args_by_name = vars(args)
     kwargs = {}
     for key in (
+        "selected_game",
         "data_root",
         "ckpt_dir",
         "resume",
@@ -1245,22 +1253,23 @@ def parse_args() -> TrainConfig:
         "num_epochs",
         "batch_size",
         "seq_len",
-        "prediction_horizon",
         "prediction_horizon_offsets",
         "model_size",
+        "cnn_channels",
+        "spatial_channels",
+        "spatial_query_count",
+        "spatial_attention_heads",
         "d_model",
         "spatial_dropout",
+        "temporal_dropout",
         "head_dropout",
-        "fastvit_depth",
-        "fastvit_kernel_size",
         "temporal_layers",
         "temporal_heads",
         "temporal_context",
-        "pooling",
-        "recent_spatial_context",
-        "high_res_spatial_context",
-        "high_res_pooling",
-        "low_res_pooling",
+        "horizon_layers",
+        "horizon_heads",
+        "action_sequence_dropout",
+        "action_key_dropout",
         "train_seq_stride",
         "val_seq_stride",
         "target_effective_batch",
@@ -1275,11 +1284,8 @@ def parse_args() -> TrainConfig:
         "button_threshold_min",
         "button_threshold_max",
         "action_label_offset",
-        "last_action_sequence_dropout",
-        "last_action_key_dropout",
-        "last_action_corruption_prob",
-        "last_action_curriculum_warmup_epochs",
-        "last_action_curriculum_ramp_epochs",
+        "change_loss_weight",
+        "ema_decay",
         "button_label_smoothing",
         "aug_brightness",
         "aug_contrast",
@@ -1320,10 +1326,24 @@ def parse_args() -> TrainConfig:
         kwargs["skipped_key_names"] = tuple(
             name.strip() for name in str(args.skip_key_names).split(",") if name.strip()
         )
+    if args.key_names is not None:
+        kwargs["key_names"] = [
+            name.strip() for name in str(args.key_names).split(",") if name.strip()
+        ]
+    if args.mouse_button_names is not None:
+        kwargs["mouse_button_names"] = [
+            name.strip() for name in str(args.mouse_button_names).split(",") if name.strip()
+        ]
     if args.prediction_horizon_offsets is not None:
         kwargs["prediction_horizon_offsets"] = tuple(
             int(part.strip())
             for part in str(args.prediction_horizon_offsets).split(",")
+            if part.strip()
+        )
+    if args.cnn_channels is not None:
+        kwargs["cnn_channels"] = tuple(
+            int(part.strip())
+            for part in str(args.cnn_channels).split(",")
             if part.strip()
         )
     return TrainConfig(**kwargs)
@@ -1363,17 +1383,17 @@ def train() -> None:
     print(f"Training action keys: {', '.join(cfg.key_names + cfg.mouse_button_names)}")
     print(
         "Policy architecture:",
-        "cnn_variable_grid_transformer",
+        f"{MODEL_FAMILY}_v{ARCHITECTURE_VERSION}",
+        f"cnn_channels={cfg.cnn_channels}",
+        f"spatial_gru={cfg.spatial_channels}@{cfg.model_size // 16}x{cfg.model_size // 16}",
+        f"spatial_queries={cfg.spatial_query_count}",
+        f"d_model={cfg.d_model}",
         f"temporal_layers={cfg.temporal_layers}",
         f"temporal_heads={cfg.temporal_heads}",
         f"temporal_context={cfg.temporal_context}",
-        "spatial_source=custom_cnn_feature_grid",
-        f"high_res_frames={cfg.high_res_spatial_context}",
-        f"high_res_grid={cfg.high_res_pooling[0]}x{cfg.high_res_pooling[1]}",
-        f"low_res_grid={cfg.low_res_pooling[0]}x{cfg.low_res_pooling[1]}",
+        f"horizon_layers={cfg.horizon_layers}",
     )
     horizon_offsets = tuple(int(offset) for offset in cfg.prediction_horizon_offsets)
-    first_horizon_offset = int(horizon_offsets[0])
     print(f"Horizon frame offsets: {', '.join(str(offset) for offset in horizon_offsets)}")
 
     train_targets = build_window_targets(train_pairs, cfg, stride=cfg.train_seq_stride, return_meta=True)
@@ -1383,33 +1403,40 @@ def train() -> None:
         f"train={tuple(train_targets.button_horizon.shape)}",
         f"val={(tuple(val_targets.button_horizon.shape) if val_targets is not None else None)}",
         f"action_label_offset={cfg.action_label_offset}",
-        "action_index=frame+horizon-1+offset",
-        "last_action_index=frame-1+offset",
+        "action_index=source_frame+horizon+label_offset",
+        "last_action_index=source_frame-1",
         f"horizon_offsets={horizon_offsets}",
     )
     supervised_start, supervised_end = supervised_frame_range(cfg.seq_len)
     print(
         "Loss supervision:",
         f"frames={supervised_start}-{supervised_end}",
-        "loss=weighted_bce",
+        f"loss=state_bce+{cfg.change_loss_weight:.2f}*transition_bce",
     )
     print(
         "Last action conditioning:",
-        "enabled=True",
-        f"seq_drop={cfg.last_action_sequence_dropout:.2f}",
-        f"key_drop={cfg.last_action_key_dropout:.2f}",
-        f"corrupt={cfg.last_action_corruption_prob:.2f}",
-    )
-    print(
-        "Last action curriculum:",
-        f"vision_only_epochs={cfg.last_action_curriculum_warmup_epochs}",
-        f"ramp_epochs={cfg.last_action_curriculum_ramp_epochs}",
+        "learned_context_only=True",
+        f"seq_drop={cfg.action_sequence_dropout:.2f}",
+        f"key_drop={cfg.action_key_dropout:.2f}",
+        "direct_logit_prior=False",
     )
     train_persist = persistence_baseline_metrics(train_targets, cfg)
-    print(f"Persistence baseline: train_f1@+{first_horizon_offset}={train_persist['macro_f1']:.4f}")
+    print(
+        "Persistence baseline train:",
+        " ".join(
+            f"f1@+{offset}={score:.4f}"
+            for offset, score in zip(horizon_offsets, train_persist["horizon_macro_f1"])
+        ),
+    )
     if val_targets is not None:
         val_persist = persistence_baseline_metrics(val_targets, cfg)
-        print(f"Persistence baseline: val_f1@+{first_horizon_offset}={val_persist['macro_f1']:.4f} {val_persist['per_class_summary']}")
+        print(
+            "Persistence baseline val:",
+            " ".join(
+                f"f1@+{offset}={score:.4f}"
+                for offset, score in zip(horizon_offsets, val_persist["horizon_macro_f1"])
+            ),
+        )
 
     train_file_list = os.path.join(cfg.ckpt_dir, "train_file_list.txt")
     val_file_list = os.path.join(cfg.ckpt_dir, "val_file_list.txt")
@@ -1427,12 +1454,26 @@ def train() -> None:
         cfg.pos_weight_clamp,
         valid=second_half_only(train_targets.horizon_valid),
     ).to(device)
+    change_pos_weight = compute_pos_weight(
+        train_targets.change_horizon,
+        cfg.pos_weight_power,
+        cfg.pos_weight_clamp,
+        valid=second_half_only(train_targets.horizon_valid),
+    ).to(device)
     button_thresholds = decision_thresholds_from_pos_weight(button_pos_weight, cfg).detach().cpu()
     cfg.button_state_thresholds = tuple(float(x) for x in list(button_thresholds.tolist()))
+    cfg.horizon_button_thresholds = tuple(
+        tuple(float(value) for value in cfg.button_state_thresholds)
+        for _ in cfg.prediction_horizon_offsets
+    )
     button_names = list(cfg.key_names) + list(cfg.mouse_button_names)
     print(
-        "Class weighting:",
+        "State class weighting:",
         '   '.join([f"{name}={float(weight):.3f}" for name, weight in zip(button_names, button_pos_weight.tolist())]),
+    )
+    print(
+        "Transition class weighting:",
+        '   '.join([f"{name}={float(weight):.3f}" for name, weight in zip(button_names, change_pos_weight.tolist())]),
     )
     threshold_parts = [
         f"{name}={float(threshold):.3f}"
@@ -1480,8 +1521,9 @@ def train() -> None:
     base_model: torch.nn.Module = DrivingVideoPolicy(cfg).to(device)
     base_model = base_model.to(memory_format=torch.channels_last)
     optimizer = torch.optim.AdamW(base_model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay, fused=True)
+    ema = ModelEMA(base_model, cfg.ema_decay)
     print(f"Parameters: {sum(p.numel() for p in base_model.parameters()) / 1e6:.4f}M")
-    start_epoch, global_step, best_score = maybe_resume(base_model, optimizer, cfg, device)
+    start_epoch, global_step, best_score = maybe_resume(base_model, ema.model, optimizer, cfg, device)
 
     if cfg.compile_model:
         compile_kwargs = {"fullgraph": False, "dynamic": False}
@@ -1489,19 +1531,15 @@ def train() -> None:
             compile_kwargs["mode"] = cfg.compile_mode
         model = torch.compile(base_model, **compile_kwargs)
         print(f"torch.compile enabled: mode={cfg.compile_mode}")
-        eval_model = base_model
-        print("Validation uses eager model to avoid TorchInductor eval-graph compiler failures.")
     else:
         model = base_model
-        eval_model = model
+    eval_model = ema.model
+    print(f"Validation uses EMA weights: decay={cfg.ema_decay:.5f}")
 
     optimizer_steps_per_epoch = int(math.ceil(train_batches / float(cfg.grad_accum)))
     total_steps = max(1, optimizer_steps_per_epoch * cfg.num_epochs)
     epochs_without_improvement = 0
-    final_horizon_offset = int(horizon_offsets[-1])
-
     for epoch in range(start_epoch, cfg.num_epochs):
-        last_action_curriculum = last_action_curriculum_for_epoch(cfg, epoch)
         train_metrics, global_step = run_epoch(
             desc=f"Epoch {epoch + 1}/{cfg.num_epochs} [train]",
             model=model,
@@ -1513,10 +1551,12 @@ def train() -> None:
             amp_dtype=amp_dtype,
             use_autocast=use_autocast,
             button_pos_weight=button_pos_weight,
+            change_pos_weight=change_pos_weight,
             optimizer=optimizer,
+            ema=ema,
+            ema_source=base_model,
             total_steps=total_steps,
             global_step=global_step,
-            last_action_curriculum=last_action_curriculum,
         )
 
         val_metrics = None
@@ -1534,9 +1574,14 @@ def train() -> None:
                     amp_dtype=amp_dtype,
                     use_autocast=use_autocast,
                     button_pos_weight=button_pos_weight,
-                    last_action_curriculum=last_action_curriculum,
+                    change_pos_weight=change_pos_weight,
                 )
             score = driving_score(val_metrics, cfg)
+            cfg.horizon_button_thresholds = tuple(
+                tuple(float(value) for value in row)
+                for row in val_metrics["calibrated_thresholds"]
+            )
+            cfg.button_state_thresholds = tuple(float(value) for value in cfg.horizon_button_thresholds[0])
 
         improved = score > best_score
         if improved:
@@ -1545,6 +1590,7 @@ def train() -> None:
             save_checkpoint(
                 os.path.join(cfg.ckpt_dir, "model_best.pt"),
                 model=base_model,
+                ema_model=ema.model,
                 optimizer=optimizer,
                 cfg=cfg,
                 epoch=epoch + 1,
@@ -1557,6 +1603,7 @@ def train() -> None:
         save_checkpoint(
             os.path.join(cfg.ckpt_dir, "model_latest.pt"),
             model=base_model,
+            ema_model=ema.model,
             optimizer=optimizer,
             cfg=cfg,
             epoch=epoch + 1,
@@ -1567,6 +1614,7 @@ def train() -> None:
             save_checkpoint(
                 os.path.join(cfg.ckpt_dir, f"model_epoch_{epoch + 1}.pt"),
                 model=base_model,
+                ema_model=ema.model,
                 optimizer=optimizer,
                 cfg=cfg,
                 epoch=epoch + 1,
@@ -1576,58 +1624,42 @@ def train() -> None:
 
         parts = [
             f"Epoch {epoch + 1}/{cfg.num_epochs}",
-            f"la={last_action_curriculum.alpha:.2f}",
             f"tr_loss={train_metrics['loss']:.4f}",
-            f"tr_f1@+{first_horizon_offset}={train_metrics['step1_button_macro_f1']:.4f}",
+            "tr_state=" + ",".join(
+                f"+{offset}:{score:.3f}"
+                for offset, score in zip(horizon_offsets, train_metrics["horizon_button_macro_f1"])
+            ),
+            "tr_change=" + ",".join(
+                f"+{offset}:{score:.3f}"
+                for offset, score in zip(horizon_offsets, train_metrics["horizon_change_macro_f1"])
+            ),
         ]
-        if int(cfg.prediction_horizon) > 1:
-            parts.append(f"tr_f1@+{final_horizon_offset}={train_metrics['final_button_macro_f1']:.4f}")
         if val_metrics is not None:
             parts.append(f"va_loss={val_metrics['loss']:.4f}")
-            parts.append(f"va_f1@+{first_horizon_offset}={val_metrics['step1_button_macro_f1']:.4f}")
-            if int(cfg.prediction_horizon) > 1:
-                parts.append(f"va_f1@+{final_horizon_offset}={val_metrics['final_button_macro_f1']:.4f}")
-            parts.append(f"best={best_score:.4f}")
-            parts.append(val_metrics["per_class_summary"])
-        else:
-            parts.append(train_metrics["per_class_summary"])
-        print(" | ".join(part for part in parts if part))
-        train_stats = (
-            f"Epoch {epoch + 1} train stats: "
-            f"f1@+{first_horizon_offset}={train_metrics['step1_button_macro_f1']:.4f}"
-        )
-        if int(cfg.prediction_horizon) > 1:
-            train_stats += (
-                f" f1@+{final_horizon_offset}={train_metrics['final_button_macro_f1']:.4f}"
+            parts.append(
+                "va_state=" + ",".join(
+                    f"+{offset}:{score:.3f}"
+                    for offset, score in zip(horizon_offsets, val_metrics["horizon_button_macro_f1"])
+                )
             )
-        print(train_stats)
-        print_button_stats_table(
-            f"Epoch {epoch + 1} train per-key/button @+{first_horizon_offset}:",
-            train_metrics["step1_button_rows"],
-        )
-        if int(cfg.prediction_horizon) > 1:
+            parts.append(
+                "va_change=" + ",".join(
+                    f"+{offset}:{score:.3f}"
+                    for offset, score in zip(horizon_offsets, val_metrics["horizon_change_macro_f1"])
+                )
+            )
+            parts.append(f"best={best_score:.4f}")
+        print(" | ".join(part for part in parts if part))
+        for horizon_idx, offset in enumerate(horizon_offsets):
             print_button_stats_table(
-                f"Epoch {epoch + 1} train per-key/button @+{final_horizon_offset}:",
-                train_metrics["final_button_rows"],
+                f"Epoch {epoch + 1} train state per-action @+{offset}:",
+                train_metrics["horizon_button_rows"][horizon_idx],
             )
         if val_metrics is not None:
-            val_stats = (
-                f"Epoch {epoch + 1} val stats: "
-                f"f1@+{first_horizon_offset}={val_metrics['step1_button_macro_f1']:.4f}"
-            )
-            if int(cfg.prediction_horizon) > 1:
-                val_stats += (
-                    f" f1@+{final_horizon_offset}={val_metrics['final_button_macro_f1']:.4f}"
-                )
-            print(val_stats)
-            print_button_stats_table(
-                f"Epoch {epoch + 1} val per-key/button @+{first_horizon_offset}:",
-                val_metrics["step1_button_rows"],
-            )
-            if int(cfg.prediction_horizon) > 1:
+            for horizon_idx, offset in enumerate(horizon_offsets):
                 print_button_stats_table(
-                    f"Epoch {epoch + 1} val per-key/button @+{final_horizon_offset}:",
-                    val_metrics["final_button_rows"],
+                    f"Epoch {epoch + 1} val state per-action @+{offset}:",
+                    val_metrics["horizon_button_rows"][horizon_idx],
                 )
         if (
             val_metrics is not None

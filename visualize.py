@@ -23,13 +23,12 @@ from inverse_dynamics import (  # noqa: E402
     inverse_checkpoint_family_mismatch_reason,
 )
 from models import (  # noqa: E402
+    ARCHITECTURE_VERSION,
+    MODEL_FAMILY,
     DrivingVideoPolicy,
     ModelConfig,
     TemporalState,
-    get_key_names as MODEL_GET_KEY_NAMES,
-    get_mouse_button_names as MODEL_GET_MOUSE_BUTTON_NAMES,
-    is_legacy_learned_pooling_state_key,
-    normalize_pooling_shape,
+    validate_policy_checkpoint,
 )
 
 
@@ -118,51 +117,8 @@ class FFmpegWriter:
 
 
 def _coerce_config_types(cfg: ModelConfig) -> ModelConfig:
-    if cfg.key_names is None:
-        cfg.key_names = MODEL_GET_KEY_NAMES(cfg.selected_game)
-    else:
-        cfg.key_names = list(cfg.key_names)
-
-    if cfg.mouse_button_names is None:
-        cfg.mouse_button_names = MODEL_GET_MOUSE_BUTTON_NAMES(cfg.selected_game)
-    else:
-        cfg.mouse_button_names = list(cfg.mouse_button_names)
-
-    cfg.seq_len = int(cfg.seq_len)
-    cfg.train_seq_stride = int(cfg.train_seq_stride)
-    cfg.val_seq_stride = int(cfg.val_seq_stride)
-    cfg.model_size = int(cfg.model_size)
-    cfg.prediction_dt = float(cfg.prediction_dt)
-    cfg.prediction_horizon = int(getattr(cfg, "prediction_horizon", 1))
-    offsets = getattr(cfg, "prediction_horizon_offsets", None)
-    if offsets is None:
-        cfg.prediction_horizon_offsets = tuple(range(1, cfg.prediction_horizon + 1))
-    else:
-        cfg.prediction_horizon_offsets = tuple(int(offset) for offset in offsets)
-        if not cfg.prediction_horizon_offsets:
-            cfg.prediction_horizon_offsets = tuple(range(1, cfg.prediction_horizon + 1))
-        if any(offset <= 0 for offset in cfg.prediction_horizon_offsets):
-            raise ValueError(f"prediction_horizon_offsets must be positive, got {cfg.prediction_horizon_offsets}.")
-        if any(curr <= prev for prev, curr in zip(cfg.prediction_horizon_offsets, cfg.prediction_horizon_offsets[1:])):
-            raise ValueError(
-                f"prediction_horizon_offsets must be strictly increasing, got {cfg.prediction_horizon_offsets}."
-            )
-        cfg.prediction_horizon = len(cfg.prediction_horizon_offsets)
-    cfg.d_model = int(cfg.d_model)
-    cfg.fastvit_depth = max(0, int(cfg.fastvit_depth))
-    cfg.fastvit_kernel_size = max(3, int(cfg.fastvit_kernel_size))
-    if cfg.fastvit_kernel_size % 2 == 0:
-        cfg.fastvit_kernel_size += 1
-    cfg.temporal_layers = max(1, int(cfg.temporal_layers))
-    cfg.temporal_heads = max(1, int(cfg.temporal_heads))
-    cfg.temporal_context = max(1, int(cfg.temporal_context))
-    cfg.pooling = normalize_pooling_shape(getattr(cfg, "pooling", (16, 16)))
-    cfg.recent_spatial_context = max(1, int(getattr(cfg, "recent_spatial_context", 10)))
-    cfg.high_res_spatial_context = max(1, int(getattr(cfg, "high_res_spatial_context", 20)))
-    cfg.high_res_pooling = normalize_pooling_shape(getattr(cfg, "high_res_pooling", (5, 5)))
-    cfg.low_res_pooling = normalize_pooling_shape(getattr(cfg, "low_res_pooling", (3, 3)))
-    cfg.num_bin = len(cfg.key_names) + len(cfg.mouse_button_names)
-    return cfg
+    values = {field.name: getattr(cfg, field.name) for field in fields(ModelConfig)}
+    return ModelConfig(**values)
 
 
 def _apply_config_overrides(cfg: ModelConfig, overrides: Dict) -> ModelConfig:
@@ -189,11 +145,13 @@ def _extract_model_state(state):
 
 
 def _detect_checkpoint_kind(state) -> LoadedModelKind:
+    if isinstance(state, dict) and state.get("model_family") == MODEL_FAMILY:
+        return "policy"
     config_dict = _extract_checkpoint_config(state)
     inverse_keys = {field.name for field in fields(InverseDynamicsConfig)}
     policy_keys = {field.name for field in fields(ModelConfig)}
 
-    inverse_markers = {"output_seq_len", "visual_encoder_name", "cnn_channels"}
+    inverse_markers = {"output_seq_len", "visual_encoder_name"}
     policy_markers = {"prediction_horizon", "model_size", "d_model"}
     if any(key in config_dict for key in inverse_markers):
         return "inverse"
@@ -234,25 +192,15 @@ def _find_latest_checkpoint(ckpt_dir: str) -> Optional[str]:
     return None
 
 
-def initialize_model_lazy_layers(
-    model: DrivingVideoPolicy,
-    cfg: ModelConfig,
-    device: torch.device,
-) -> None:
-    was_training = model.training
-    model.eval()
-    with torch.no_grad():
-        dummy_frames = torch.zeros(1, 1, 3, cfg.model_size, cfg.model_size, device=device)
-        dummy_dt = torch.full((1, 1), float(cfg.prediction_dt), device=device)
-        _ = model(dummy_frames, dt=dummy_dt)
-    model.train(was_training)
-
-
 def load_model_from_checkpoint(
     ckpt_path: str,
     device: torch.device,
 ) -> Tuple[DrivingVideoPolicy, ModelConfig]:
     state = _load_checkpoint_state(ckpt_path, device)
+    if not isinstance(state, dict) or state.get("model_family") != MODEL_FAMILY:
+        raise RuntimeError(f"Policy checkpoint must belong to {MODEL_FAMILY}.")
+    if int(state.get("architecture_version", -1)) != ARCHITECTURE_VERSION:
+        raise RuntimeError(f"Policy checkpoint must use architecture version {ARCHITECTURE_VERSION}.")
     cfg = ModelConfig()
     config_dict = _extract_checkpoint_config(state)
     if config_dict:
@@ -261,18 +209,9 @@ def load_model_from_checkpoint(
         cfg = _coerce_config_types(cfg)
 
     model = DrivingVideoPolicy(cfg=cfg).to(device)
-    initialize_model_lazy_layers(model, cfg, device)
-    model_state = _extract_model_state(state)
-    load_result = model.load_state_dict(model_state, strict=False)
-    bad_missing = list(load_result.missing_keys)
-    bad_unexpected = [
-        name for name in load_result.unexpected_keys if not is_legacy_learned_pooling_state_key(name)
-    ]
-    if bad_missing or bad_unexpected:
-        raise RuntimeError(
-            f"Policy checkpoint {ckpt_path} is incompatible with the current CNN variable-grid architecture. "
-            "Train a fresh policy checkpoint or pass a matching checkpoint."
-        )
+    validate_policy_checkpoint(state, cfg)
+    model_state = state["ema_model_state"]
+    model.load_state_dict(model_state, strict=True)
 
     model.eval()
     return model, cfg
@@ -354,15 +293,12 @@ def _policy_encoder_input(
     frame_rgb: torch.Tensor,
     previous_frame_rgb: Optional[torch.Tensor],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    del previous_frame_rgb
     if frame_rgb.dim() != 4 or frame_rgb.size(1) != 3:
         raise ValueError(f"Expected current frame [B,3,H,W], got {tuple(frame_rgb.shape)}.")
-    frame_rgb = model._normalize_frames(frame_rgb)
-    masked_frame = model._apply_masks(frame_rgb)
-    x = masked_frame
+    x, current = model.prepare_visual_input(frame_rgb, previous_frame_rgb)
     if x.is_cuda:
         x = x.contiguous(memory_format=torch.channels_last)
-    return x, frame_rgb.detach()
+    return x, current.detach()
 
 
 def _inverse_encoder_input(
@@ -389,11 +325,11 @@ def _policy_token_attention_heat_from_features(
     model: DrivingVideoPolicy,
     spatial_feats: torch.Tensor,
 ) -> torch.Tensor:
-    cell_tokens = model._project_spatial_features(spatial_feats)
+    cells = spatial_feats.permute(0, 2, 3, 1)
+    cell_tokens = model.cell_projector(cells)
     cell_energy = torch.linalg.vector_norm(cell_tokens.float(), ord=2, dim=-1)
     cell_energy = cell_energy / max(float(cell_tokens.size(-1)) ** 0.5, 1.0)
-    feature_h, feature_w = int(spatial_feats.size(-2)), int(spatial_feats.size(-1))
-    return cell_energy.reshape(spatial_feats.size(0), 1, feature_h, feature_w)
+    return cell_energy.unsqueeze(1)
 
 
 def _compute_feature_map(
@@ -406,11 +342,8 @@ def _compute_feature_map(
     if isinstance(model, DrivingVideoPolicy):
         x, current = _policy_encoder_input(model, frame_rgb, previous_frame_rgb)
         if layer == "motion":
-            return x.abs(), current, policy_state
-        if hasattr(model.spatial_encoder, "feature_stages"):
-            stages = model.spatial_encoder.feature_stages(x)
-        else:
-            stages = _activation_stages(model.spatial_encoder.net, x)
+            return x[:, 3:].abs(), current, policy_state
+        stages = model.spatial_encoder.feature_stages(x)
         if layer.startswith("stage"):
             stage_idx = int(layer.removeprefix("stage")) - 1
             if stage_idx < 0 or stage_idx >= len(stages):
@@ -554,21 +487,26 @@ def _action_index(cfg: ModelConfig, action_name: str) -> Optional[int]:
     return None
 
 
-def _button_thresholds(cfg: ModelConfig, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    thresholds = getattr(cfg, "button_state_thresholds", None)
-    if thresholds is None or len(tuple(thresholds)) != int(cfg.num_bin):
-        thresholds = tuple(float(cfg.button_state_threshold) for _ in range(int(cfg.num_bin)))
+def _button_thresholds(
+    cfg: ModelConfig,
+    device: torch.device,
+    dtype: torch.dtype,
+    horizon_idx: int = 0,
+) -> torch.Tensor:
+    all_thresholds = tuple(tuple(float(value) for value in row) for row in cfg.horizon_button_thresholds)
+    horizon_idx = max(0, min(int(horizon_idx), len(all_thresholds) - 1))
+    thresholds = all_thresholds[horizon_idx]
     return torch.tensor(tuple(float(value) for value in thresholds), device=device, dtype=dtype)
 
 
-def _button_threshold_value(cfg: ModelConfig, action_idx: Optional[int]) -> float:
+def _button_threshold_value(cfg: ModelConfig, action_idx: Optional[int], horizon_idx: int = 0) -> float:
     if action_idx is None:
         return float(getattr(cfg, "button_state_threshold", 0.5))
-    thresholds = getattr(cfg, "button_state_thresholds", None)
-    if thresholds is not None:
-        values = tuple(float(value) for value in thresholds)
-        if 0 <= int(action_idx) < len(values):
-            return values[int(action_idx)]
+    rows = tuple(tuple(float(value) for value in row) for row in cfg.horizon_button_thresholds)
+    horizon_idx = max(0, min(int(horizon_idx), len(rows) - 1))
+    values = rows[horizon_idx]
+    if 0 <= int(action_idx) < len(values):
+        return values[int(action_idx)]
     return float(getattr(cfg, "button_state_threshold", 0.5))
 
 
@@ -633,11 +571,11 @@ def _real_trajectory_probs_for_frame(
 
     rows: List[np.ndarray] = []
     for offset in offsets:
-        target_idx = int(frame_idx) + int(offset) - 1 + int(action_label_offset)
+        target_idx = int(frame_idx) + int(offset) + int(action_label_offset)
         if target_idx < 0 or target_idx >= int(buttons.shape[0]):
             break
         rows.append(buttons[target_idx])
-    if len(rows) < min(10, len(offsets)):
+    if len(rows) < len(offsets):
         return None
     return np.stack(rows, axis=0).astype(np.float32)
 
@@ -650,6 +588,7 @@ def _policy_visuals_for_frame(
     *,
     state: Optional[TemporalState],
     prev_action: Optional[torch.Tensor],
+    previous_frame_rgb: Optional[torch.Tensor],
     layer: FeatureLayer,
     resize_to: Optional[int],
     reduction: HeatReduction,
@@ -678,19 +617,20 @@ def _policy_visuals_for_frame(
 
     with torch.inference_mode():
         with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_autocast and x.is_cuda):
-            frame_rgb = model._normalize_frames(x)
-            masked_frame = model._apply_masks(frame_rgb)
-            if masked_frame.is_cuda:
-                masked_frame = masked_frame.contiguous(memory_format=torch.channels_last)
+            previous_model_frame = (
+                previous_frame_rgb
+                if state is None or state.previous_frame is None
+                else state.previous_frame
+            )
+            visual_input, frame_rgb = model.prepare_visual_input(x, previous_model_frame)
+            if visual_input.is_cuda:
+                visual_input = visual_input.contiguous(memory_format=torch.channels_last)
 
             stages: Optional[List[torch.Tensor]] = None
             if layer == "motion":
-                feat = masked_frame.abs()
+                feat = visual_input[:, 3:].abs()
             else:
-                if hasattr(model.spatial_encoder, "feature_stages"):
-                    stages = model.spatial_encoder.feature_stages(masked_frame)
-                else:
-                    stages = _activation_stages(model.spatial_encoder.net, masked_frame)
+                stages = model.spatial_encoder.feature_stages(visual_input)
 
                 if layer.startswith("stage"):
                     stage_idx = int(layer.removeprefix("stage")) - 1
@@ -722,8 +662,8 @@ def _policy_visuals_for_frame(
                 if bool(need_trajectory):
                     logits = output.horizon_button_logits[0].detach().float()
                     trajectory_probs = torch.sigmoid(logits).detach().cpu().numpy().astype(np.float32)
-                    command_idx = min(int(cfg.prediction_horizon) - 1, 9)
-                    thresholds = _button_thresholds(cfg, device=logits.device, dtype=logits.dtype)
+                    command_idx = 0
+                    thresholds = _button_thresholds(cfg, device=logits.device, dtype=logits.dtype, horizon_idx=command_idx)
                     next_action = (
                         torch.sigmoid(logits[command_idx]) >= thresholds
                     ).to(dtype=x.dtype).reshape(1, int(cfg.num_bin)).detach()
@@ -754,10 +694,13 @@ def _trajectory_points(
     *,
     x_offset_px: float = 0.0,
 ) -> Optional[np.ndarray]:
-    if probs.ndim != 2 or probs.shape[0] < 10:
+    if probs.ndim != 2 or probs.shape[0] < 2:
         return None
 
-    offsets = tuple(int(offset) for offset in getattr(cfg, "prediction_horizon_offsets", ()))
+    offsets = tuple(
+        int(offset) + int(getattr(cfg, "action_label_offset", 0))
+        for offset in getattr(cfg, "prediction_horizon_offsets", ())
+    )
     if len(offsets) != probs.shape[0]:
         offsets = tuple(range(1, probs.shape[0] + 1))
     max_offset = max(float(offsets[-1]), 1.0)
@@ -778,14 +721,16 @@ def _trajectory_points(
     previous_offset = 0
     points = [(base_x, base_y)]
 
-    w_threshold = _button_threshold_value(cfg, w_idx)
-    s_threshold = _button_threshold_value(cfg, s_idx)
-    a_threshold = _button_threshold_value(cfg, a_idx)
-    d_threshold = _button_threshold_value(cfg, d_idx)
-
     first_stop_idx: Optional[int] = None
     if s_idx is not None:
-        stop_hits = np.flatnonzero(probs[: len(offsets), s_idx] >= s_threshold)
+        stop_hits = np.asarray(
+            [
+                horizon_idx
+                for horizon_idx in range(len(offsets))
+                if probs[horizon_idx, s_idx] >= _button_threshold_value(cfg, s_idx, horizon_idx)
+            ],
+            dtype=np.int64,
+        )
         if stop_hits.size > 0:
             first_stop_idx = int(stop_hits[0])
             if first_stop_idx == 0:
@@ -798,6 +743,10 @@ def _trajectory_points(
         step_frac = max(float(offset - previous_offset) / max_offset, 0.0)
         previous_offset = int(offset)
         is_stop_horizon = first_stop_idx is not None and horizon_idx == first_stop_idx
+        w_threshold = _button_threshold_value(cfg, w_idx, horizon_idx)
+        s_threshold = _button_threshold_value(cfg, s_idx, horizon_idx)
+        a_threshold = _button_threshold_value(cfg, a_idx, horizon_idx)
+        d_threshold = _button_threshold_value(cfg, d_idx, horizon_idx)
 
         right_intent = float(probs[horizon_idx, d_idx]) if d_idx is not None else 0.0
         left_intent = float(probs[horizon_idx, a_idx]) if a_idx is not None else 0.0
@@ -1004,6 +953,15 @@ def process_video_cnn(
 ) -> None:
     if not os.path.exists(input_path):
         raise FileNotFoundError(f"Input video not found: {input_path}")
+    if isinstance(model, DrivingVideoPolicy):
+        effective_offsets = tuple(
+            int(offset) + int(action_label_offset)
+            for offset in model.cfg.prediction_horizon_offsets
+        )
+        if any(offset <= 0 for offset in effective_offsets):
+            raise ValueError(
+                f"All policy trajectory targets must be strictly future-facing, got effective offsets {effective_offsets}."
+            )
 
     cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
@@ -1048,17 +1006,17 @@ def process_video_cnn(
         and model_kind == "policy"
         and isinstance(model, DrivingVideoPolicy)
         and trajectory_cfg is not None
-        and int(getattr(trajectory_cfg, "prediction_horizon", 0)) >= 10
+        and int(getattr(trajectory_cfg, "prediction_horizon", 0)) >= 2
     )
     real_buttons: Optional[np.ndarray] = None
-    if trajectory_enabled and bool(draw_real_trajectory) and trajectory_cfg is not None:
+    if trajectory_enabled and trajectory_cfg is not None:
         resolved_csv_path = real_csv_path or _find_csv_for_video(
             input_path,
             csv_ext=str(getattr(trajectory_cfg, "csv_ext", ".csv")),
         )
         if resolved_csv_path is not None:
             real_buttons = _load_real_button_sequence(resolved_csv_path, trajectory_cfg)
-        else:
+        elif bool(draw_real_trajectory):
             print("[Encoder] No matching CSV found; left-side real trajectory will be omitted.")
 
     try:
@@ -1070,6 +1028,14 @@ def process_video_cnn(
             trajectory_probs: Optional[np.ndarray] = None
             real_trajectory_probs: Optional[np.ndarray] = None
             if isinstance(model, DrivingVideoPolicy) and trajectory_cfg is not None:
+                if trajectory_enabled and real_buttons is not None:
+                    previous_action_idx = frame_idx - 1
+                    if 0 <= previous_action_idx < int(real_buttons.shape[0]):
+                        trajectory_prev_action = torch.from_numpy(
+                            real_buttons[previous_action_idx]
+                        ).reshape(1, int(trajectory_cfg.num_bin))
+                    else:
+                        trajectory_prev_action = torch.zeros((1, int(trajectory_cfg.num_bin)), dtype=torch.float32)
                 heat_color, previous_frame_rgb, policy_state, trajectory_probs, trajectory_prev_action = (
                     _policy_visuals_for_frame(
                         frame,
@@ -1078,6 +1044,7 @@ def process_video_cnn(
                         device,
                         state=policy_state,
                         prev_action=trajectory_prev_action,
+                        previous_frame_rgb=previous_frame_rgb,
                         layer=layer,
                         resize_to=resize_to,
                         reduction=reduction,
@@ -1092,7 +1059,7 @@ def process_video_cnn(
                         need_trajectory=trajectory_enabled,
                     )
                 )
-                if trajectory_enabled:
+                if trajectory_enabled and bool(draw_real_trajectory):
                     real_trajectory_probs = _real_trajectory_probs_for_frame(
                         real_buttons,
                         frame_idx,
@@ -1179,7 +1146,7 @@ def process_video_cnn(
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Visualize feature-energy heatmaps from the current visual encoders.")
-    parser.add_argument("--input", default=r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\data\greenville\run_20260521_182038.mp4', help="Input video path. Defaults to the newest run in cfg.data_root.")
+    parser.add_argument("--input", default=None, help="Input video path. Defaults to the newest run in cfg.data_root.")
     parser.add_argument("--output", default=None, help="Output video path (.mp4). Default auto-names next to input.")
     parser.add_argument("--csv", default=None, help="CSV labels for the input video. Default auto-detects next to --input.")
     parser.add_argument(
@@ -1190,12 +1157,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--ckpt-path",
-        default=r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\checkpoints_rt\model_latest.pt',
+        default=None,
         help="Checkpoint path. If omitted, auto-select from --ckpt-dir.",
     )
     parser.add_argument(
         "--ckpt-dir",
-        default="./checkpoints_rt",
+        default="./checkpoints_multihorizon",
         help="Checkpoint directory used when --ckpt-path is omitted.",
     )
     parser.add_argument(
@@ -1237,18 +1204,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--no-trajectory",
         action="store_true",
         help="Disable the FSD-style policy trajectory overlay.",
-        default=True
     )
     parser.add_argument(
         "--no-real-trajectory",
         action="store_true",
         help="Disable the left-side ground-truth trajectory in side-by-side output.",
-    )
-    parser.add_argument(
-        "--action-label-offset",
-        type=int,
-        default=0,
-        help="Frame offset applied when reading real future labels from CSV.",
     )
     parser.add_argument(
         "--trajectory-alpha",
@@ -1281,6 +1241,8 @@ def main() -> None:
     )
     print(f"Resolved checkpoint type: {model_kind}")
     resize_to = int(args.resize_to) if args.resize_to is not None else int(cfg.model_size)
+    if model_kind == "policy" and resize_to != int(cfg.model_size):
+        raise ValueError(f"Policy visualization must use checkpoint model_size={cfg.model_size}, got {resize_to}.")
 
     if args.input is not None:
         input_path = args.input
@@ -1293,6 +1255,7 @@ def main() -> None:
     output_path = args.output or _default_output_path(input_path, args.layer, args.mode, model_kind)
     amp_dtype = torch.float16 if bool(args.fp16) else torch.bfloat16
     use_autocast = (not bool(args.no_amp)) and device.type == "cuda"
+    action_label_offset = int(getattr(cfg, "action_label_offset", 0))
 
     process_video_cnn(
         input_path=input_path,
@@ -1321,7 +1284,7 @@ def main() -> None:
         draw_trajectory=not bool(args.no_trajectory),
         draw_real_trajectory=not bool(args.no_real_trajectory),
         real_csv_path=None if args.csv is None else str(args.csv),
-        action_label_offset=int(args.action_label_offset),
+        action_label_offset=action_label_offset,
         trajectory_alpha=float(args.trajectory_alpha),
     )
 

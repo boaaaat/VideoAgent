@@ -141,6 +141,17 @@ def find_csv_for_video(video_path: str, csv_ext: str = ".csv") -> str:
     )
 
 
+def find_default_video(data_root: str, video_ext: str = ".mp4") -> str:
+    candidates = sorted(
+        os.path.join(data_root, name)
+        for name in os.listdir(data_root)
+        if name.startswith("run_") and name.endswith(video_ext) and not name.endswith(f"_keys{video_ext}")
+    )
+    if not candidates:
+        raise FileNotFoundError(f"No run_*{video_ext} videos found under {data_root!r}.")
+    return candidates[-1]
+
+
 def load_csv_rows(csv_path: str) -> Tuple[List[str], List[Dict[str, str]]]:
     with open(csv_path, "r", newline="") as f:
         reader = csv.DictReader(f)
@@ -228,7 +239,7 @@ def draw_overlay(
     label_str = f"{label_idx}" if label_idx is not None else "N/A"
     cv2.putText(
         frame,
-        f"Target idx: {label_str} = frame + frame_offset - 1 + label_offset",
+        f"Target idx: {label_str} = frame + frame_offset + label_offset",
         (x0 + 10, y),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.5,
@@ -359,8 +370,13 @@ def main() -> int:
     )
     parser.add_argument(
         "--video",
-        help="Path to the video file.",
-        default=r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\data\greenville\run_20260528_121826.mp4',
+        help="Path to the video file. Defaults to the newest run in --data-root.",
+        default=None,
+    )
+    parser.add_argument(
+        "--data-root",
+        default=game_data_root(selected_game),
+        help="Dataset root used when --video is omitted.",
     )
     parser.add_argument(
         "--csv",
@@ -369,33 +385,27 @@ def main() -> int:
         help="Optional path to CSV. If omitted, auto-matched from video name.",
     )
     parser.add_argument(
-        "--label-shift",
-        type=int,
-        default=None,
-        help="Legacy direct label shift. Prefer --prediction-horizon and --action-label-offset.",
-    )
-    parser.add_argument(
         "--prediction-horizon",
         type=int,
         default=None,
-        help="Direct future frame offset override. Target idx = frame + offset - 1 + action_label_offset.",
+        help="Direct future frame offset override. Target idx = frame + offset + action_label_offset.",
     )
     parser.add_argument(
         "--prediction-horizon-offsets",
-        default="1,2,3,5,7,10,13,16,20,24",
+        default="1,2,3,5,7,10",
         help="Comma-separated training horizon frame offsets.",
     )
     parser.add_argument(
         "--command-horizon",
         type=int,
-        default=10,
+        default=1,
         help="1-based horizon head to visualize when --prediction-horizon is omitted.",
     )
     parser.add_argument(
         "--action-label-offset",
         type=int,
-        default=-1,
-        help="Same offset used by train.py. Target idx = frame + frame_offset - 1 + label_offset.",
+        default=0,
+        help="Same offset used by train.py. Target idx = frame + frame_offset + label_offset.",
     )
     parser.add_argument(
         "--max-frames",
@@ -431,7 +441,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    video_path = args.video
+    video_path = args.video or find_default_video(str(args.data_root))
     if not os.path.exists(video_path):
         raise FileNotFoundError(f"Video not found: {video_path}")
 
@@ -508,12 +518,13 @@ def main() -> int:
                 if args.prediction_horizon is not None
                 else int(horizon_offsets[command_idx])
             )
-            if args.label_shift is None:
-                action_label_offset = int(args.action_label_offset)
-                label_idx = current_idx + prediction_horizon - 1 + action_label_offset
-            else:
-                action_label_offset = int(args.label_shift) - prediction_horizon + 1
-                label_idx = current_idx + int(args.label_shift)
+            action_label_offset = int(args.action_label_offset)
+            label_idx = current_idx + prediction_horizon + action_label_offset
+            if prediction_horizon + action_label_offset <= 0:
+                raise ValueError(
+                    "The effective target offset must be strictly future-facing, "
+                    f"got {prediction_horizon + action_label_offset}."
+                )
 
             if 0 <= label_idx < len(rows):
                 keys, clicks, mouse_delta, label_ts = parse_row(
