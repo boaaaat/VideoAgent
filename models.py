@@ -14,7 +14,7 @@ from action_space import (
 
 
 MODEL_FAMILY = "causal_multihorizon_video_policy"
-ARCHITECTURE_VERSION = 1
+ARCHITECTURE_VERSION = 4
 DEFAULT_HORIZON_OFFSETS = (1, 2, 3, 5, 7, 10)
 BURN_IN_FRAMES = 20
 POLICY_INPUT_CHANNELS = 6
@@ -26,13 +26,6 @@ def _group_norm(channels: int) -> nn.GroupNorm:
     while groups > 1 and int(channels) % groups != 0:
         groups -= 1
     return nn.GroupNorm(groups, int(channels))
-
-
-def _valid_head_count(channels: int, requested: int) -> int:
-    heads = min(max(1, int(requested)), int(channels))
-    while heads > 1 and int(channels) % heads != 0:
-        heads -= 1
-    return heads
 
 
 def _coerce_horizon_offsets(offsets: Optional[Sequence[int]]) -> Tuple[int, ...]:
@@ -70,16 +63,11 @@ class ModelConfig:
     mouse_button_names: Optional[List[str]] = None
     num_bin: int = 0
 
-    cnn_channels: Tuple[int, int, int, int] = (32, 64, 128, 256)
-    spatial_channels: int = 256
-    spatial_query_count: int = 8
-    d_model: int = 384
-    spatial_attention_heads: int = 8
-    temporal_layers: int = 4
-    temporal_heads: int = 8
-    temporal_context: int = 80
-    horizon_layers: int = 2
-    horizon_heads: int = 8
+    cnn_channels: Tuple[int, int, int] = (32, 64, 128)
+    spatial_channels: int = 128
+    compressor_channels: int = 8
+    spatial_pool_size: int = 8
+    d_model: int = 512
 
     spatial_dropout: float = 0.05
     temporal_dropout: float = 0.10
@@ -98,7 +86,7 @@ class ModelConfig:
 
         self.model_size = int(self.model_size)
         if self.model_size != 256:
-            raise ValueError(f"This policy family requires model_size=256 for a 16x16 spatial map, got {self.model_size}.")
+            raise ValueError(f"This policy family requires model_size=256 for a 64x64 spatial map, got {self.model_size}.")
         self.seq_len = max(1, int(self.seq_len))
         self.train_seq_stride = max(1, int(self.train_seq_stride))
         self.val_seq_stride = max(1, int(self.val_seq_stride))
@@ -129,8 +117,8 @@ class ModelConfig:
             raise ValueError("The policy requires at least one action key or mouse button.")
 
         channels = tuple(max(8, int(value)) for value in self.cnn_channels)
-        if len(channels) != 4:
-            raise ValueError(f"cnn_channels must contain four stages, got {channels}.")
+        if len(channels) != 3:
+            raise ValueError(f"cnn_channels must contain three stages, got {channels}.")
         self.cnn_channels = channels
         self.spatial_channels = max(32, int(self.spatial_channels))
         if self.spatial_channels != self.cnn_channels[-1]:
@@ -138,18 +126,9 @@ class ModelConfig:
                 f"spatial_channels must match the final CNN channel count, got "
                 f"{self.spatial_channels} and {self.cnn_channels[-1]}."
             )
-        self.spatial_query_count = max(1, int(self.spatial_query_count))
+        self.compressor_channels = max(1, int(self.compressor_channels))
+        self.spatial_pool_size = max(1, int(self.spatial_pool_size))
         self.d_model = max(64, int(self.d_model))
-        self.spatial_attention_heads = _valid_head_count(self.d_model, self.spatial_attention_heads)
-        self.temporal_layers = max(1, int(self.temporal_layers))
-        self.temporal_heads = _valid_head_count(self.d_model, self.temporal_heads)
-        self.temporal_context = min(80, max(1, int(self.temporal_context)))
-        if self.seq_len > self.temporal_context:
-            raise ValueError(
-                f"seq_len must not exceed the {self.temporal_context}-frame temporal context, got {self.seq_len}."
-            )
-        self.horizon_layers = max(1, int(self.horizon_layers))
-        self.horizon_heads = _valid_head_count(self.d_model, self.horizon_heads)
 
         self.spatial_dropout = float(min(max(self.spatial_dropout, 0.0), 0.9))
         self.temporal_dropout = float(min(max(self.temporal_dropout, 0.0), 0.9))
@@ -215,14 +194,9 @@ def validate_policy_checkpoint(
         "action_label_offset",
         "cnn_channels",
         "spatial_channels",
-        "spatial_query_count",
+        "compressor_channels",
+        "spatial_pool_size",
         "d_model",
-        "spatial_attention_heads",
-        "temporal_layers",
-        "temporal_heads",
-        "temporal_context",
-        "horizon_layers",
-        "horizon_heads",
         "spatial_dropout",
         "temporal_dropout",
         "head_dropout",
@@ -288,6 +262,7 @@ class TemporalState:
     previous_frame: Optional[torch.Tensor] = None
     spatial_hidden: Optional[torch.Tensor] = None
     temporal_tokens: Optional[torch.Tensor] = None
+    temporal_lengths: Optional[torch.Tensor] = None
 
 
 class TokenGroupNorm(nn.Module):
@@ -305,15 +280,24 @@ class TokenGroupNorm(nn.Module):
 
 
 class ConvNormAct(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, *, stride: int = 1, kernel_size: int = 3) -> None:
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        *,
+        stride: int = 1,
+        kernel_size: int = 3,
+        dilation: int = 1,
+    ) -> None:
         super().__init__()
-        padding = kernel_size // 2
+        padding = int(dilation) * (kernel_size // 2)
         self.conv = nn.Conv2d(
             in_channels,
             out_channels,
             kernel_size=kernel_size,
             stride=stride,
             padding=padding,
+            dilation=int(dilation),
             bias=False,
         )
         self.norm = _group_norm(out_channels)
@@ -340,9 +324,9 @@ class ResidualSpatialBlock(nn.Module):
 class SpatialEncoder(nn.Module):
     def __init__(self, channels: Sequence[int], dropout: float) -> None:
         super().__init__()
-        c1, c2, c3, c4 = (int(value) for value in channels)
+        c1, c2, c3 = (int(value) for value in channels)
         self.stage1 = nn.Sequential(
-            ConvNormAct(POLICY_INPUT_CHANNELS, c1, stride=2, kernel_size=5),
+            ConvNormAct(POLICY_INPUT_CHANNELS, c1, stride=2),
             ResidualSpatialBlock(c1, dropout),
         )
         self.stage2 = nn.Sequential(
@@ -350,38 +334,53 @@ class SpatialEncoder(nn.Module):
             ResidualSpatialBlock(c2, dropout),
         )
         self.stage3 = nn.Sequential(
-            ConvNormAct(c2, c3, stride=2),
+            ConvNormAct(c2, c3, stride=1, dilation=2),
             ResidualSpatialBlock(c3, dropout),
-        )
-        self.stage4 = nn.Sequential(
-            ConvNormAct(c3, c4, stride=2),
-            ResidualSpatialBlock(c4, dropout),
+            ConvNormAct(c3, c3, stride=1, dilation=4),
+            ResidualSpatialBlock(c3, dropout),
         )
 
     def feature_stages(self, x: torch.Tensor) -> List[torch.Tensor]:
         stage1 = self.stage1(x)
         stage2 = self.stage2(stage1)
         stage3 = self.stage3(stage2)
-        stage4 = self.stage4(stage3)
-        return [stage1, stage2, stage3, stage4]
+        return [stage1, stage2, stage3]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.feature_stages(x)[-1]
 
 
 class SpatialConvGRUCell(nn.Module):
-    def __init__(self, channels: int) -> None:
+    def __init__(self, in_channels: int, hidden_channels: int, kernel_size: int = 3) -> None:
         super().__init__()
-        combined_channels = int(channels) * 2
-        self.channels = int(channels)
-        self.gates = nn.Conv2d(combined_channels, self.channels * 2, kernel_size=3, padding=1, bias=False)
-        self.gates_norm = _group_norm(self.channels * 2)
-        self.candidate = nn.Conv2d(combined_channels, self.channels, kernel_size=3, padding=1, bias=False)
-        self.candidate_norm = _group_norm(self.channels)
+        self.in_channels = int(in_channels)
+        self.hidden_channels = int(hidden_channels)
+        padding = int(kernel_size) // 2
+        combined_channels = self.in_channels + self.hidden_channels
+        self.gates = nn.Conv2d(
+            combined_channels,
+            self.hidden_channels * 2,
+            kernel_size=int(kernel_size),
+            padding=padding,
+            bias=False,
+        )
+        self.gates_norm = _group_norm(self.hidden_channels * 2)
+        self.candidate = nn.Conv2d(
+            combined_channels,
+            self.hidden_channels,
+            kernel_size=int(kernel_size),
+            padding=padding,
+            bias=False,
+        )
+        self.candidate_norm = _group_norm(self.hidden_channels)
 
     def forward(self, x: torch.Tensor, hidden: Optional[torch.Tensor]) -> torch.Tensor:
         if hidden is None:
-            hidden = torch.zeros_like(x)
+            hidden = x.new_zeros((int(x.size(0)), self.hidden_channels, int(x.size(2)), int(x.size(3))))
+        if int(x.size(1)) != self.in_channels:
+            raise ValueError(f"Expected ConvGRU input channels={self.in_channels}, got {tuple(x.shape)}.")
+        if int(hidden.size(1)) != self.hidden_channels:
+            raise ValueError(f"Expected ConvGRU hidden channels={self.hidden_channels}, got {tuple(hidden.shape)}.")
         combined = torch.cat((x, hidden), dim=1)
         update, reset = self.gates_norm(self.gates(combined)).chunk(2, dim=1)
         update = torch.sigmoid(update)
@@ -397,25 +396,23 @@ class DrivingVideoPolicy(nn.Module):
         self.cfg = cfg
         self.model_family = MODEL_FAMILY
         self.architecture_version = ARCHITECTURE_VERSION
-        self.feature_size = int(cfg.model_size) // 16
+        self.feature_size = int(cfg.model_size) // 4
+        self.compressed_feature_dim = int(cfg.compressor_channels) * int(cfg.spatial_pool_size) * int(cfg.spatial_pool_size)
 
         self.spatial_encoder = SpatialEncoder(cfg.cnn_channels, cfg.spatial_dropout)
-        self.spatial_gru = SpatialConvGRUCell(cfg.spatial_channels)
-        self.cell_projector = nn.Sequential(
-            nn.Linear(cfg.spatial_channels, cfg.d_model),
-            nn.LayerNorm(cfg.d_model),
+        self.spatial_gru = SpatialConvGRUCell(cfg.spatial_channels, cfg.spatial_channels)
+        self.channel_compressor = nn.Sequential(
+            nn.Conv2d(cfg.spatial_channels, cfg.compressor_channels, kernel_size=1, bias=False),
+            _group_norm(cfg.compressor_channels),
             nn.SiLU(inplace=True),
         )
-        self.spatial_queries = nn.Parameter(torch.empty(cfg.spatial_query_count, cfg.d_model))
-        nn.init.normal_(self.spatial_queries, mean=0.0, std=0.02)
-        self.spatial_query_norm = nn.LayerNorm(cfg.d_model)
-        self.spatial_cross_attention = nn.MultiheadAttention(
-            cfg.d_model,
-            cfg.spatial_attention_heads,
-            dropout=cfg.temporal_dropout,
-            batch_first=True,
+        self.spatial_pool = nn.AdaptiveAvgPool2d((cfg.spatial_pool_size, cfg.spatial_pool_size))
+        self.frame_projector = nn.Sequential(
+            nn.LayerNorm(self.compressed_feature_dim),
+            nn.Linear(self.compressed_feature_dim, cfg.d_model),
+            nn.SiLU(inplace=True),
+            nn.Dropout(cfg.temporal_dropout),
         )
-        self.spatial_pool_norm = nn.LayerNorm(cfg.d_model)
 
         context_hidden = max(64, cfg.d_model // 2)
         self.dt_encoder = nn.Sequential(
@@ -440,24 +437,6 @@ class DrivingVideoPolicy(nn.Module):
         nn.init.constant_(self.context_gate.bias, -2.0)
         self.fused_norm = TokenGroupNorm(cfg.d_model)
 
-        self.temporal_position = nn.Parameter(torch.empty(1, cfg.temporal_context, cfg.d_model))
-        nn.init.normal_(self.temporal_position, mean=0.0, std=0.02)
-        temporal_layer = nn.TransformerEncoderLayer(
-            d_model=cfg.d_model,
-            nhead=cfg.temporal_heads,
-            dim_feedforward=cfg.d_model * 4,
-            dropout=cfg.temporal_dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
-        )
-        self.temporal_encoder = nn.TransformerEncoder(
-            temporal_layer,
-            num_layers=cfg.temporal_layers,
-            norm=nn.LayerNorm(cfg.d_model),
-            enable_nested_tensor=False,
-        )
-
         self.horizon_queries = nn.Parameter(torch.empty(cfg.prediction_horizon, cfg.d_model))
         nn.init.normal_(self.horizon_queries, mean=0.0, std=0.02)
         self.horizon_time_encoder = nn.Sequential(
@@ -465,21 +444,7 @@ class DrivingVideoPolicy(nn.Module):
             nn.SiLU(inplace=True),
             nn.Linear(context_hidden, cfg.d_model),
         )
-        horizon_layer = nn.TransformerEncoderLayer(
-            d_model=cfg.d_model,
-            nhead=cfg.horizon_heads,
-            dim_feedforward=cfg.d_model * 2,
-            dropout=cfg.head_dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
-        )
-        self.horizon_decoder = nn.TransformerEncoder(
-            horizon_layer,
-            num_layers=cfg.horizon_layers,
-            norm=nn.LayerNorm(cfg.d_model),
-            enable_nested_tensor=False,
-        )
+        self.horizon_norm = TokenGroupNorm(cfg.d_model)
         head_hidden = max(128, cfg.d_model // 2)
         self.button_head = nn.Sequential(
             TokenGroupNorm(cfg.d_model),
@@ -536,11 +501,53 @@ class DrivingVideoPolicy(nn.Module):
             visual_input = visual_input.contiguous(memory_format=torch.channels_last)
         return self.spatial_encoder.feature_stages(visual_input), current
 
-    def _prepare_sequence_visual_input(self, frames: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _coerce_reset_mask(
+        self,
+        reset_mask: Optional[torch.Tensor],
+        batch_size: int,
+        *,
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        if reset_mask is None:
+            return None
+        values = reset_mask.to(device=device, dtype=torch.bool).reshape(-1)
+        if int(values.numel()) != batch_size:
+            raise ValueError(f"Expected reset_mask with {batch_size} values, got {tuple(values.shape)}.")
+        return values
+
+    def _reset_batch_rows(
+        self,
+        value: Optional[torch.Tensor],
+        reset_mask: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        if value is None or reset_mask is None or not bool(reset_mask.any().item()):
+            return value
+        view_shape = [int(reset_mask.numel())] + [1] * (value.dim() - 1)
+        keep = (~reset_mask).to(device=value.device).view(*view_shape)
+        return value * keep.to(dtype=value.dtype)
+
+    def _prepare_sequence_visual_input(
+        self,
+        frames: torch.Tensor,
+        previous_frame: Optional[torch.Tensor] = None,
+        reset_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         if frames.dim() != 5 or int(frames.size(2)) != 3:
             raise ValueError(f"Expected frames [B,T,3,H,W], got {tuple(frames.shape)}.")
         current = self._apply_masks(self._normalize_frames(frames))
-        previous = torch.cat((torch.zeros_like(current[:, :1]), current[:, :-1]), dim=1)
+        batch_size = int(current.size(0))
+        if previous_frame is None:
+            first_previous = torch.zeros_like(current[:, :1])
+        else:
+            first_previous = previous_frame.to(device=current.device, dtype=current.dtype)
+            if tuple(first_previous.shape) != tuple(current[:, 0].shape):
+                raise ValueError(
+                    f"Expected previous_frame shape {tuple(current[:, 0].shape)}, got {tuple(first_previous.shape)}."
+                )
+            reset_mask = self._coerce_reset_mask(reset_mask, batch_size, device=current.device)
+            first_previous = self._reset_batch_rows(first_previous, reset_mask)
+            first_previous = first_previous.unsqueeze(1)
+        previous = torch.cat((first_previous, current[:, :-1]), dim=1)
         motion = current - previous
         return torch.cat((current, motion), dim=2), current
 
@@ -575,18 +582,12 @@ class DrivingVideoPolicy(nn.Module):
         if states.dim() != 5:
             raise ValueError(f"Expected spatial states [B,T,C,H,W], got {tuple(states.shape)}.")
         batch_size, time_steps, channels, height, width = states.shape
-        cells = states.permute(0, 1, 3, 4, 2).reshape(batch_size * time_steps, height * width, channels)
-        cells = self.cell_projector(cells)
-        queries = self.spatial_queries.to(device=cells.device, dtype=cells.dtype)
-        queries = queries.unsqueeze(0).expand(batch_size * time_steps, -1, -1)
-        pooled, _ = self.spatial_cross_attention(
-            self.spatial_query_norm(queries),
-            cells,
-            cells,
-            need_weights=False,
-        )
-        pooled = self.spatial_pool_norm(pooled + queries).mean(dim=1)
-        return pooled.reshape(batch_size, time_steps, self.cfg.d_model)
+        flat = states.reshape(batch_size * time_steps, channels, height, width)
+        compressed = self.channel_compressor(flat)
+        pooled = self.spatial_pool(compressed)
+        flattened = pooled.flatten(1)
+        projected = self.frame_projector(flattened)
+        return projected.reshape(batch_size, time_steps, self.cfg.d_model)
 
     def _coerce_dt(
         self,
@@ -675,22 +676,10 @@ class DrivingVideoPolicy(nn.Module):
         gate = torch.sigmoid(self.context_gate(torch.cat((frame_tokens, dt_features, action_features), dim=-1)))
         return self.fused_norm(frame_tokens + gate * delta)
 
-    def _causal_mask(self, length: int, device: torch.device) -> torch.Tensor:
-        return torch.triu(torch.ones((length, length), device=device, dtype=torch.bool), diagonal=1)
-
     def _encode_temporal(self, tokens: torch.Tensor) -> torch.Tensor:
         if tokens.dim() != 3:
             raise ValueError(f"Expected temporal tokens [B,T,D], got {tuple(tokens.shape)}.")
-        length = int(tokens.size(1))
-        if length > self.cfg.temporal_context:
-            raise ValueError(
-                f"Temporal sequence length {length} exceeds the {self.cfg.temporal_context}-token causal context."
-            )
-        position = self.temporal_position[:, self.cfg.temporal_context - length:].to(
-            device=tokens.device,
-            dtype=tokens.dtype,
-        )
-        return self.temporal_encoder(tokens + position, mask=self._causal_mask(length, tokens.device), is_causal=False)
+        return tokens
 
     def _decode_horizons(
         self,
@@ -731,9 +720,7 @@ class DrivingVideoPolicy(nn.Module):
         horizon_queries = self.horizon_queries.to(device=temporal_features.device, dtype=temporal_features.dtype)
         horizon_base = horizon_queries.reshape(1, 1, self.cfg.prediction_horizon, d_model) + horizon_time
 
-        decoded_input = temporal_features.unsqueeze(2) + horizon_base
-        decoded = self.horizon_decoder(decoded_input.reshape(batch_size * time_steps, self.cfg.prediction_horizon, d_model))
-        decoded = decoded.reshape(batch_size, time_steps, self.cfg.prediction_horizon, d_model)
+        decoded = self.horizon_norm(temporal_features.unsqueeze(2) + horizon_base)
         button = self.button_head(decoded)
         change = self.change_head(decoded)
 
@@ -750,7 +737,21 @@ class DrivingVideoPolicy(nn.Module):
         frames: torch.Tensor,
         dt: Optional[torch.Tensor] = None,
         prev_action: Optional[torch.Tensor] = None,
-    ) -> PolicyOutput:
+        state: Optional[TemporalState] = None,
+        reset_mask: Optional[torch.Tensor] = None,
+        return_state: bool = False,
+    ):
+        if state is not None or reset_mask is not None or return_state:
+            output, next_state = self.forward_sequence_with_state(
+                frames,
+                dt=dt,
+                state=state,
+                prev_action=prev_action,
+                reset_mask=reset_mask,
+            )
+            if return_state:
+                return output, next_state
+            return output
         visual_input, _ = self._prepare_sequence_visual_input(frames)
         features = self._spatial_features(visual_input)
         spatial_states, _ = self._run_spatial_gru(features)
@@ -758,6 +759,46 @@ class DrivingVideoPolicy(nn.Module):
         fused = self._fuse_context(frame_tokens, dt, prev_action)
         temporal = self._encode_temporal(fused)
         return self._decode_horizons(temporal, dt)
+
+    def forward_sequence_with_state(
+        self,
+        frames: torch.Tensor,
+        dt: Optional[torch.Tensor],
+        state: Optional[TemporalState],
+        prev_action: Optional[torch.Tensor] = None,
+        reset_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[PolicyOutput, TemporalState]:
+        state = state if state is not None else TemporalState()
+        if frames.dim() != 5:
+            raise ValueError(f"Expected frames [B,T,3,H,W], got {tuple(frames.shape)}.")
+        batch_size = int(frames.size(0))
+        reset_mask = self._coerce_reset_mask(reset_mask, batch_size, device=frames.device)
+
+        previous_frame = state.previous_frame
+        if previous_frame is not None:
+            previous_frame = previous_frame.to(device=frames.device)
+        visual_input, current = self._prepare_sequence_visual_input(frames, previous_frame, reset_mask)
+        features = self._spatial_features(visual_input)
+
+        spatial_hidden = state.spatial_hidden
+        if spatial_hidden is not None:
+            spatial_hidden = spatial_hidden.to(device=features.device, dtype=features.dtype)
+            if int(spatial_hidden.size(0)) != batch_size:
+                raise ValueError(f"Spatial state batch mismatch: expected {batch_size}, got {spatial_hidden.size(0)}.")
+            spatial_hidden = self._reset_batch_rows(spatial_hidden, reset_mask)
+
+        spatial_states, spatial_hidden = self._run_spatial_gru(features, spatial_hidden)
+        frame_tokens = self._pool_spatial_states(spatial_states)
+        fused = self._fuse_context(frame_tokens, dt, prev_action)
+        temporal = self._encode_temporal(fused)
+        output = self._decode_horizons(temporal, dt)
+        next_state = TemporalState(
+            previous_frame=current[:, -1].detach(),
+            spatial_hidden=spatial_hidden.detach(),
+            temporal_tokens=None,
+            temporal_lengths=None,
+        )
+        return output, next_state
 
     def forward_step(
         self,
@@ -774,20 +815,12 @@ class DrivingVideoPolicy(nn.Module):
         spatial_hidden = self.spatial_gru(features, state.spatial_hidden)
         frame_token = self._pool_spatial_states(spatial_hidden.unsqueeze(1))
         fused = self._fuse_context(frame_token, dt, prev_action)
-
-        if state.temporal_tokens is None:
-            memory = fused
-        else:
-            prior = state.temporal_tokens.to(device=fused.device, dtype=fused.dtype)
-            if int(prior.size(0)) != int(fused.size(0)):
-                raise ValueError(f"Temporal state batch mismatch: expected {fused.size(0)}, got {prior.size(0)}.")
-            memory = torch.cat((prior, fused), dim=1)
-        memory = memory[:, -self.cfg.temporal_context:]
-        temporal = self._encode_temporal(memory)
+        temporal = self._encode_temporal(fused)
         output = self._decode_horizons(temporal[:, -1], dt)
         next_state = TemporalState(
             previous_frame=current.detach(),
             spatial_hidden=spatial_hidden.detach(),
-            temporal_tokens=memory.detach(),
+            temporal_tokens=None,
+            temporal_lengths=None,
         )
         return output, next_state

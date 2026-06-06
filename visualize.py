@@ -325,11 +325,10 @@ def _policy_token_attention_heat_from_features(
     model: DrivingVideoPolicy,
     spatial_feats: torch.Tensor,
 ) -> torch.Tensor:
-    cells = spatial_feats.permute(0, 2, 3, 1)
-    cell_tokens = model.cell_projector(cells)
-    cell_energy = torch.linalg.vector_norm(cell_tokens.float(), ord=2, dim=-1)
-    cell_energy = cell_energy / max(float(cell_tokens.size(-1)) ** 0.5, 1.0)
-    return cell_energy.unsqueeze(1)
+    compressed = model.channel_compressor(spatial_feats)
+    energy = torch.linalg.vector_norm(compressed.float(), ord=2, dim=1, keepdim=True)
+    energy = energy / max(float(compressed.size(1)) ** 0.5, 1.0)
+    return energy
 
 
 def _compute_feature_map(
@@ -1146,7 +1145,7 @@ def process_video_cnn(
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Visualize feature-energy heatmaps from the current visual encoders.")
-    parser.add_argument("--input", default=None, help="Input video path. Defaults to the newest run in cfg.data_root.")
+    parser.add_argument("--input", default=r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\data\greenville\run_20260520_121714.mp4', help="Input video path. Defaults to the newest run in cfg.data_root.")
     parser.add_argument("--output", default=None, help="Output video path (.mp4). Default auto-names next to input.")
     parser.add_argument("--csv", default=None, help="CSV labels for the input video. Default auto-detects next to --input.")
     parser.add_argument(
@@ -1162,16 +1161,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--ckpt-dir",
-        default="./checkpoints_multihorizon",
+        default="./checkpoints_rt",
         help="Checkpoint directory used when --ckpt-path is omitted.",
     )
     parser.add_argument(
         "--layer",
         choices=["motion", "stage1", "stage2", "stage3", "stage4", "spatial", "tokens"],
-        default="spatial",
+        default="stage3",
         help=(
-            "Encoder signal to visualize. Policy checkpoints use masked RGB input for motion, stage1-stage4 for "
-            "the spatial encoder blocks, final CNN features for spatial, and projected CNN token energy for tokens. "
+            "Encoder signal to visualize. Policy checkpoints use masked RGB input for motion, stage1-stage3 for "
+            "the spatial encoder blocks, final CNN features for spatial, and compressed CNN energy for tokens. "
             "Inverse checkpoints support "
             "motion and stage1-stage4."
         ),
@@ -1199,11 +1198,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fp16", action="store_true", help="Use fp16 autocast on CUDA instead of bf16.")
     parser.add_argument("--no-amp", action="store_true", help="Disable autocast during encoder inference.")
     parser.add_argument("--cpu", action="store_true", help="Force CPU execution.")
-    parser.add_argument("--max-frames", type=int, default=None, help="Stop after this many frames.")
+    parser.add_argument("--max-frames", type=int, default=5000, help="Stop after this many frames.")
     parser.add_argument(
         "--no-trajectory",
         action="store_true",
         help="Disable the FSD-style policy trajectory overlay.",
+        default=True
     )
     parser.add_argument(
         "--no-real-trajectory",

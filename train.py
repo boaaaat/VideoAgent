@@ -34,6 +34,7 @@ from models import (
     DrivingVideoPolicy,
     ModelConfig,
     PolicyOutput,
+    TemporalState,
     validate_policy_checkpoint,
 )
 
@@ -52,7 +53,7 @@ class TrainConfig(ModelConfig):
     grad_clip: float = 1.0
 
     amp_dtype: str = "bf16"
-    compile_model: bool = True
+    compile_model: bool = False
     compile_mode: str = "default"
 
     train_split: float = 0.8
@@ -92,7 +93,7 @@ class TrainConfig(ModelConfig):
     dali_dont_use_mmap: bool = False
     dali_resize_mode: str = "video_then_resize"
     dali_prepare_first_batch: bool = True
-    dali_train_random_shuffle: bool = True
+    dali_train_random_shuffle: bool = False
     dali_val_random_shuffle: bool = False
     dali_shuffle_seed: int = 1337
     sync_dataset: bool = True
@@ -102,7 +103,7 @@ class TrainConfig(ModelConfig):
 
     resume: bool = False
     resume_path: Optional[str] = None
-    ckpt_dir: str = "./checkpoints_multihorizon"
+    ckpt_dir: str = "./checkpoints_rt"
     save_every: int = 1
     print_every: int = 20
     max_train_batches: Optional[int] = None
@@ -181,7 +182,9 @@ class WindowTargets:
     change_horizon: torch.Tensor
     horizon_valid: torch.Tensor
     last_action: torch.Tensor
+    state_reset: torch.Tensor
     meta: Optional[List[Tuple[str, int, int]]] = None
+    streams: Optional[List[List[int]]] = None
 
 
 @dataclass
@@ -381,11 +384,14 @@ def build_window_targets(
     change_windows: List[np.ndarray] = []
     valid_windows: List[np.ndarray] = []
     last_action_windows: List[np.ndarray] = []
+    state_reset_windows: List[np.ndarray] = []
     dt_windows: List[np.ndarray] = []
     meta: List[Tuple[str, int, int]] = []
+    streams: List[List[int]] = []
 
     horizon_offsets = tuple(int(offset) for offset in cfg.prediction_horizon_offsets)
     horizon = len(horizon_offsets)
+    chunk_stride = max(1, int(stride))
     for video_path, csv_path in pairs:
         run = load_run_arrays(csv_path, cfg)
         buttons = run["buttons"]
@@ -394,7 +400,8 @@ def build_window_targets(
             continue
 
         max_start = buttons.shape[0] - cfg.seq_len
-        for start in range(0, max_start + 1, max(1, int(stride))):
+        run_indices: List[int] = []
+        for start in range(0, max_start + 1, chunk_stride):
             end = start + cfg.seq_len
             button_target = np.zeros((cfg.seq_len, horizon, cfg.num_bin), dtype=np.float32)
             change_target = np.zeros((cfg.seq_len, horizon, cfg.num_bin), dtype=np.float32)
@@ -422,9 +429,13 @@ def build_window_targets(
             change_windows.append(change_target)
             valid_windows.append(valid_target)
             last_action_windows.append(last_action)
+            state_reset_windows.append(np.array(1.0 if not run_indices else 0.0, dtype=np.float32))
             dt_windows.append(dt[start:end])
+            run_indices.append(len(button_windows) - 1)
             if return_meta:
                 meta.append((video_path, start, end))
+        if run_indices:
+            streams.append(run_indices)
 
     if not button_windows:
         raise RuntimeError("No training windows found. Check data_root, seq_len, and stride.")
@@ -438,7 +449,9 @@ def build_window_targets(
         change_horizon=stack(change_windows),
         horizon_valid=stack(valid_windows),
         last_action=stack(last_action_windows),
+        state_reset=torch.from_numpy(np.stack(state_reset_windows, axis=0)).float(),
         meta=meta if return_meta else None,
+        streams=streams,
     )
 
 
@@ -452,6 +465,50 @@ def write_window_file_list(
         for idx in use_indices:
             video_path, start, end = meta[idx]
             file_obj.write(f"{video_path} {idx} {start} {end}\n")
+
+
+def stream_order(
+    streams: Sequence[Sequence[int]],
+    *,
+    batch_size: int,
+    shuffle_runs: bool,
+    seed: int,
+    drop_last: bool,
+) -> List[int]:
+    batch_size = max(1, int(batch_size))
+    run_ids = [idx for idx, stream in enumerate(streams) if stream]
+    if shuffle_runs:
+        rng = random.Random(int(seed))
+        rng.shuffle(run_ids)
+
+    lanes: List[List[int]] = [[] for _ in range(batch_size)]
+    lane_lengths = [0 for _ in range(batch_size)]
+    for run_id in run_ids:
+        slot = min(range(batch_size), key=lambda idx: lane_lengths[idx])
+        chunk_ids = [int(value) for value in streams[run_id]]
+        lanes[slot].extend(chunk_ids)
+        lane_lengths[slot] += len(chunk_ids)
+
+    if not any(lanes):
+        return []
+    if drop_last:
+        if any(length <= 0 for length in lane_lengths):
+            return []
+        steps = min(lane_lengths)
+    else:
+        steps = max(lane_lengths)
+
+    order: List[int] = []
+    for step in range(steps):
+        batch: List[int] = []
+        for lane in lanes:
+            if step < len(lane):
+                batch.append(int(lane[step]))
+        if len(batch) == batch_size:
+            order.extend(batch)
+        elif batch and not drop_last:
+            order.extend(batch)
+    return order
 
 
 @pipeline_def
@@ -631,6 +688,25 @@ def second_half_only(valid: torch.Tensor) -> torch.Tensor:
     return valid * time.to(dtype=valid.dtype)
 
 
+def supervised_valid(valid: torch.Tensor, state_reset: Optional[torch.Tensor]) -> torch.Tensor:
+    if state_reset is None:
+        return second_half_only(valid)
+    if valid.dim() < 2:
+        raise ValueError(f"Expected valid mask [B,T,...], got {tuple(valid.shape)}.")
+    reset = state_reset.to(device=valid.device, dtype=torch.bool).reshape(-1)
+    if int(reset.numel()) != int(valid.size(0)):
+        raise ValueError(f"Expected {valid.size(0)} state_reset values, got {tuple(reset.shape)}.")
+    warm = torch.arange(valid.size(1), device=valid.device) >= supervised_start_frame(valid.size(1))
+    view_shape = [1] * valid.dim()
+    view_shape[0] = int(valid.size(0))
+    view_shape[1] = int(valid.size(1))
+    keep = torch.where(reset.view(-1, 1), warm.view(1, -1), torch.ones((1, valid.size(1)), device=valid.device, dtype=torch.bool))
+    keep = keep.view(*view_shape)
+    if valid.dtype == torch.bool:
+        return valid & keep
+    return valid * keep.to(dtype=valid.dtype)
+
+
 def decision_thresholds_from_pos_weight(pos_weight: torch.Tensor, cfg: TrainConfig) -> torch.Tensor:
     """Undo the logit prior introduced by weighted BCE when making binary decisions."""
     if not bool(cfg.button_threshold_from_pos_weight):
@@ -679,7 +755,9 @@ def bundle_index(bundle: WindowTargets, indices: torch.Tensor) -> WindowTargets:
         change_horizon=bundle.change_horizon[indices],
         horizon_valid=bundle.horizon_valid[indices],
         last_action=bundle.last_action[indices],
+        state_reset=bundle.state_reset[indices],
         meta=None,
+        streams=None,
     )
 
 
@@ -690,7 +768,9 @@ def move_bundle_to_device(bundle: WindowTargets, device: torch.device) -> Window
         change_horizon=bundle.change_horizon.to(device, non_blocking=True),
         horizon_valid=bundle.horizon_valid.to(device, non_blocking=True),
         last_action=bundle.last_action.to(device, non_blocking=True),
+        state_reset=bundle.state_reset.to(device, non_blocking=True),
         meta=bundle.meta,
+        streams=bundle.streams,
     )
 
 
@@ -701,7 +781,9 @@ def pin_bundle(bundle: WindowTargets) -> WindowTargets:
         change_horizon=bundle.change_horizon.pin_memory(),
         horizon_valid=bundle.horizon_valid.pin_memory(),
         last_action=bundle.last_action.pin_memory(),
+        state_reset=bundle.state_reset.pin_memory(),
         meta=bundle.meta,
+        streams=bundle.streams,
     )
 
 
@@ -713,7 +795,7 @@ def compute_losses(
     button_pos_weight: torch.Tensor,
     change_pos_weight: torch.Tensor,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    valid = second_half_only(targets.horizon_valid).float()
+    valid = supervised_valid(targets.horizon_valid, targets.state_reset).float()
     valid_4d = valid.unsqueeze(-1)
     button_target = targets.button_horizon.float()
     if float(cfg.button_label_smoothing) > 0.0:
@@ -764,7 +846,7 @@ def update_metrics(
     change_horizon_stats: Sequence[BinaryStats],
     calibrator: HorizonThresholdCalibrator,
 ) -> None:
-    valid = second_half_only(targets.horizon_valid)
+    valid = supervised_valid(targets.horizon_valid, targets.state_reset)
     thresholds = button_threshold_tensor(cfg, device=output.horizon_button_logits.device).view(
         1,
         1,
@@ -825,7 +907,7 @@ def binary_stats_rows(stats: BinaryStats, names: Sequence[str]) -> List[Dict[str
 
 def persistence_baseline_metrics(targets: WindowTargets, cfg: TrainConfig) -> Dict[str, object]:
     names = list(cfg.key_names) + list(cfg.mouse_button_names)
-    valid = second_half_only(targets.horizon_valid > 0.5)
+    valid = supervised_valid(targets.horizon_valid > 0.5, targets.state_reset)
     results: List[Dict[str, float]] = []
     rows: List[List[Dict[str, float | int | str]]] = []
     for horizon_idx in range(int(cfg.prediction_horizon)):
@@ -934,7 +1016,9 @@ def load_batch(iterator, targets: WindowTargets, device: torch.device, cfg: Trai
         change_horizon=targets.change_horizon[labels],
         horizon_valid=targets.horizon_valid[labels],
         last_action=targets.last_action[labels],
+        state_reset=targets.state_reset[labels],
         meta=None,
+        streams=None,
     )
     return frames, target
 
@@ -971,19 +1055,28 @@ def run_epoch(
     change_horizon_stats = [BinaryStats(cfg.num_bin, device) for _ in range(horizon_count)]
     calibrator = HorizonThresholdCalibrator(horizon_count, cfg.num_bin, device)
     steps = 0
+    temporal_state: Optional[TemporalState] = None
 
     iterator_it = iter(iterator)
     pbar = tqdm(range(int(batches)), desc=desc, dynamic_ncols=True)
     for batch_idx in pbar:
         frames, batch_targets = load_batch(iterator_it, targets, device, cfg)
+        reset_mask = batch_targets.state_reset > 0.5
+        if temporal_state is not None and temporal_state.previous_frame is not None:
+            if int(temporal_state.previous_frame.size(0)) != int(frames.size(0)):
+                temporal_state = None
+                reset_mask = torch.ones((int(frames.size(0)),), device=device, dtype=torch.bool)
         if is_train:
             frames = augment_frames(frames, cfg)
         with torch.set_grad_enabled(is_train):
             with torch.amp.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_autocast):
-                output = model(
+                output, temporal_state = model(
                     frames,
                     dt=batch_targets.dt,
                     prev_action=batch_targets.last_action,
+                    state=temporal_state,
+                    reset_mask=reset_mask,
+                    return_state=True,
                 )
                 loss, details = compute_losses(
                     output,
@@ -1163,19 +1256,14 @@ def parse_args() -> TrainConfig:
     add("--seq-len", type=int, default=None)
     add("--prediction-horizon-offsets", default=None, help="Comma-separated future frame offsets for horizon heads.")
     add("--model-size", type=int, default=None)
-    add("--cnn-channels", default=None, help="Four comma-separated CNN stage widths.")
+    add("--cnn-channels", default=None, help="Three comma-separated CNN stage widths.")
     add("--spatial-channels", type=int, default=None)
-    add("--spatial-query-count", type=int, default=None)
-    add("--spatial-attention-heads", type=int, default=None)
+    add("--compressor-channels", type=int, default=None)
+    add("--spatial-pool-size", type=int, default=None)
     add("--d-model", type=int, default=None)
     add("--spatial-dropout", type=float, default=None)
     add("--temporal-dropout", type=float, default=None)
     add("--head-dropout", type=float, default=None)
-    add("--temporal-layers", type=int, default=None)
-    add("--temporal-heads", type=int, default=None)
-    add("--temporal-context", type=int, default=None)
-    add("--horizon-layers", type=int, default=None)
-    add("--horizon-heads", type=int, default=None)
     add("--action-sequence-dropout", type=float, default=None)
     add("--action-key-dropout", type=float, default=None)
     add("--train-seq-stride", type=int, default=None)
@@ -1257,17 +1345,12 @@ def parse_args() -> TrainConfig:
         "model_size",
         "cnn_channels",
         "spatial_channels",
-        "spatial_query_count",
-        "spatial_attention_heads",
+        "compressor_channels",
+        "spatial_pool_size",
         "d_model",
         "spatial_dropout",
         "temporal_dropout",
         "head_dropout",
-        "temporal_layers",
-        "temporal_heads",
-        "temporal_context",
-        "horizon_layers",
-        "horizon_heads",
         "action_sequence_dropout",
         "action_key_dropout",
         "train_seq_stride",
@@ -1385,19 +1468,16 @@ def train() -> None:
         "Policy architecture:",
         f"{MODEL_FAMILY}_v{ARCHITECTURE_VERSION}",
         f"cnn_channels={cfg.cnn_channels}",
-        f"spatial_gru={cfg.spatial_channels}@{cfg.model_size // 16}x{cfg.model_size // 16}",
-        f"spatial_queries={cfg.spatial_query_count}",
+        f"spatial_gru={cfg.spatial_channels}@{cfg.model_size // 4}x{cfg.model_size // 4}",
+        f"compressor={cfg.compressor_channels}@{cfg.spatial_pool_size}x{cfg.spatial_pool_size}",
+        f"dense={cfg.compressor_channels * cfg.spatial_pool_size * cfg.spatial_pool_size}",
         f"d_model={cfg.d_model}",
-        f"temporal_layers={cfg.temporal_layers}",
-        f"temporal_heads={cfg.temporal_heads}",
-        f"temporal_context={cfg.temporal_context}",
-        f"horizon_layers={cfg.horizon_layers}",
     )
     horizon_offsets = tuple(int(offset) for offset in cfg.prediction_horizon_offsets)
     print(f"Horizon frame offsets: {', '.join(str(offset) for offset in horizon_offsets)}")
 
-    train_targets = build_window_targets(train_pairs, cfg, stride=cfg.train_seq_stride, return_meta=True)
-    val_targets = build_window_targets(val_pairs, cfg, stride=cfg.val_seq_stride, return_meta=True) if val_pairs else None
+    train_targets = build_window_targets(train_pairs, cfg, stride=cfg.seq_len, return_meta=True)
+    val_targets = build_window_targets(val_pairs, cfg, stride=cfg.seq_len, return_meta=True) if val_pairs else None
     print(
         "Windows:",
         f"train={tuple(train_targets.button_horizon.shape)}",
@@ -1406,6 +1486,7 @@ def train() -> None:
         "action_index=source_frame+horizon+label_offset",
         "last_action_index=source_frame-1",
         f"horizon_offsets={horizon_offsets}",
+        f"chunk_stride={cfg.seq_len}",
     )
     supervised_start, supervised_end = supervised_frame_range(cfg.seq_len)
     print(
@@ -1440,25 +1521,23 @@ def train() -> None:
 
     train_file_list = os.path.join(cfg.ckpt_dir, "train_file_list.txt")
     val_file_list = os.path.join(cfg.ckpt_dir, "val_file_list.txt")
-    if train_targets.meta is None:
-        raise RuntimeError("Training window metadata is required for DALI file list generation.")
-    write_window_file_list(train_targets.meta, train_file_list)
+    if train_targets.meta is None or train_targets.streams is None:
+        raise RuntimeError("Training window metadata and stream groups are required for DALI file list generation.")
     if val_targets is not None:
-        if val_targets.meta is None:
-            raise RuntimeError("Validation window metadata is required for DALI file list generation.")
-        write_window_file_list(val_targets.meta, val_file_list)
+        if val_targets.meta is None or val_targets.streams is None:
+            raise RuntimeError("Validation window metadata and stream groups are required for DALI file list generation.")
 
     button_pos_weight = compute_pos_weight(
         train_targets.button_horizon,
         cfg.pos_weight_power,
         cfg.pos_weight_clamp,
-        valid=second_half_only(train_targets.horizon_valid),
+        valid=supervised_valid(train_targets.horizon_valid, train_targets.state_reset),
     ).to(device)
     change_pos_weight = compute_pos_weight(
         train_targets.change_horizon,
         cfg.pos_weight_power,
         cfg.pos_weight_clamp,
-        valid=second_half_only(train_targets.horizon_valid),
+        valid=supervised_valid(train_targets.horizon_valid, train_targets.state_reset),
     ).to(device)
     button_thresholds = decision_thresholds_from_pos_weight(button_pos_weight, cfg).detach().cpu()
     cfg.button_state_thresholds = tuple(float(x) for x in list(button_thresholds.tolist()))
@@ -1485,14 +1564,17 @@ def train() -> None:
     if val_targets is not None:
         val_targets = move_bundle_to_device(val_targets, device)
 
-    train_iter = make_dali_iterator(
-        train_file_list,
-        cfg,
+    train_order = stream_order(
+        train_targets.streams,
         batch_size=cfg.batch_size,
-        random_shuffle=cfg.dali_train_random_shuffle,
-        last_batch_policy=LastBatchPolicy.DROP,
+        shuffle_runs=True,
+        seed=cfg.dali_shuffle_seed,
+        drop_last=True,
     )
-    train_batches = int(train_targets.button_horizon.shape[0]) // int(cfg.batch_size)
+    if train_targets.meta is None:
+        raise RuntimeError("Training metadata unexpectedly missing.")
+    write_window_file_list(train_targets.meta, train_file_list, train_order)
+    train_batches = len(train_order) // int(cfg.batch_size)
     if cfg.max_train_batches is not None:
         train_batches = min(train_batches, cfg.max_train_batches)
     if train_batches <= 0:
@@ -1500,16 +1582,27 @@ def train() -> None:
 
     val_iter = None
     val_batches = 0
+    val_batch_size = 0
     if val_targets is not None:
-        val_batch_size = min(max(1, cfg.batch_size), int(val_targets.button_horizon.shape[0]))
+        val_batch_size = 1
+        val_order = stream_order(
+            val_targets.streams or [],
+            batch_size=val_batch_size,
+            shuffle_runs=False,
+            seed=cfg.dali_shuffle_seed,
+            drop_last=False,
+        )
+        if val_targets.meta is None:
+            raise RuntimeError("Validation metadata unexpectedly missing.")
+        write_window_file_list(val_targets.meta, val_file_list, val_order)
         val_iter = make_dali_iterator(
             val_file_list,
             cfg,
             batch_size=val_batch_size,
-            random_shuffle=cfg.dali_val_random_shuffle,
+            random_shuffle=False,
             last_batch_policy=LastBatchPolicy.PARTIAL,
         )
-        val_batches = int(math.ceil(int(val_targets.button_horizon.shape[0]) / float(val_batch_size)))
+        val_batches = int(math.ceil(len(val_order) / float(val_batch_size))) if val_order else 0
         if cfg.max_val_batches is not None:
             val_batches = min(val_batches, cfg.max_val_batches)
 
@@ -1540,6 +1633,26 @@ def train() -> None:
     total_steps = max(1, optimizer_steps_per_epoch * cfg.num_epochs)
     epochs_without_improvement = 0
     for epoch in range(start_epoch, cfg.num_epochs):
+        train_order = stream_order(
+            train_targets.streams or [],
+            batch_size=cfg.batch_size,
+            shuffle_runs=True,
+            seed=cfg.dali_shuffle_seed + epoch,
+            drop_last=True,
+        )
+        if cfg.max_train_batches is not None:
+            train_order = train_order[: int(cfg.max_train_batches) * int(cfg.batch_size)]
+        if train_targets.meta is None:
+            raise RuntimeError("Training metadata unexpectedly missing.")
+        write_window_file_list(train_targets.meta, train_file_list, train_order)
+        train_iter = make_dali_iterator(
+            train_file_list,
+            cfg,
+            batch_size=cfg.batch_size,
+            random_shuffle=False,
+            last_batch_policy=LastBatchPolicy.DROP,
+        )
+        train_batches = len(train_order) // int(cfg.batch_size)
         train_metrics, global_step = run_epoch(
             desc=f"Epoch {epoch + 1}/{cfg.num_epochs} [train]",
             model=model,

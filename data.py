@@ -914,7 +914,7 @@ def main():
 
             if should_capture:
                 capture_started = time.perf_counter()
-                screenshot = cam.grab()
+                screenshot = cam.grab(new_frame_only=False)
                 if screenshot is None:
                     time.sleep(0.001)
                     continue

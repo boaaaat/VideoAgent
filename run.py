@@ -396,10 +396,8 @@ def main() -> None:
         f"effective_target_offset=+{int(cfg.prediction_horizon_offsets[cfg.command_horizon - 1]) + int(cfg.action_label_offset)}",
         f"d_model={cfg.d_model}",
         f"architecture={MODEL_FAMILY}_v{ARCHITECTURE_VERSION}",
-        f"spatial_gru={cfg.spatial_channels}@{cfg.model_size // 16}x{cfg.model_size // 16}",
-        f"spatial_queries={cfg.spatial_query_count}",
-        f"temporal_layers={cfg.temporal_layers}",
-        f"temporal_context={cfg.temporal_context}",
+        f"spatial_gru={cfg.spatial_channels}@{cfg.model_size // 4}x{cfg.model_size // 4}",
+        f"compressor={cfg.compressor_channels}@{cfg.spatial_pool_size}x{cfg.spatial_pool_size}",
         "input=masked_rgb+frame_difference+learned_action_context",
     )
     command_idx = max(0, min(int(cfg.command_horizon) - 1, int(cfg.prediction_horizon) - 1))
