@@ -4,7 +4,7 @@ import glob
 import math
 import os
 import random
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -34,11 +34,70 @@ from models import (
 )
 
 
+def _require_bool(name: str, value: object) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"{name} must be a bool, got {value!r}.")
+    return value
+
+
+def _require_optional_bool(name: str, value: object) -> Optional[bool]:
+    if value is None:
+        return None
+    return _require_bool(name, value)
+
+
+def _require_int_at_least(name: str, value: object, minimum: int) -> int:
+    result = _require_int(name, value)
+    if result < minimum:
+        raise ValueError(f"{name} must be >= {minimum}, got {result}.")
+    return result
+
+
+def _require_int(name: str, value: object) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be an integer, got {value!r}.")
+    try:
+        result = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an integer, got {value!r}.") from exc
+    try:
+        if float(result) != float(value):
+            raise ValueError
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an integer, got {value!r}.") from exc
+    return result
+
+
+def _require_int_between(name: str, value: object, minimum: int, maximum: int) -> int:
+    result = _require_int_at_least(name, value, minimum)
+    if result < minimum or result > maximum:
+        raise ValueError(f"{name} must be in [{minimum}, {maximum}], got {result}.")
+    return result
+
+
+def _require_float_at_least(name: str, value: object, minimum: float) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a number, got {value!r}.")
+    result = float(value)
+    if not math.isfinite(result) or result < minimum:
+        raise ValueError(f"{name} must be >= {minimum}, got {value!r}.")
+    return result
+
+
+def _require_float_range(name: str, value: object, minimum: float, maximum: float) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a number, got {value!r}.")
+    result = float(value)
+    if not math.isfinite(result) or result < minimum or result > maximum:
+        raise ValueError(f"{name} must be in [{minimum}, {maximum}], got {value!r}.")
+    return result
+
+
 @dataclass
 class TrainConfig(ModelConfig):
     batch_size: int = 1
     target_effective_batch: int = 16
-    grad_accum: int = 16
+    grad_accum: int = field(init=False)
     num_epochs: int = 100
 
     lr: float = 2e-4
@@ -60,6 +119,7 @@ class TrainConfig(ModelConfig):
     button_threshold_max: float = 0.9
 
     button_loss_weight: float = 1.0
+    conflicting_button_loss_weight: float = 0.03
     streaming_state_training: bool = True
     streaming_state_validation: bool = True
     streaming_segment_min_chunks: int = 2
@@ -92,7 +152,7 @@ class TrainConfig(ModelConfig):
     dali_reader_prefetch_queue_depth: int = 4
     dali_read_ahead: bool = False
     dali_dont_use_mmap: bool = False
-    dali_resize_mode: str = "video_then_resize"
+    dali_resize_mode: str = "video_resize"
     dali_prepare_first_batch: bool = True
     dali_train_random_shuffle: bool = True
     dali_val_random_shuffle: bool = False
@@ -111,72 +171,178 @@ class TrainConfig(ModelConfig):
     max_val_batches: Optional[int] = None
 
     def __post_init__(self) -> None:
+        had_custom_thresholds = self.button_state_thresholds is not None
         super().__post_init__()
         skipped = tuple(str(name) for name in (self.skipped_key_names or ()))
         if skipped:
+            unknown = sorted(set(skipped) - set(self.key_names))
+            if unknown:
+                raise ValueError(f"skipped_key_names contains unknown keys: {unknown}.")
+            if had_custom_thresholds:
+                raise ValueError(
+                    "button_state_thresholds cannot be combined with skipped_key_names because "
+                    "filtering changes the action count."
+                )
             skip_set = set(skipped)
             self.key_names = [name for name in self.key_names if name not in skip_set]
             self.num_bin = len(self.key_names) + len(self.mouse_button_names)
             if self.num_bin <= 0:
                 raise ValueError("At least one action key/button must remain after skipped_key_names filtering.")
-            if self.button_state_thresholds is None or len(tuple(self.button_state_thresholds)) != self.num_bin:
-                self.button_state_thresholds = tuple(float(self.button_state_threshold) for _ in range(self.num_bin))
+            self.button_state_thresholds = tuple(float(self.button_state_threshold) for _ in range(self.num_bin))
         self.skipped_key_names = skipped
-        self.batch_size = max(1, int(self.batch_size))
-        self.target_effective_batch = max(1, int(self.target_effective_batch))
-        self.num_epochs = max(1, int(self.num_epochs))
-        self.dali_prefetch_queue_depth = max(1, int(self.dali_prefetch_queue_depth))
-        self.dali_reader_prefetch_queue_depth = max(1, int(self.dali_reader_prefetch_queue_depth))
-        self.dali_train_random_shuffle = bool(self.dali_train_random_shuffle)
-        self.dali_val_random_shuffle = bool(self.dali_val_random_shuffle)
-        self.save_every = max(1, int(self.save_every))
-        self.print_every = max(1, int(self.print_every))
-        self.grad_accum = max(1, int(math.ceil(self.target_effective_batch / float(self.batch_size))))
-        self.warmup_steps = max(0, int(self.warmup_steps))
-        self.train_split = float(min(max(self.train_split, 0.05), 0.95))
-        self.split_seed = int(self.split_seed)
-        self.dali_shuffle_seed = int(self.dali_shuffle_seed)
-        self.pos_weight_power = max(0.0, float(self.pos_weight_power))
-        self.pos_weight_clamp = max(1.0, float(self.pos_weight_clamp))
-        self.button_threshold_from_pos_weight = bool(self.button_threshold_from_pos_weight)
-        self.button_threshold_min = float(min(max(self.button_threshold_min, 0.0), 1.0))
-        self.button_threshold_max = float(min(max(self.button_threshold_max, self.button_threshold_min), 1.0))
-        self.streaming_state_training = bool(self.streaming_state_training)
-        self.streaming_state_validation = bool(self.streaming_state_validation)
-        self.streaming_segment_min_chunks = max(1, int(self.streaming_segment_min_chunks))
-        self.streaming_segment_max_chunks = max(self.streaming_segment_min_chunks, int(self.streaming_segment_max_chunks))
-        self.grad_clip = max(0.0, float(self.grad_clip))
-        self.action_label_offset = int(self.action_label_offset)
-        self.last_action_sequence_dropout = float(min(max(self.last_action_sequence_dropout, 0.0), 1.0))
-        self.last_action_key_dropout = float(min(max(self.last_action_key_dropout, 0.0), 1.0))
-        self.last_action_corruption_prob = float(min(max(self.last_action_corruption_prob, 0.0), 1.0))
-        self.button_label_smoothing = float(min(max(self.button_label_smoothing, 0.0), 0.2))
-        self.aug_brightness = float(min(max(self.aug_brightness, 0.0), 0.5))
-        self.aug_contrast = float(min(max(self.aug_contrast, 0.0), 0.5))
-        self.aug_noise_std = float(min(max(self.aug_noise_std, 0.0), 0.1))
-        self.aug_gray_prob = float(min(max(self.aug_gray_prob, 0.0), 1.0))
-        self.aug_translate_frac = float(min(max(self.aug_translate_frac, 0.0), 0.25))
-        self.aug_scale_frac = float(min(max(self.aug_scale_frac, 0.0), 0.50))
-        self.aug_edges_crop_prob = float(min(max(self.aug_edges_crop_prob, 0.0), 1.0))
-        self.aug_edges_crop_min_frac = float(min(max(self.aug_edges_crop_min_frac, 0.0), 0.45))
-        self.aug_edges_crop_max_frac = float(min(max(self.aug_edges_crop_max_frac, self.aug_edges_crop_min_frac), 0.45))
-        self.aug_cutout_prob = float(min(max(self.aug_cutout_prob, 0.0), 1.0))
-        self.aug_cutout_min_frac = float(min(max(self.aug_cutout_min_frac, 0.0), 0.75))
-        self.aug_cutout_max_frac = float(min(max(self.aug_cutout_max_frac, self.aug_cutout_min_frac), 0.75))
-        self.aug_cutout_count = max(1, min(int(self.aug_cutout_count), 16))
-        self.early_stop_patience = max(0, int(self.early_stop_patience))
-        self.dali_resize_mode = str(self.dali_resize_mode).strip().lower()
-        if self.dali_resize_mode not in {"video_resize", "video_then_resize", "none"}:
+
+        self.batch_size = _require_int_at_least("batch_size", self.batch_size, 1)
+        self.target_effective_batch = _require_int_at_least("target_effective_batch", self.target_effective_batch, 1)
+        self.grad_accum = int(math.ceil(self.target_effective_batch / float(self.batch_size)))
+        self.num_epochs = _require_int_at_least("num_epochs", self.num_epochs, 1)
+        self.lr = _require_float_at_least("lr", self.lr, 0.0)
+        if self.lr <= 0.0:
+            raise ValueError(f"lr must be > 0.0, got {self.lr}.")
+        self.min_lr = _require_float_at_least("min_lr", self.min_lr, 0.0)
+        if self.min_lr > self.lr:
+            raise ValueError(f"min_lr must be <= lr, got min_lr={self.min_lr} lr={self.lr}.")
+        self.weight_decay = _require_float_at_least("weight_decay", self.weight_decay, 0.0)
+        self.dali_prefetch_queue_depth = _require_int_at_least(
+            "dali_prefetch_queue_depth",
+            self.dali_prefetch_queue_depth,
+            1,
+        )
+        self.dali_reader_prefetch_queue_depth = _require_int_at_least(
+            "dali_reader_prefetch_queue_depth",
+            self.dali_reader_prefetch_queue_depth,
+            1,
+        )
+        self.dali_train_random_shuffle = _require_bool("dali_train_random_shuffle", self.dali_train_random_shuffle)
+        self.dali_val_random_shuffle = _require_bool("dali_val_random_shuffle", self.dali_val_random_shuffle)
+        self.dali_prepare_first_batch = _require_bool("dali_prepare_first_batch", self.dali_prepare_first_batch)
+        self.save_every = _require_int_at_least("save_every", self.save_every, 1)
+        self.print_every = _require_int_at_least("print_every", self.print_every, 1)
+        self.warmup_steps = _require_int_at_least("warmup_steps", self.warmup_steps, 0)
+        self.train_split = _require_float_range("train_split", self.train_split, 0.05, 0.95)
+        self.split_seed = _require_int("split_seed", self.split_seed)
+        self.dali_shuffle_seed = _require_int("dali_shuffle_seed", self.dali_shuffle_seed)
+        self.pos_weight_power = _require_float_at_least("pos_weight_power", self.pos_weight_power, 0.0)
+        self.pos_weight_clamp = _require_float_at_least("pos_weight_clamp", self.pos_weight_clamp, 1.0)
+        self.button_threshold_from_pos_weight = _require_bool(
+            "button_threshold_from_pos_weight",
+            self.button_threshold_from_pos_weight,
+        )
+        self.button_threshold_min = _require_float_range("button_threshold_min", self.button_threshold_min, 0.0, 1.0)
+        self.button_threshold_max = _require_float_range("button_threshold_max", self.button_threshold_max, 0.0, 1.0)
+        if self.button_threshold_max < self.button_threshold_min:
             raise ValueError(
-                "dali_resize_mode must be one of: video_resize, video_then_resize, none; "
+                "button_threshold_max must be >= button_threshold_min, "
+                f"got max={self.button_threshold_max} min={self.button_threshold_min}."
+            )
+        self.button_loss_weight = _require_float_at_least("button_loss_weight", self.button_loss_weight, 0.0)
+        self.conflicting_button_loss_weight = _require_float_at_least(
+            "conflicting_button_loss_weight",
+            self.conflicting_button_loss_weight,
+            0.0,
+        )
+        self.streaming_state_training = _require_bool("streaming_state_training", self.streaming_state_training)
+        self.streaming_state_validation = _require_bool("streaming_state_validation", self.streaming_state_validation)
+        self.streaming_segment_min_chunks = _require_int_at_least(
+            "streaming_segment_min_chunks",
+            self.streaming_segment_min_chunks,
+            1,
+        )
+        self.streaming_segment_max_chunks = _require_int_at_least(
+            "streaming_segment_max_chunks",
+            self.streaming_segment_max_chunks,
+            1,
+        )
+        if self.streaming_segment_max_chunks < self.streaming_segment_min_chunks:
+            raise ValueError(
+                "streaming_segment_max_chunks must be >= streaming_segment_min_chunks, "
+                f"got max={self.streaming_segment_max_chunks} min={self.streaming_segment_min_chunks}."
+            )
+        self.grad_clip = _require_float_at_least("grad_clip", self.grad_clip, 0.0)
+        self.action_label_offset = _require_int("action_label_offset", self.action_label_offset)
+        self.last_action_sequence_dropout = _require_float_range(
+            "last_action_sequence_dropout",
+            self.last_action_sequence_dropout,
+            0.0,
+            1.0,
+        )
+        self.last_action_key_dropout = _require_float_range(
+            "last_action_key_dropout",
+            self.last_action_key_dropout,
+            0.0,
+            1.0,
+        )
+        self.last_action_corruption_prob = _require_float_range(
+            "last_action_corruption_prob",
+            self.last_action_corruption_prob,
+            0.0,
+            1.0,
+        )
+        self.button_label_smoothing = _require_float_range("button_label_smoothing", self.button_label_smoothing, 0.0, 0.2)
+        self.aug_brightness = _require_float_range("aug_brightness", self.aug_brightness, 0.0, 0.5)
+        self.aug_contrast = _require_float_range("aug_contrast", self.aug_contrast, 0.0, 0.5)
+        self.aug_noise_std = _require_float_range("aug_noise_std", self.aug_noise_std, 0.0, 0.1)
+        self.aug_gray_prob = _require_float_range("aug_gray_prob", self.aug_gray_prob, 0.0, 1.0)
+        self.aug_translate_frac = _require_float_range("aug_translate_frac", self.aug_translate_frac, 0.0, 0.25)
+        self.aug_scale_frac = _require_float_range("aug_scale_frac", self.aug_scale_frac, 0.0, 0.50)
+        self.aug_edges_crop_prob = _require_float_range("aug_edges_crop_prob", self.aug_edges_crop_prob, 0.0, 1.0)
+        self.aug_edges_crop_min_frac = _require_float_range(
+            "aug_edges_crop_min_frac",
+            self.aug_edges_crop_min_frac,
+            0.0,
+            0.45,
+        )
+        self.aug_edges_crop_max_frac = _require_float_range(
+            "aug_edges_crop_max_frac",
+            self.aug_edges_crop_max_frac,
+            0.0,
+            0.45,
+        )
+        if self.aug_edges_crop_max_frac < self.aug_edges_crop_min_frac:
+            raise ValueError(
+                "aug_edges_crop_max_frac must be >= aug_edges_crop_min_frac, "
+                f"got max={self.aug_edges_crop_max_frac} min={self.aug_edges_crop_min_frac}."
+            )
+        self.aug_cutout_prob = _require_float_range("aug_cutout_prob", self.aug_cutout_prob, 0.0, 1.0)
+        self.aug_cutout_min_frac = _require_float_range("aug_cutout_min_frac", self.aug_cutout_min_frac, 0.0, 0.75)
+        self.aug_cutout_max_frac = _require_float_range("aug_cutout_max_frac", self.aug_cutout_max_frac, 0.0, 0.75)
+        if self.aug_cutout_max_frac < self.aug_cutout_min_frac:
+            raise ValueError(
+                "aug_cutout_max_frac must be >= aug_cutout_min_frac, "
+                f"got max={self.aug_cutout_max_frac} min={self.aug_cutout_min_frac}."
+            )
+        self.aug_cutout_count = _require_int_between("aug_cutout_count", self.aug_cutout_count, 1, 16)
+        self.early_stop_patience = _require_int_at_least("early_stop_patience", self.early_stop_patience, 0)
+        self.dali_resize_mode = str(self.dali_resize_mode).strip().lower()
+        if self.dali_resize_mode not in {"video_resize", "none"}:
+            raise ValueError(
+                "dali_resize_mode must be one of: video_resize, none; "
                 f"got {self.dali_resize_mode!r}."
             )
-        self.dali_num_threads = max(1, int(self.dali_num_threads))
-        self.max_train_batches = None if self.max_train_batches is None else max(1, int(self.max_train_batches))
-        self.max_val_batches = None if self.max_val_batches is None else max(1, int(self.max_val_batches))
+        self.dali_num_threads = _require_int_at_least("dali_num_threads", self.dali_num_threads, 1)
+        self.dali_read_ahead = _require_bool("dali_read_ahead", self.dali_read_ahead)
+        self.dali_dont_use_mmap = _require_bool("dali_dont_use_mmap", self.dali_dont_use_mmap)
+        self.sync_dataset = _require_bool("sync_dataset", self.sync_dataset)
+        self.dataset_sync_delete_stale = _require_optional_bool(
+            "dataset_sync_delete_stale",
+            self.dataset_sync_delete_stale,
+        )
+        self.dataset_sync_hash_same_size = _require_bool(
+            "dataset_sync_hash_same_size",
+            self.dataset_sync_hash_same_size,
+        )
+        self.resume = _require_bool("resume", self.resume)
+        self.max_train_batches = (
+            None
+            if self.max_train_batches is None
+            else _require_int_at_least("max_train_batches", self.max_train_batches, 1)
+        )
+        self.max_val_batches = (
+            None
+            if self.max_val_batches is None
+            else _require_int_at_least("max_val_batches", self.max_val_batches, 1)
+        )
         if not os.path.isabs(self.ckpt_dir):
             self.ckpt_dir = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), self.ckpt_dir))
-        os.makedirs(self.ckpt_dir, exist_ok=True)
 
 
 @dataclass
@@ -323,6 +489,7 @@ def build_window_targets(
     stride: int,
     return_meta: bool = False,
 ) -> WindowTargets:
+    stride = _require_int_at_least("stride", stride, 1)
     button_windows: List[np.ndarray] = []
     valid_windows: List[np.ndarray] = []
     last_action_windows: List[np.ndarray] = []
@@ -337,7 +504,7 @@ def build_window_targets(
             continue
 
         max_start = buttons.shape[0] - cfg.seq_len
-        for start in range(0, max_start + 1, max(1, int(stride))):
+        for start in range(0, max_start + 1, stride):
             end = start + cfg.seq_len
             button_target = np.zeros((cfg.seq_len, horizon, cfg.num_bin), dtype=np.float32)
             valid_target = np.zeros((cfg.seq_len, horizon), dtype=np.float32)
@@ -425,8 +592,12 @@ def _split_stream_random_segments(
     if not stream:
         return []
 
-    min_chunks = max(1, int(min_chunks))
-    max_chunks = max(min_chunks, int(max_chunks))
+    min_chunks = int(min_chunks)
+    max_chunks = int(max_chunks)
+    if min_chunks < 1:
+        raise ValueError(f"min_chunks must be >= 1, got {min_chunks}.")
+    if max_chunks < min_chunks:
+        raise ValueError(f"max_chunks must be >= min_chunks, got max={max_chunks} min={min_chunks}.")
     segments: List[List[int]] = []
     cursor = 0
     while cursor < len(stream):
@@ -482,21 +653,9 @@ def video_pipeline(
     reader_step=None,
     enable_frame_num="none",
     normalize_frames=True,
-    enable_augmentation=False,
-    color_prob=0.0,
-    brightness_range=(1.0, 1.0),
-    contrast_range=(1.0, 1.0),
-    saturation_range=(1.0, 1.0),
-    hue_deg_max=0.0,
-    blur_prob=0.0,
-    blur_sigma_range=(0.3, 0.8),
-    noise_prob=0.0,
-    noise_std_max=0.0,
     filenames=None,
     labels=None,
 ):
-    del enable_augmentation, color_prob, brightness_range, contrast_range, saturation_range, hue_deg_max
-    del blur_prob, blur_sigma_range, noise_prob, noise_std_max
     seq_len = int(seq_len)
     resize_size = int(resize_size)
     resize_mode = str(resize_mode)
@@ -509,7 +668,9 @@ def video_pipeline(
     if file_list is not None and filenames is not None:
         raise ValueError("video_pipeline accepts only one of file_list or filenames.")
 
-    use_reader_resize = resize_mode in {"video_resize", "video_then_resize"}
+    if resize_mode not in {"video_resize", "none"}:
+        raise ValueError(f"Unknown DALI resize_mode: {resize_mode}")
+    use_reader_resize = resize_mode == "video_resize"
     reader_kwargs = {
         "device": "gpu",
         "name": "Reader",
@@ -565,19 +726,6 @@ def video_pipeline(
         vids, labels = reader_outputs[0], reader_outputs[1]
         if len(reader_outputs) > 2:
             frame_nums = reader_outputs[2]
-    if not use_reader_resize:
-        if resize_mode in {"video_resize", "video_then_resize"}:
-            vids = fn.resize(
-                vids,
-                resize_x=resize_size,
-                resize_y=resize_size,
-                interp_type=types.INTERP_LINEAR,
-                bytes_per_sample_hint=resized_bytes,
-                temp_buffer_hint=resized_bytes,
-            )
-        elif resize_mode != "none":
-            raise ValueError(f"Unknown DALI resize_mode: {resize_mode}")
-
     if normalize_frames:
         frames = fn.crop_mirror_normalize(
             vids,
@@ -627,11 +775,13 @@ def compute_pos_weight(
 
 
 def supervised_start_frame(seq_len: int) -> int:
-    return max(0, int(seq_len) // 4)
+    seq_len = _require_int_at_least("seq_len", seq_len, 1)
+    return seq_len // 4
 
 
 def supervised_frame_range(seq_len: int) -> Tuple[int, int]:
-    return supervised_start_frame(seq_len), max(0, int(seq_len))
+    seq_len = _require_int_at_least("seq_len", seq_len, 1)
+    return supervised_start_frame(seq_len), seq_len
 
 
 def second_half_only(valid: torch.Tensor) -> torch.Tensor:
@@ -687,15 +837,6 @@ def resolve_amp_settings(amp: str) -> Tuple[torch.dtype, bool, bool]:
     raise ValueError("Only bf16 and fp32 are supported by this trainer.")
 
 
-def bundle_index(bundle: WindowTargets, indices: torch.Tensor) -> WindowTargets:
-    return WindowTargets(
-        button_horizon=bundle.button_horizon[indices],
-        horizon_valid=bundle.horizon_valid[indices],
-        last_action=bundle.last_action[indices],
-        meta=None,
-    )
-
-
 def move_bundle_to_device(bundle: WindowTargets, device: torch.device) -> WindowTargets:
     return WindowTargets(
         button_horizon=bundle.button_horizon.to(device, non_blocking=True),
@@ -705,13 +846,32 @@ def move_bundle_to_device(bundle: WindowTargets, device: torch.device) -> Window
     )
 
 
-def pin_bundle(bundle: WindowTargets) -> WindowTargets:
-    return WindowTargets(
-        button_horizon=bundle.button_horizon.pin_memory(),
-        horizon_valid=bundle.horizon_valid.pin_memory(),
-        last_action=bundle.last_action.pin_memory(),
-        meta=bundle.meta,
-    )
+def action_index(cfg: TrainConfig, name: str) -> Optional[int]:
+    name_to_idx = {str(action_name).lower(): idx for idx, action_name in enumerate(cfg.key_names)}
+    return name_to_idx.get(str(name).lower())
+
+
+def conflicting_button_loss(
+    button_logits: torch.Tensor,
+    loss_weight: torch.Tensor,
+    cfg: TrainConfig,
+) -> torch.Tensor:
+    if float(cfg.conflicting_button_loss_weight) <= 0.0:
+        return button_logits.new_zeros(())
+    pairs = (("w", "s"), ("a", "d"))
+    probs = torch.sigmoid(button_logits)
+    conflicts: List[torch.Tensor] = []
+    for first, second in pairs:
+        first_idx = action_index(cfg, first)
+        second_idx = action_index(cfg, second)
+        if first_idx is not None and second_idx is not None:
+            conflicts.append(probs[..., first_idx] * probs[..., second_idx])
+    if not conflicts:
+        return button_logits.new_zeros(())
+
+    pair_conflict = torch.stack(conflicts, dim=-1).mean(dim=-1)
+    weight = loss_weight.squeeze(-1)
+    return (pair_conflict * weight).sum() / weight.sum().clamp(min=1.0)
 
 
 def compute_losses(
@@ -746,10 +906,12 @@ def compute_losses(
         ).view(1, 1, horizon_count, 1)
         loss_weight = loss_weight * horizon_weight
     button_loss = (button_loss_raw * loss_weight).sum() / (loss_weight.sum() * cfg.num_bin).clamp(min=1.0)
+    conflict_loss = conflicting_button_loss(button_logits, loss_weight, cfg)
 
-    total = cfg.button_loss_weight * button_loss
+    total = cfg.button_loss_weight * button_loss + cfg.conflicting_button_loss_weight * conflict_loss
     return total, {
         "button": button_loss.detach(),
+        "conflict": conflict_loss.detach(),
     }
 
 
@@ -925,6 +1087,8 @@ def make_dali_iterator(
 
 def load_batch(iterator, targets: WindowTargets, device: torch.device, cfg: TrainConfig) -> Tuple[torch.Tensor, WindowTargets, torch.Tensor]:
     batch = next(iterator)[0]
+    if "frames" not in batch or "labels" not in batch:
+        raise RuntimeError(f"DALI batch must contain 'frames' and 'labels', got keys={sorted(batch)}.")
     frames = ensure_fchw_layout(batch["frames"])
     if frames.device != device:
         frames = frames.to(device, non_blocking=True)
@@ -934,6 +1098,12 @@ def load_batch(iterator, targets: WindowTargets, device: torch.device, cfg: Trai
     elif amp_name in {"fp32", "float32", "none"} and frames.dtype != torch.float32:
         frames = frames.float()
     labels = normalize_dali_labels(batch["labels"]).to(device, non_blocking=True)
+    if labels.numel() == 0:
+        raise RuntimeError("DALI batch returned no labels.")
+    target_count = int(targets.button_horizon.size(0))
+    if bool(((labels < 0) | (labels >= target_count)).any().item()):
+        bad = labels[((labels < 0) | (labels >= target_count))][:8].detach().cpu().tolist()
+        raise RuntimeError(f"DALI labels out of range for {target_count} windows: {bad}.")
     target = WindowTargets(
         button_horizon=targets.button_horizon[labels],
         horizon_valid=targets.horizon_valid[labels],
@@ -993,7 +1163,7 @@ def _update_streaming_cache(
         return
 
     hidden = state.hidden_state.detach()
-    max_pending = max(2, int(math.ceil(float(cfg.seq_len) / float(max(1, cfg.train_seq_stride)))) + 2)
+    max_pending = max(2, int(math.ceil(float(cfg.seq_len) / float(cfg.train_seq_stride))) + 2)
     for batch_idx, label_idx in enumerate(_labels_to_indices(labels)):
         video_path, _, end = targets.meta[label_idx]
         video_cache = cache.setdefault(video_path, {})
@@ -1026,7 +1196,7 @@ def run_epoch(
         optimizer.zero_grad(set_to_none=True)
 
     loss_sum = torch.zeros((), device=device)
-    detail_sums = {name: torch.zeros((), device=device) for name in ("button",)}
+    detail_sums = {name: torch.zeros((), device=device) for name in ("button", "conflict")}
     step1_stats = BinaryStats(cfg.num_bin, device)
     final_stats = BinaryStats(cfg.num_bin, device)
     steps = 0
@@ -1074,7 +1244,7 @@ def run_epoch(
                     cfg,
                     button_pos_weight=button_pos_weight,
                 )
-                loss_div = loss / max(1, int(cfg.grad_accum))
+                loss_div = loss / int(cfg.grad_accum)
 
             if is_train:
                 loss_div.backward()
@@ -1109,6 +1279,7 @@ def run_epoch(
             postfix = {
                 "loss": float((loss_sum / max(1, steps)).item()),
                 "btn": float((detail_sums["button"] / max(1, steps)).item()),
+                "conf": float((detail_sums["conflict"] / max(1, steps)).item()),
             }
             if use_streaming_state:
                 postfix["carry"] = float(stream_carried / max(1, stream_total))
@@ -1121,6 +1292,7 @@ def run_epoch(
     metrics = {
         "loss": float((loss_sum / max(1, steps)).item()),
         "button_loss": float((detail_sums["button"] / max(1, steps)).item()),
+        "conflicting_button_loss": float((detail_sums["conflict"] / max(1, steps)).item()),
         "step1_button_macro_f1": step1["macro_f1"],
         "step1_button_macro_precision": step1["macro_precision"],
         "step1_button_macro_recall": step1["macro_recall"],
@@ -1182,20 +1354,28 @@ def maybe_resume(
         return 0, 0, -1e9
     print(f"Resuming from {ckpt_path}")
     state = torch.load(ckpt_path, map_location=device)
+    if not isinstance(state, dict):
+        raise RuntimeError(f"Cannot resume checkpoint {ckpt_path}: expected a checkpoint dict.")
+    missing_keys = [key for key in ("model_state", "optimizer_state", "epoch", "global_step", "best_score") if key not in state]
+    if missing_keys:
+        raise RuntimeError(f"Cannot resume checkpoint {ckpt_path}: missing keys {missing_keys}.")
     try:
         model.load_state_dict(state["model_state"])
     except RuntimeError as exc:
-        if cfg.resume_path is None:
-            print(
-                f"Skipping incompatible checkpoint {ckpt_path}. "
-                "Starting a fresh run for the current model/action configuration."
-            )
-            return 0, 0, -1e9
         raise RuntimeError(
-            f"Cannot resume checkpoint {ckpt_path}: it does not match the current CNN+temporal model. "
-            "Start a fresh run or pass --no-resume."
+            f"Cannot resume checkpoint {ckpt_path}: model_state does not match the current "
+            f"policy config (num_bin={cfg.num_bin}, d_model={cfg.d_model}, "
+            f"horizon={cfg.prediction_horizon}). Start a fresh run with --no-resume "
+            "or choose a compatible --resume-path."
         ) from exc
-    optimizer.load_state_dict(state["optimizer_state"])
+    try:
+        optimizer.load_state_dict(state["optimizer_state"])
+    except (RuntimeError, ValueError, KeyError) as exc:
+        raise RuntimeError(
+            f"Cannot resume checkpoint {ckpt_path}: optimizer_state is incompatible with "
+            "the current optimizer/model parameters. Start a fresh run with --no-resume "
+            "or choose a compatible --resume-path."
+        ) from exc
     return int(state["epoch"]), int(state["global_step"]), float(state["best_score"])
 
 
@@ -1231,6 +1411,7 @@ def parse_args() -> TrainConfig:
     add("--flat-button-threshold", dest="button_threshold_from_pos_weight", action="store_false", default=None)
     add("--button-threshold-min", type=float, default=None)
     add("--button-threshold-max", type=float, default=None)
+    add("--conflicting-button-loss-weight", type=float, default=None)
     add("--streaming-state-training", dest="streaming_state_training", action="store_true", default=None)
     add("--no-streaming-state-training", dest="streaming_state_training", action="store_false")
     add("--streaming-state-validation", dest="streaming_state_validation", action="store_true", default=None)
@@ -1267,7 +1448,7 @@ def parse_args() -> TrainConfig:
     add("--compile", dest="compile_model", action="store_true", default=None)
     add("--no-compile", dest="compile_model", action="store_false", default=None)
     add("--compile-mode", default=None)
-    add("--dali-resize-mode", choices=["video_resize", "video_then_resize", "none"], default=None)
+    add("--dali-resize-mode", choices=["video_resize", "none"], default=None)
     add("--dali-train-random-shuffle", dest="dali_train_random_shuffle", action="store_true", default=None)
     add("--no-dali-train-random-shuffle", dest="dali_train_random_shuffle", action="store_false")
     add("--dali-val-random-shuffle", dest="dali_val_random_shuffle", action="store_true", default=None)
@@ -1322,6 +1503,7 @@ def parse_args() -> TrainConfig:
         "button_threshold_from_pos_weight",
         "button_threshold_min",
         "button_threshold_max",
+        "conflicting_button_loss_weight",
         "streaming_state_training",
         "streaming_state_validation",
         "streaming_segment_min_chunks",
@@ -1385,6 +1567,7 @@ def train() -> None:
     cfg = parse_args()
     if cfg.data_root is None:
         cfg.data_root = game_data_root(cfg.selected_game)
+    os.makedirs(cfg.ckpt_dir, exist_ok=True)
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for DALI video training.")
@@ -1430,6 +1613,7 @@ def train() -> None:
     print(
         "Loss supervision:",
         f"frames={supervised_start}-{supervised_end}",
+        f"conflict_weight={float(cfg.conflicting_button_loss_weight):.4f}",
     )
     print(
         "Streaming state training:",

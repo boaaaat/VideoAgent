@@ -130,9 +130,9 @@ class InverseTrainConfig(InverseDynamicsConfig):
                 f"got {self.attention_backend!r}."
             )
         self.dali_resize_mode = str(self.dali_resize_mode).strip().lower()
-        if self.dali_resize_mode not in {"video_resize", "video_then_resize", "none"}:
+        if self.dali_resize_mode not in {"video_resize", "none"}:
             raise ValueError(
-                "dali_resize_mode must be one of: video_resize, video_then_resize, none; "
+                "dali_resize_mode must be one of: video_resize, none; "
                 f"got {self.dali_resize_mode!r}."
             )
         self.grad_clip = max(0.0, float(self.grad_clip))
@@ -531,7 +531,6 @@ def make_dali_iterator(
         read_ahead=cfg.dali_read_ahead,
         dont_use_mmap=cfg.dali_dont_use_mmap,
         normalize_frames=False,
-        enable_augmentation=False,
         prefetch_queue_depth=cfg.dali_prefetch_queue_depth,
         exec_async=True,
         exec_pipelined=True,
@@ -1068,7 +1067,7 @@ def parse_args() -> InverseTrainConfig:
     add("--no-compile", dest="compile_model", action="store_false")
     add("--compile-mode", default=None)
     add("--attention-backend", default=None, choices=["auto", "flash", "mem_efficient", "math"])
-    add("--dali-resize-mode", default=None, choices=["video_resize", "video_then_resize", "none"])
+    add("--dali-resize-mode", default=None, choices=["video_resize", "none"])
     parser.set_defaults(compile_model=None)
 
     for flag in (

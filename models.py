@@ -1,5 +1,6 @@
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
+from dataclasses import dataclass
+import math
+from typing import List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -14,31 +15,67 @@ from action_space import (
 
 
 SPATIAL_FEATURE_CHANNELS = 128
-TEMPORAL_HIDDEN_CHANNELS = 192
-CNN_FEATURE_CHANNELS = TEMPORAL_HIDDEN_CHANNELS
+TEMPORAL_HIDDEN_CHANNELS = 128
 POLICY_INPUT_CHANNELS = 3
 TEMPORAL_RNN_LAYERS = 2
 LAST_ACTION_EMBEDDING_DROPOUT = 0.25
-LAST_ACTION_FEATURE_SCALE = 1.0
-DEFAULT_HORIZON_OFFSETS = (1, 2, 3, 5, 7, 10, 13, 16, 20, 24)
+DEFAULT_HORIZON_OFFSETS = (1, 2, 3, 5, 7, 10)
 
 
-def _largest_valid_head_count(channels: int, requested_heads: int) -> int:
-    requested_heads = max(1, min(int(requested_heads), int(channels)))
-    for heads in range(requested_heads, 0, -1):
-        if channels % heads == 0:
-            return heads
-    return 1
+def _require_int_at_least(name: str, value: object, minimum: int) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be an integer, got {value!r}.")
+    try:
+        result = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an integer, got {value!r}.") from exc
+    try:
+        if float(result) != float(value):
+            raise ValueError
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an integer, got {value!r}.") from exc
+    if result < minimum:
+        raise ValueError(f"{name} must be >= {minimum}, got {result}.")
+    return result
+
+
+def _require_float_range(name: str, value: object, minimum: float, maximum: float) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a number, got {value!r}.")
+    result = float(value)
+    if not math.isfinite(result) or result < minimum or result > maximum:
+        raise ValueError(f"{name} must be in [{minimum}, {maximum}], got {value!r}.")
+    return result
+
+
+def _torch_is_compiling() -> bool:
+    compiler = getattr(torch, "compiler", None)
+    is_compiling = getattr(compiler, "is_compiling", None)
+    if is_compiling is not None:
+        return bool(is_compiling())
+    dynamo = getattr(torch, "_dynamo", None)
+    is_compiling = getattr(dynamo, "is_compiling", None)
+    return bool(is_compiling is not None and is_compiling())
+
+
+def _validate_unit_interval_tensor(name: str, tensor: torch.Tensor) -> None:
+    if _torch_is_compiling():
+        return
+    if not bool(torch.isfinite(tensor).all().item()):
+        raise ValueError(f"{name} must contain only finite values.")
+    if bool(((tensor < 0.0) | (tensor > 1.0)).any().item()):
+        raise ValueError(f"{name} must be in [0, 1].")
 
 
 def _default_horizon_offsets(prediction_horizon: int) -> Tuple[int, ...]:
-    horizon = max(1, int(prediction_horizon))
-    if horizon <= len(DEFAULT_HORIZON_OFFSETS):
-        return tuple(DEFAULT_HORIZON_OFFSETS[:horizon])
-    offsets = list(DEFAULT_HORIZON_OFFSETS)
-    while len(offsets) < horizon:
-        offsets.append(offsets[-1] + 4)
-    return tuple(offsets)
+    horizon = int(prediction_horizon)
+    if horizon > len(DEFAULT_HORIZON_OFFSETS):
+        raise ValueError(
+            "prediction_horizon exceeds the default horizon offsets. "
+            f"Provide explicit prediction_horizon_offsets for horizon={horizon}; "
+            f"defaults support up to {len(DEFAULT_HORIZON_OFFSETS)}."
+        )
+    return tuple(DEFAULT_HORIZON_OFFSETS[:horizon])
 
 
 @dataclass
@@ -52,16 +89,16 @@ class ModelConfig:
     seq_len: int = 80
     train_seq_stride: int = 20
     val_seq_stride: int = 80
-    prediction_horizon: int = 10
+    prediction_horizon: int = 6
     prediction_horizon_offsets: Optional[Sequence[int]] = None
 
     key_names: Optional[List[str]] = None
     mouse_button_names: Optional[List[str]] = None
 
     d_model: int = 128
-    spatial_dropout = 0.10
-    head_dropout = 0.20
-    zoneout = 0.10
+    spatial_dropout: float = 0.10
+    head_dropout: float = 0.20
+    zoneout: float = 0.10
 
     pooling: Tuple[int, int] = (7, 7)
 
@@ -74,30 +111,36 @@ class ModelConfig:
         if self.data_root is None:
             self.data_root = game_data_root(self.selected_game)
 
-        self.model_size = max(32, int(self.model_size))
-        self.seq_len = max(1, int(self.seq_len))
-        self.train_seq_stride = max(1, int(self.train_seq_stride))
-        self.val_seq_stride = max(1, int(self.val_seq_stride))
-        self.prediction_horizon = max(1, int(self.prediction_horizon))
+        self.model_size = _require_int_at_least("model_size", self.model_size, 32)
+        self.seq_len = _require_int_at_least("seq_len", self.seq_len, 1)
+        self.train_seq_stride = _require_int_at_least("train_seq_stride", self.train_seq_stride, 1)
+        self.val_seq_stride = _require_int_at_least("val_seq_stride", self.val_seq_stride, 1)
+        self.prediction_horizon = _require_int_at_least("prediction_horizon", self.prediction_horizon, 1)
         if self.prediction_horizon_offsets is None:
             self.prediction_horizon_offsets = _default_horizon_offsets(self.prediction_horizon)
         else:
-            offsets = tuple(int(offset) for offset in self.prediction_horizon_offsets)
+            offsets = tuple(
+                _require_int_at_least(f"prediction_horizon_offsets[{idx}]", offset, 1)
+                for idx, offset in enumerate(self.prediction_horizon_offsets)
+            )
             if not offsets:
                 raise ValueError("prediction_horizon_offsets must contain at least one frame offset.")
-            if any(offset <= 0 for offset in offsets):
-                raise ValueError(f"prediction_horizon_offsets must be positive, got {offsets}.")
             if any(curr <= prev for prev, curr in zip(offsets, offsets[1:])):
                 raise ValueError(f"prediction_horizon_offsets must be strictly increasing, got {offsets}.")
             self.prediction_horizon_offsets = offsets
             self.prediction_horizon = len(offsets)
 
-        self.d_model = max(64, int(self.d_model))
-        self.spatial_dropout = float(min(max(self.spatial_dropout, 0.0), 0.9))
-        self.head_dropout = float(min(max(self.head_dropout, 0.0), 0.9))
-        self.zoneout = float(min(max(self.zoneout, 0.0), 0.9))
+        self.d_model = _require_int_at_least("d_model", self.d_model, 64)
+        if self.d_model % 4 != 0:
+            raise ValueError(f"d_model must be divisible by 4 transformer heads, got {self.d_model}.")
+        self.spatial_dropout = _require_float_range("spatial_dropout", self.spatial_dropout, 0.0, 0.9)
+        self.head_dropout = _require_float_range("head_dropout", self.head_dropout, 0.0, 0.9)
+        self.zoneout = _require_float_range("zoneout", self.zoneout, 0.0, 0.9)
         pool_h, pool_w = self.pooling
-        self.pooling = (max(1, int(pool_h)), max(1, int(pool_w)))
+        self.pooling = (
+            _require_int_at_least("pooling[0]", pool_h, 1),
+            _require_int_at_least("pooling[1]", pool_w, 1),
+        )
 
         if self.key_names is None:
             self.key_names = get_key_names(self.selected_game)
@@ -110,8 +153,15 @@ class ModelConfig:
             self.mouse_button_names = list(self.mouse_button_names)
 
         self.num_bin = len(self.key_names) + len(self.mouse_button_names)
+        if self.num_bin <= 0:
+            raise ValueError("At least one action key/button is required.")
 
-        self.button_state_threshold = float(min(max(self.button_state_threshold, 0.0), 1.0))
+        self.button_state_threshold = _require_float_range(
+            "button_state_threshold",
+            self.button_state_threshold,
+            0.0,
+            1.0,
+        )
         if self.button_state_thresholds is None:
             self.button_state_thresholds = tuple(float(self.button_state_threshold) for _ in range(self.num_bin))
         else:
@@ -120,20 +170,20 @@ class ModelConfig:
                 raise ValueError(
                     f"button_state_thresholds must contain {self.num_bin} values, got {len(thresholds)}."
                 )
-            self.button_state_thresholds = tuple(min(max(x, 0.0), 1.0) for x in thresholds)
+            for idx, threshold in enumerate(thresholds):
+                _require_float_range(f"button_state_thresholds[{idx}]", threshold, 0.0, 1.0)
+            self.button_state_thresholds = thresholds
 
 
 @dataclass
 class PolicyOutput:
     button_logits: torch.Tensor
     horizon_button_logits: torch.Tensor
-    future_button_logits: Dict[int, torch.Tensor] = field(default_factory=dict)
 
 
 @dataclass
 class TemporalState:
     hidden_state: Optional[torch.Tensor] = None
-    previous_frame: Optional[torch.Tensor] = None
 
 
 class ResidualBlock(nn.Module):
@@ -220,7 +270,7 @@ class ConvGRUCell(nn.Module):
         super().__init__()
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
-        self.zoneout = float(min(max(zoneout, 0.0), 0.9))
+        self.zoneout = _require_float_range("zoneout", zoneout, 0.0, 0.9)
         padding = kernel_size // 2
         
         self.gates_conv = nn.Conv2d(
@@ -271,54 +321,11 @@ class ConvGRUCell(nn.Module):
         return (1.0 - self.zoneout) * h_next + self.zoneout * h_prev
 
 
-class LearnedMultiHeadSpatialPool2d(nn.Module):
-    """
-    Learns spatial attention pools while preserving an AdaptiveAvgPool2d-style output shape.
-    """
-    def __init__(self, channels: int, output_size: Sequence[int], num_heads: int):
-        super().__init__()
-        output_h, output_w = output_size
-        self.channels = int(channels)
-        self.output_size = (max(1, int(output_h)), max(1, int(output_w)))
-        self.num_heads = _largest_valid_head_count(self.channels, int(num_heads))
-        self.head_dim = self.channels // self.num_heads
-        self.num_slots = self.output_size[0] * self.output_size[1]
-
-        self.attn_logits = nn.Conv2d(
-            self.channels,
-            self.num_heads * self.num_slots,
-            kernel_size=1,
-            bias=True,
-        )
-        nn.init.zeros_(self.attn_logits.weight)
-        nn.init.zeros_(self.attn_logits.bias)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        b, c, spatial_h, spatial_w = x.shape
-        if c != self.channels:
-            raise ValueError(f"Expected {self.channels} channels, got {c}.")
-
-        spatial_size = spatial_h * spatial_w
-        logits = self.attn_logits(x).reshape(b, self.num_heads, self.num_slots, spatial_size)
-        weights = torch.softmax(logits, dim=-1)
-
-        values = x.reshape(b, self.num_heads, self.head_dim, spatial_size)
-        pooled = torch.einsum("bhsn,bhdn->bhsd", weights, values)
-        pooled = pooled.permute(0, 1, 3, 2).reshape(b, c, self.output_size[0], self.output_size[1])
-        return pooled
-
-
 class DrivingVideoPolicy(nn.Module):
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.cfg = cfg
-        
-        # --- Center Car Mask Boundaries (Percentages) ---
-        self.car_y_min_pct = 0.50
-        self.car_y_max_pct = 0.80
-        self.car_x_min_pct = 0.40
-        self.car_x_max_pct = 0.60
-        
+
         self.spatial_encoder = CustomSpatialEncoder(in_channels=POLICY_INPUT_CHANNELS, dropout=cfg.spatial_dropout)
         
         # ConvGRU tracking state
@@ -370,10 +377,9 @@ class DrivingVideoPolicy(nn.Module):
         
         self.horizon_queries = nn.Parameter(torch.empty(self.cfg.prediction_horizon, self.cfg.d_model))
         nn.init.normal_(self.horizon_queries, mean=0.0, std=0.02)
-        decoder_heads = _largest_valid_head_count(self.cfg.d_model, 4)
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=self.cfg.d_model,
-            nhead=decoder_heads,
+            nhead=4,
             dim_feedforward=max(self.cfg.d_model * 4, 512),
             dropout=cfg.head_dropout * 0.5,
             activation="gelu",
@@ -471,7 +477,10 @@ class DrivingVideoPolicy(nn.Module):
     def _normalize_frames(self, frames: torch.Tensor) -> torch.Tensor:
         if frames.dtype == torch.uint8:
             frames = frames.float() / 255.0
-        return frames.clamp(0.0, 1.0)
+        elif not torch.is_floating_point(frames):
+            raise TypeError(f"frames must be a floating point or uint8 tensor, got {frames.dtype}.")
+        _validate_unit_interval_tensor("frames", frames)
+        return frames
 
     def _last_action_features(
         self,
@@ -502,9 +511,10 @@ class DrivingVideoPolicy(nn.Module):
             else:
                 raise ValueError(f"Expected prev_action with 2 or 3 dims, got {tuple(action_values.shape)}.")
 
-        action_values = action_values.clamp(0.0, 1.0).reshape(batch_size * time_steps, self.cfg.num_bin)
+        _validate_unit_interval_tensor("prev_action", action_values)
+        action_values = action_values.reshape(batch_size * time_steps, self.cfg.num_bin)
         features = self.last_action_encoder(action_values).reshape(batch_size, time_steps, self.cfg.d_model)
-        return features.to(dtype=dtype) * LAST_ACTION_FEATURE_SCALE
+        return features.to(dtype=dtype)
 
     def _apply_masks(self, frames: torch.Tensor) -> torch.Tensor:
         h, w = frames.shape[-2:]
@@ -533,6 +543,8 @@ class DrivingVideoPolicy(nn.Module):
         return_aux: bool = False,
         prev_action: Optional[torch.Tensor] = None,
     ):
+        if frames.dim() != 5:
+            raise ValueError(f"Expected RGB frames with shape [B,T,3,H,W], got {tuple(frames.shape)}.")
         b, t, c, h, w = frames.shape
         if c != 3:
             raise ValueError(f"Expected RGB frames with shape [B,T,3,H,W], got {tuple(frames.shape)}.")
@@ -579,10 +591,6 @@ class DrivingVideoPolicy(nn.Module):
         output = PolicyOutput(
             button_logits=step_button,
             horizon_button_logits=button,
-            future_button_logits={
-                int(offset): button[:, :, idx]
-                for idx, offset in enumerate(self.cfg.prediction_horizon_offsets)
-            },
         )
         if return_aux:
             return output, TemporalState(hidden_state=h_t.detach())
@@ -592,9 +600,10 @@ class DrivingVideoPolicy(nn.Module):
         self,
         frame: torch.Tensor,
         state: TemporalState,
-        return_aux: bool = False,
         prev_action: Optional[torch.Tensor] = None,
     ):
+        if frame.dim() != 4 or frame.size(1) != 3:
+            raise ValueError(f"Expected RGB frame with shape [B,3,H,W], got {tuple(frame.shape)}.")
         b = frame.shape[0]
 
         # 1. Normalize and mask out the car layout exactly once
@@ -621,7 +630,7 @@ class DrivingVideoPolicy(nn.Module):
         temporal_feat, new_hidden = self._temporal_step(spatial_feat, h_t)
         fused = temporal_feat + self.temporal_spatial_fusion(spatial_feat)
 
-        # 4. Map the new hidden states through the learned spatial pooling layout
+        # 4. Map the new hidden states through the fixed spatial pooling layout
         pooled = self.pool(fused)
         pooled_flat = pooled.reshape(b, -1)
 
@@ -638,15 +647,8 @@ class DrivingVideoPolicy(nn.Module):
         squeezed = PolicyOutput(
             button_logits=button[:, 0],
             horizon_button_logits=button,
-            future_button_logits={
-                int(offset): button[:, idx]
-                for idx, offset in enumerate(self.cfg.prediction_horizon_offsets)
-            },
         )
 
         # 6. Detach hidden state to prevent backpropagation graph memory leaks
-        new_state = TemporalState(
-            hidden_state=new_hidden.detach(),
-            previous_frame=None,
-        )
+        new_state = TemporalState(hidden_state=new_hidden.detach())
         return squeezed, new_state
