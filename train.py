@@ -98,7 +98,7 @@ class TrainConfig(ModelConfig):
     batch_size: int = 1
     target_effective_batch: int = 16
     grad_accum: int = field(init=False)
-    num_epochs: int = 100
+    num_epochs: int = 20
 
     lr: float = 2e-4
     min_lr: float = 1e-5
@@ -1169,7 +1169,9 @@ def _update_streaming_cache(
         video_cache = cache.setdefault(video_path, {})
         video_cache[int(end)] = hidden[:, batch_idx].detach()
         while len(video_cache) > max_pending:
-            video_cache.pop(min(video_cache))
+            # Evict the oldest-inserted entry (stale leftovers from out-of-order
+            # segments), never the freshly stored state for the active segment.
+            video_cache.pop(next(iter(video_cache)))
 
 
 

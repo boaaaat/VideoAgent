@@ -17,7 +17,8 @@ from action_space import (
 SPATIAL_FEATURE_CHANNELS = 128
 TEMPORAL_HIDDEN_CHANNELS = 128
 POLICY_INPUT_CHANNELS = 3
-TEMPORAL_RNN_LAYERS = 2
+TEMPORAL_RNN_LAYERS = 1
+KEYPOINT_HEATMAP_CHANNELS = 32
 LAST_ACTION_EMBEDDING_DROPOUT = 0.25
 DEFAULT_HORIZON_OFFSETS = (1, 2, 3, 5, 7, 10)
 
@@ -46,25 +47,6 @@ def _require_float_range(name: str, value: object, minimum: float, maximum: floa
     if not math.isfinite(result) or result < minimum or result > maximum:
         raise ValueError(f"{name} must be in [{minimum}, {maximum}], got {value!r}.")
     return result
-
-
-def _torch_is_compiling() -> bool:
-    compiler = getattr(torch, "compiler", None)
-    is_compiling = getattr(compiler, "is_compiling", None)
-    if is_compiling is not None:
-        return bool(is_compiling())
-    dynamo = getattr(torch, "_dynamo", None)
-    is_compiling = getattr(dynamo, "is_compiling", None)
-    return bool(is_compiling is not None and is_compiling())
-
-
-def _validate_unit_interval_tensor(name: str, tensor: torch.Tensor) -> None:
-    if _torch_is_compiling():
-        return
-    if not bool(torch.isfinite(tensor).all().item()):
-        raise ValueError(f"{name} must contain only finite values.")
-    if bool(((tensor < 0.0) | (tensor > 1.0)).any().item()):
-        raise ValueError(f"{name} must be in [0, 1].")
 
 
 def _default_horizon_offsets(prediction_horizon: int) -> Tuple[int, ...]:
@@ -98,9 +80,7 @@ class ModelConfig:
     d_model: int = 128
     spatial_dropout: float = 0.10
     head_dropout: float = 0.20
-    zoneout: float = 0.10
-
-    pooling: Tuple[int, int] = (7, 7)
+    zoneout: float = 0.0
 
     button_state_threshold: float = 0.5
     button_state_thresholds: Optional[Sequence[float]] = None
@@ -132,15 +112,10 @@ class ModelConfig:
 
         self.d_model = _require_int_at_least("d_model", self.d_model, 64)
         if self.d_model % 4 != 0:
-            raise ValueError(f"d_model must be divisible by 4 transformer heads, got {self.d_model}.")
+            raise ValueError(f"d_model must be divisible by 4, got {self.d_model}.")
         self.spatial_dropout = _require_float_range("spatial_dropout", self.spatial_dropout, 0.0, 0.9)
         self.head_dropout = _require_float_range("head_dropout", self.head_dropout, 0.0, 0.9)
         self.zoneout = _require_float_range("zoneout", self.zoneout, 0.0, 0.9)
-        pool_h, pool_w = self.pooling
-        self.pooling = (
-            _require_int_at_least("pooling[0]", pool_h, 1),
-            _require_int_at_least("pooling[1]", pool_w, 1),
-        )
 
         if self.key_names is None:
             self.key_names = get_key_names(self.selected_game)
@@ -187,16 +162,16 @@ class TemporalState:
 
 
 class ResidualBlock(nn.Module):
-    """2D residual block used by the exact-width policy encoder."""
+    """2D residual block used by the policy encoder."""
 
     def __init__(self, channels: int, dropout: float = 0.0):
         super().__init__()
         layers: List[nn.Module] = [
             nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(channels),
+            nn.GroupNorm(8, channels),
             nn.SiLU(inplace=True),
             nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(channels),
+            nn.GroupNorm(8, channels),
         ]
         if dropout > 0.0:
             layers.append(nn.Dropout2d(dropout))
@@ -209,61 +184,54 @@ class ResidualBlock(nn.Module):
 
 class CustomSpatialEncoder(nn.Module):
     """
-    Exact-width residual CNN encoder.
-    Outputs [B, SPATIAL_FEATURE_CHANNELS, H/4, W/4] for square policy inputs.
+    GroupNorm residual CNN encoder.
+    Full-capacity stages at H/4 (64x64) and H/8 (32x32) encode fine lane-line and
+    edge detail; the output grid is [B, SPATIAL_FEATURE_CHANNELS, H/16, W/16].
+    GroupNorm keeps statistics batch-independent (training runs at batch_size=1).
     """
     def __init__(self, in_channels: int = 3, dropout: float = 0.2):
         super().__init__()
         self.stem = nn.Sequential(
-            nn.Conv2d(in_channels, 32, kernel_size=7, stride=2, padding=3, bias=False),  # /2
-            nn.BatchNorm2d(32),
+            nn.Conv2d(in_channels, 32, kernel_size=3, stride=2, padding=1, bias=False),   # /2
+            nn.GroupNorm(8, 32),
             nn.SiLU(inplace=True),
         )
-        self.detail = nn.Sequential(
-            nn.Conv2d(32, 64, kernel_size=5, stride=2, padding=2, bias=False),           # /4
-            nn.BatchNorm2d(64),
+        self.stage1 = nn.Sequential(
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1, bias=False),            # /4
+            nn.GroupNorm(8, 64),
             nn.SiLU(inplace=True),
-        )
-        self.residual_blocks = nn.Sequential(
             ResidualBlock(64, dropout),
             ResidualBlock(64, dropout),
         )
-        self.proj = nn.Sequential(
-            nn.Conv2d(64, SPATIAL_FEATURE_CHANNELS, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(SPATIAL_FEATURE_CHANNELS),
+        self.stage2 = nn.Sequential(
+            nn.Conv2d(64, 96, kernel_size=3, stride=2, padding=1, bias=False),            # /8
+            nn.GroupNorm(8, 96),
             nn.SiLU(inplace=True),
+            ResidualBlock(96, dropout),
+            ResidualBlock(96, dropout),
+        )
+        self.stage3 = nn.Sequential(
+            nn.Conv2d(96, SPATIAL_FEATURE_CHANNELS, kernel_size=3, stride=2, padding=1, bias=False),  # /16
+            nn.GroupNorm(8, SPATIAL_FEATURE_CHANNELS),
+            nn.SiLU(inplace=True),
+            ResidualBlock(SPATIAL_FEATURE_CHANNELS, dropout),
+            ResidualBlock(SPATIAL_FEATURE_CHANNELS, dropout),
         )
 
     def feature_stages(self, x: torch.Tensor) -> List[torch.Tensor]:
         stem = self.stem(x)
-        detail = self.detail(stem)
-        residual = self.residual_blocks(detail)
-        projected = self.proj(residual)
-        return [stem, detail, residual, projected]
+        stage1 = self.stage1(stem)
+        stage2 = self.stage2(stage1)
+        stage3 = self.stage3(stage2)
+        return [stem, stage1, stage2, stage3]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.feature_stages(x)[-1]
-
-
-class SpatialLayerNorm2d(nn.Module):
-    """LayerNorm-style normalization over each channel's spatial feature grid."""
-
-    def __init__(self, channels: int, eps: float = 1e-5):
-        super().__init__()
-        self.eps = float(eps)
-        self.weight = nn.Parameter(torch.ones(1, channels, 1, 1))
-        self.bias = nn.Parameter(torch.zeros(1, channels, 1, 1))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        mean = x.mean(dim=(-2, -1), keepdim=True)
-        variance = x.var(dim=(-2, -1), unbiased=False, keepdim=True)
-        normalized = (x - mean) * torch.rsqrt(variance + self.eps)
-        return normalized * self.weight + self.bias
+        return self.stage3(self.stage2(self.stage1(self.stem(x))))
 
 
 class ConvGRUCell(nn.Module):
     """
-    A GRU cell that replaces standard Linear matrix multiplications with Conv2d loops,
+    A GRU cell that replaces standard Linear matrix multiplications with Conv2d,
     preserving structural 2D coordinates across time.
     """
     def __init__(self, input_dim: int, hidden_dim: int, kernel_size: int = 3, zoneout: float = 0.0):
@@ -272,31 +240,28 @@ class ConvGRUCell(nn.Module):
         self.hidden_dim = hidden_dim
         self.zoneout = _require_float_range("zoneout", zoneout, 0.0, 0.9)
         padding = kernel_size // 2
-        
+
         self.gates_conv = nn.Conv2d(
             in_channels=input_dim + hidden_dim,
             out_channels=2 * hidden_dim,
             kernel_size=kernel_size,
             padding=padding,
-            bias=True
+            bias=True,
         )
         self.candidate_conv = nn.Conv2d(
             in_channels=input_dim + hidden_dim,
             out_channels=hidden_dim,
             kernel_size=kernel_size,
             padding=padding,
-            bias=True
+            bias=True,
         )
-        self.residual_scale = nn.Parameter(torch.tensor(0.10))
-        self.spatial_norm = SpatialLayerNorm2d(hidden_dim)
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        nn.init.orthogonal_(self.gates_conv.weight)
-        nn.init.orthogonal_(self.candidate_conv.weight)
         if self.gates_conv.bias is not None:
             nn.init.zeros_(self.gates_conv.bias)
-            nn.init.constant_(self.gates_conv.bias[self.hidden_dim:], 1.0)
+            # Update gate starts near z=0.27 so the cell keeps ~73% of its state per step.
+            nn.init.constant_(self.gates_conv.bias[self.hidden_dim:], -1.0)
         if self.candidate_conv.bias is not None:
             nn.init.zeros_(self.candidate_conv.bias)
 
@@ -304,15 +269,14 @@ class ConvGRUCell(nn.Module):
         combined = torch.cat([x, h_prev], dim=1)
         gates = self.gates_conv(combined)
         r_gate, z_gate = torch.chunk(gates, 2, dim=1)
-        
+
         r_gate = torch.sigmoid(r_gate)
         z_gate = torch.sigmoid(z_gate)
-        
+
         combined_candidate = torch.cat([x, r_gate * h_prev], dim=1)
         candidate = torch.tanh(self.candidate_conv(combined_candidate))
-        
-        gru_output = (1.0 - z_gate) * h_prev + z_gate * candidate
-        h_next = self.spatial_norm(gru_output + self.residual_scale * h_prev)
+
+        h_next = (1.0 - z_gate) * h_prev + z_gate * candidate
         if self.zoneout <= 0.0:
             return h_next
         if self.training:
@@ -327,7 +291,7 @@ class DrivingVideoPolicy(nn.Module):
         self.cfg = cfg
 
         self.spatial_encoder = CustomSpatialEncoder(in_channels=POLICY_INPUT_CHANNELS, dropout=cfg.spatial_dropout)
-        
+
         # ConvGRU tracking state
         self.spatial_feat_channels = SPATIAL_FEATURE_CHANNELS
         self.feat_channels = TEMPORAL_HIDDEN_CHANNELS
@@ -347,14 +311,16 @@ class DrivingVideoPolicy(nn.Module):
             if self.spatial_feat_channels == self.feat_channels
             else nn.Conv2d(self.spatial_feat_channels, self.feat_channels, kernel_size=1, bias=False)
         )
-        
-        # Preserve a real fixed spatial grid for the classifier head.
-        self.pool = nn.AdaptiveAvgPool2d(cfg.pooling)
-        
+        self.fused_norm = nn.GroupNorm(8, self.feat_channels)
+
+        # Spatial-softmax keypoint pooling: each heatmap channel reduces to its
+        # expected (x, y), preserving precise lane/object positions for steering.
+        self.keypoint_heatmaps = nn.Conv2d(self.feat_channels, KEYPOINT_HEATMAP_CHANNELS, kernel_size=1)
+        pooled_dim = self.feat_channels + 2 * KEYPOINT_HEATMAP_CHANNELS
         self.fc_features = nn.Sequential(
-            nn.Linear(self.feat_channels * cfg.pooling[0] * cfg.pooling[1], self.cfg.d_model),
-            nn.ELU(inplace=True),
-            nn.Dropout(cfg.head_dropout)
+            nn.Linear(pooled_dim, self.cfg.d_model),
+            nn.SiLU(inplace=True),
+            nn.Dropout(cfg.head_dropout),
         )
 
         action_hidden = max(4, min(32, cfg.num_bin * 2, self.cfg.d_model // 4))
@@ -374,30 +340,14 @@ class DrivingVideoPolicy(nn.Module):
             nn.Linear(self.cfg.d_model * 2, self.cfg.d_model),
             nn.ELU(inplace=True),
         )
-        
-        self.horizon_queries = nn.Parameter(torch.empty(self.cfg.prediction_horizon, self.cfg.d_model))
-        nn.init.normal_(self.horizon_queries, mean=0.0, std=0.02)
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=self.cfg.d_model,
-            nhead=4,
-            dim_feedforward=max(self.cfg.d_model * 4, 512),
-            dropout=cfg.head_dropout * 0.5,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
-        )
-        self.horizon_decoder = nn.TransformerDecoder(
-            decoder_layer,
-            num_layers=2,
-            norm=nn.LayerNorm(self.cfg.d_model),
-        )
-        horizon_hidden = max(64, self.cfg.d_model // 2)
+
+        horizon_hidden = max(128, self.cfg.d_model)
         self.button_head = nn.Sequential(
             nn.LayerNorm(self.cfg.d_model),
             nn.Linear(self.cfg.d_model, horizon_hidden),
-            nn.ELU(inplace=True),
+            nn.SiLU(inplace=True),
             nn.Dropout(cfg.head_dropout * 0.5),
-            nn.Linear(horizon_hidden, self.cfg.num_bin),
+            nn.Linear(horizon_hidden, self.cfg.prediction_horizon * self.cfg.num_bin),
         )
         final_button_layer = self.button_head[-1]
         if isinstance(final_button_layer, nn.Linear):
@@ -463,23 +413,31 @@ class DrivingVideoPolicy(nn.Module):
             next_states.append(x_t)
         return x_t, torch.stack(next_states, dim=0)
 
+    def _pool_features(self, fused: torch.Tensor) -> torch.Tensor:
+        fused = self.fused_norm(fused)
+        heatmaps = self.keypoint_heatmaps(fused)
+        b, k, h, w = heatmaps.shape
+        attention = torch.softmax(heatmaps.reshape(b, k, h * w).float(), dim=-1)
+        ys = torch.linspace(-1.0, 1.0, h, device=fused.device, dtype=attention.dtype)
+        xs = torch.linspace(-1.0, 1.0, w, device=fused.device, dtype=attention.dtype)
+        grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+        expected_x = (attention * grid_x.reshape(1, 1, h * w)).sum(dim=-1)
+        expected_y = (attention * grid_y.reshape(1, 1, h * w)).sum(dim=-1)
+        keypoints = torch.cat([expected_x, expected_y], dim=1).to(dtype=fused.dtype)
+        context = fused.mean(dim=(-2, -1))
+        return self.fc_features(torch.cat([keypoints, context], dim=1))
+
     def _horizon_button_logits(self, features: torch.Tensor) -> torch.Tensor:
         if features.size(-1) != self.cfg.d_model:
             raise ValueError(f"Expected final feature dim {self.cfg.d_model}, got {features.size(-1)}.")
-        leading_shape = tuple(features.shape[:-1])
-        memory = features.reshape(-1, 1, self.cfg.d_model)
-        queries = self.horizon_queries.to(device=features.device, dtype=features.dtype)
-        queries = queries.unsqueeze(0).expand(memory.size(0), -1, -1)
-        decoded = self.horizon_decoder(tgt=queries, memory=memory)
-        logits = self.button_head(decoded)
-        return logits.reshape(*leading_shape, self.cfg.prediction_horizon, self.cfg.num_bin)
+        logits = self.button_head(features)
+        return logits.reshape(*features.shape[:-1], self.cfg.prediction_horizon, self.cfg.num_bin)
 
     def _normalize_frames(self, frames: torch.Tensor) -> torch.Tensor:
         if frames.dtype == torch.uint8:
             frames = frames.float() / 255.0
         elif not torch.is_floating_point(frames):
             raise TypeError(f"frames must be a floating point or uint8 tensor, got {frames.dtype}.")
-        _validate_unit_interval_tensor("frames", frames)
         return frames
 
     def _last_action_features(
@@ -511,7 +469,6 @@ class DrivingVideoPolicy(nn.Module):
             else:
                 raise ValueError(f"Expected prev_action with 2 or 3 dims, got {tuple(action_values.shape)}.")
 
-        _validate_unit_interval_tensor("prev_action", action_values)
         action_values = action_values.reshape(batch_size * time_steps, self.cfg.num_bin)
         features = self.last_action_encoder(action_values).reshape(batch_size, time_steps, self.cfg.d_model)
         return features.to(dtype=dtype)
@@ -548,10 +505,10 @@ class DrivingVideoPolicy(nn.Module):
         b, t, c, h, w = frames.shape
         if c != 3:
             raise ValueError(f"Expected RGB frames with shape [B,T,3,H,W], got {tuple(frames.shape)}.")
-        
+
         frames = self._normalize_frames(frames)
         frames = self._apply_masks(frames)
-        
+
         # 1. Spatial Processing
         x = frames.reshape(b * t, POLICY_INPUT_CHANNELS, h, w)
         if x.is_cuda:
@@ -559,7 +516,7 @@ class DrivingVideoPolicy(nn.Module):
         spatial_feats = self.spatial_encoder(x)
         _, spatial_channels, hf, wf = spatial_feats.shape
         spatial_feats = spatial_feats.reshape(b, t, spatial_channels, hf, wf)
-        
+
         # 2. Temporal ConvGRU Rollout Loop
         h_t = self._prepare_temporal_state(
             state,
@@ -569,24 +526,22 @@ class DrivingVideoPolicy(nn.Module):
             device=frames.device,
             dtype=spatial_feats.dtype,
         )
-            
+
         visual_steps = []
         for step in range(t):
             spatial_step = spatial_feats[:, step]
             temporal_feat, h_t = self._temporal_step(spatial_step, h_t)
             fused = temporal_feat + self.temporal_spatial_fusion(spatial_step)
-            pooled = self.pool(fused)
-            pooled_flat = pooled.reshape(b, -1)
-            visual_steps.append(self.fc_features(pooled_flat))
-        
-        # 3. Linear Downsampling for Classifier Heads
+            visual_steps.append(self._pool_features(fused))
+
+        # 3. Fuse pooled visual features with last-action context
         visual_feat = torch.stack(visual_steps, dim=1)
         action_feat = self._last_action_features(prev_action, b, t, device=frames.device, dtype=visual_feat.dtype)
         fc_out = self.head_fusion(torch.cat([visual_feat, action_feat], dim=-1))
-        
+
         # 4. Action Mapping Prediction
         button = self._horizon_button_logits(fc_out)
-        
+
         step_button = button[:, :, 0]
         output = PolicyOutput(
             button_logits=step_button,
@@ -630,11 +585,8 @@ class DrivingVideoPolicy(nn.Module):
         temporal_feat, new_hidden = self._temporal_step(spatial_feat, h_t)
         fused = temporal_feat + self.temporal_spatial_fusion(spatial_feat)
 
-        # 4. Map the new hidden states through the fixed spatial pooling layout
-        pooled = self.pool(fused)
-        pooled_flat = pooled.reshape(b, -1)
-
-        visual_feat = self.fc_features(pooled_flat)
+        # 4. Pool the fused features and add last-action context
+        visual_feat = self._pool_features(fused)
         action_feat = self._last_action_features(prev_action, b, 1, device=frame.device, dtype=visual_feat.dtype).reshape(
             b,
             self.cfg.d_model,
