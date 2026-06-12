@@ -972,8 +972,6 @@ def parse_args() -> TrainConfig:
     add("--temporal-heads", type=int, default=None)
     add("--temporal-mlp-ratio", type=float, default=None)
     add("--dropout", type=float, default=None)
-    add("--coord-scale", type=float, default=None)
-    add("--coord-dropout", type=float, default=None)
     add("--encode-chunk-size", type=int, default=None)
     add("--train-seq-stride", type=int, default=None)
     add("--val-seq-stride", type=int, default=None)
@@ -1053,8 +1051,6 @@ def parse_args() -> TrainConfig:
         "temporal_heads",
         "temporal_mlp_ratio",
         "dropout",
-        "coord_scale",
-        "coord_dropout",
         "encode_chunk_size",
         "train_seq_stride",
         "val_seq_stride",

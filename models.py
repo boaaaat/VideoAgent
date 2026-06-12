@@ -33,7 +33,7 @@ class ModelConfig:
     mouse_button_names: Optional[List[str]] = None
 
     d_model: int = 192
-    frame_spatial_pool: int = 8
+    frame_spatial_pool: int = 16
     # Kept for checkpoint/config compatibility; the spatial encoder now works
     # directly at d_model width, so this value is unused by the model.
     frame_spatial_channels: int = 32
@@ -45,8 +45,6 @@ class ModelConfig:
     temporal_heads: int = 4
     temporal_mlp_ratio: float = 2.0
     dropout: float = 0.10
-    coord_scale: float = 1.0
-    coord_dropout: float = 0.1
     encode_chunk_size: int = 16
     max_context: int = 80
 
@@ -81,8 +79,6 @@ class ModelConfig:
             self.temporal_heads -= 1
         self.temporal_mlp_ratio = float(min(max(self.temporal_mlp_ratio, 1.0), 8.0))
         self.dropout = float(min(max(self.dropout, 0.0), 0.9))
-        self.coord_scale = float(min(max(self.coord_scale, 0.0), 2.0))
-        self.coord_dropout = float(min(max(self.coord_dropout, 0.0), 1.0))
         self.encode_chunk_size = max(1, int(self.encode_chunk_size))
         self.max_context = max(self.seq_len, int(self.max_context))
 
@@ -158,29 +154,54 @@ class ResidualConvBlock(nn.Module):
 
 
 class FrameCNN(nn.Module):
-    """Stride-16 conv backbone producing a d_model-wide spatial token grid."""
+    """Stride-16 conv backbone with FPN-style lateral fusion from the stride-4
+    and stride-8 stages, so thin structures (lane lines, road edges) seen at
+    high resolution survive into the d_model-wide spatial token grid."""
 
     def __init__(self, cfg: ModelConfig):
         super().__init__()
+        d = int(cfg.d_model)
         widths = [
-            max(32, cfg.d_model // 4),
-            max(48, cfg.d_model // 2),
-            max(96, (3 * cfg.d_model) // 4),
-            cfg.d_model,
+            max(32, d // 4),
+            max(48, d // 2),
+            max(96, (3 * d) // 4),
+            d,
         ]
-        layers: List[nn.Module] = []
-        in_channels = 8
-        for idx, out_channels in enumerate(widths):
-            layers.append(ConvBlock(in_channels, out_channels, stride=2, dropout=cfg.dropout * 0.2))
-            layers.append(ResidualConvBlock(out_channels, dropout=cfg.dropout * 0.2))
-            if idx >= 1:
-                layers.append(ResidualConvBlock(out_channels, dropout=cfg.dropout * 0.2))
-            in_channels = out_channels
-        self.net = nn.Sequential(*layers)
+        drop = cfg.dropout * 0.2
+
+        def stage(in_channels: int, out_channels: int, *, extra_residual: bool) -> nn.Sequential:
+            blocks: List[nn.Module] = [
+                ConvBlock(in_channels, out_channels, stride=2, dropout=drop),
+                ResidualConvBlock(out_channels, dropout=drop),
+            ]
+            if extra_residual:
+                blocks.append(ResidualConvBlock(out_channels, dropout=drop))
+            return nn.Sequential(*blocks)
+
+        self.stage1 = stage(7, widths[0], extra_residual=False)
+        self.stage2 = stage(widths[0], widths[1], extra_residual=True)
+        self.stage3 = stage(widths[1], widths[2], extra_residual=True)
+        self.stage4 = stage(widths[2], widths[3], extra_residual=True)
+        self.lateral4 = self._make_lateral(widths[1], d, num_down=2, dropout=drop)
+        self.lateral8 = self._make_lateral(widths[2], d, num_down=1, dropout=drop)
+        self.post_fuse = ResidualConvBlock(d, dropout=drop)
         self.pool_size = int(cfg.frame_spatial_pool)
 
+    @staticmethod
+    def _make_lateral(in_channels: int, out_channels: int, *, num_down: int, dropout: float) -> nn.Sequential:
+        layers: List[nn.Module] = []
+        for _ in range(num_down):
+            layers.append(ConvBlock(in_channels, in_channels, stride=2, dropout=dropout))
+        layers.append(nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False))
+        layers.append(nn.GroupNorm(_group_count(out_channels), out_channels))
+        return nn.Sequential(*layers)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.net(x)
+        x = self.stage1(x)
+        s2 = self.stage2(x)
+        s3 = self.stage3(s2)
+        s4 = self.stage4(s3)
+        x = self.post_fuse(s4 + self.lateral4(s2) + self.lateral8(s3))
         x = F.adaptive_avg_pool2d(x, output_size=(self.pool_size, self.pool_size))
         return x.flatten(2).transpose(1, 2).contiguous()
 
@@ -370,6 +391,15 @@ class ActionConditionedVideoPolicy(nn.Module):
         )
         self.button_head = nn.Linear(self.cfg.d_model, self.cfg.prediction_horizon * self.cfg.num_bin)
 
+        sobel = torch.tensor(
+            [
+                [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]],
+                [[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]],
+            ],
+            dtype=torch.float32,
+        ).unsqueeze(1)
+        self.register_buffer("sobel_kernel", sobel, persistent=False)
+
         nn.init.constant_(self.button_head.bias, -1.0)
 
     @property
@@ -412,27 +442,15 @@ class ActionConditionedVideoPolicy(nn.Module):
             return torch.full((self.cfg.num_bin,), float(self.cfg.button_state_threshold), device=device, dtype=dtype)
         return torch.tensor(list(thresholds), device=device, dtype=dtype)
 
-    def _coord_channels(
-        self,
-        *,
-        batch: int,
-        steps: int,
-        height: int,
-        width: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        y = torch.linspace(-1.0, 1.0, height, device=device, dtype=dtype).view(1, 1, 1, height, 1)
-        x = torch.linspace(-1.0, 1.0, width, device=device, dtype=dtype).view(1, 1, 1, 1, width)
-        x = x.expand(batch, steps, 1, height, width)
-        y = y.expand(batch, steps, 1, height, width)
-        coords = torch.cat([x, y], dim=2)
-        if float(self.cfg.coord_scale) != 1.0:
-            coords = coords * float(self.cfg.coord_scale)
-        if self.training and float(self.cfg.coord_dropout) > 0.0:
-            keep = torch.rand((batch, 1, 1, 1, 1), device=device) >= float(self.cfg.coord_dropout)
-            coords = coords * keep.to(dtype=dtype)
-        return coords
+    def _edge_channel(self, frames: torch.Tensor) -> torch.Tensor:
+        """Fixed Sobel gradient magnitude on grayscale, scaled to [0,1] — gives
+        thin lane lines and road edges an explicit input channel."""
+        b, t, _, h, w = frames.shape
+        gray = frames.mean(dim=2, keepdim=True).reshape(b * t, 1, h, w)
+        kernel = self.sobel_kernel.to(device=frames.device, dtype=frames.dtype)
+        grad = F.conv2d(gray, kernel, padding=1)
+        edges = grad.pow(2).sum(dim=1, keepdim=True).clamp(min=1e-12).sqrt()
+        return (edges / 4.0).clamp(0.0, 1.0).view(b, t, 1, h, w)
 
     def _encode_frames(
         self,
@@ -458,15 +476,8 @@ class ActionConditionedVideoPolicy(nn.Module):
             prev = torch.cat([prev0, frames[:, :-1]], dim=1)
             motion = frames - prev
 
-        coords = self._coord_channels(
-            batch=b,
-            steps=t,
-            height=h,
-            width=w,
-            device=frames.device,
-            dtype=frames.dtype,
-        )
-        x = torch.cat([frames, motion, coords], dim=2).reshape(b * t, 8, h, w)
+        edges = self._edge_channel(frames)
+        x = torch.cat([frames, motion, edges], dim=2).reshape(b * t, 7, h, w)
         if x.is_cuda:
             x = x.contiguous(memory_format=torch.channels_last)
 
