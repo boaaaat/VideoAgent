@@ -77,7 +77,7 @@ class ModelConfig:
     key_names: Optional[List[str]] = None
     mouse_button_names: Optional[List[str]] = None
 
-    d_model: int = 128
+    d_model: int = 256
     spatial_dropout: float = 0.10
     head_dropout: float = 0.20
     zoneout: float = 0.0

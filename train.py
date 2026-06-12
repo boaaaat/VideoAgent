@@ -918,6 +918,23 @@ def second_half_only(valid: torch.Tensor) -> torch.Tensor:
     return valid * time.to(dtype=valid.dtype)
 
 
+def warmup_masked_valid(valid: torch.Tensor, fresh_state: Optional[torch.Tensor]) -> torch.Tensor:
+    """Warmup-mask only samples that started from a zero hidden state.
+
+    Chunks that inherited a carried ConvGRU state have full temporal context
+    from frame 0; masking their early frames would delete exactly the
+    supervision that rewards carrying useful state across chunk boundaries.
+    """
+    if fresh_state is None:
+        return second_half_only(valid)
+    if fresh_state.dim() != 1 or int(fresh_state.size(0)) != int(valid.size(0)):
+        raise ValueError(
+            f"Expected fresh_state shape [{int(valid.size(0))}], got {tuple(fresh_state.shape)}."
+        )
+    fresh = fresh_state.to(device=valid.device, dtype=torch.bool).view(-1, *([1] * (valid.dim() - 1)))
+    return torch.where(fresh, second_half_only(valid), valid)
+
+
 def decision_thresholds_from_pos_weight(pos_weight: torch.Tensor, cfg: TrainConfig) -> torch.Tensor:
     """Undo the probability overshoot introduced by weighted BCE.
 
@@ -1009,8 +1026,9 @@ def compute_losses(
     cfg: TrainConfig,
     *,
     button_pos_weight: torch.Tensor,
+    fresh_state_mask: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    valid = second_half_only(targets.horizon_valid).float()
+    valid = warmup_masked_valid(targets.horizon_valid, fresh_state_mask).float()
     valid_4d = valid.unsqueeze(-1)
     button_target = targets.button_horizon.float()
     if float(cfg.button_label_smoothing) > 0.0:
@@ -1093,8 +1111,9 @@ def update_metrics(
     cfg: TrainConfig,
     step1_stats: BinaryStats,
     final_stats: BinaryStats,
+    fresh_state_mask: Optional[torch.Tensor] = None,
 ) -> None:
-    valid = second_half_only(targets.horizon_valid)
+    valid = warmup_masked_valid(targets.horizon_valid, fresh_state_mask)
     step1_valid = valid[:, :, 0] > 0.5
     final_idx = int(cfg.prediction_horizon) - 1
     final_valid = valid[:, :, final_idx] > 0.5
@@ -1262,15 +1281,16 @@ def _streaming_initial_state(
     targets: WindowTargets,
     cache: StreamingStateCache,
     reset_indices: Optional[set[int]] = None,
-) -> Tuple[Optional[TemporalState], int, int]:
+) -> Tuple[Optional[TemporalState], List[bool]]:
+    """Return the initial temporal state plus a per-sample carried flag."""
+    indices = _labels_to_indices(labels)
     if targets.meta is None or not cache:
-        return None, 0, int(labels.numel())
+        return None, [False] * len(indices)
 
     reset_indices = reset_indices or set()
     sample_states: List[Optional[torch.Tensor]] = []
     template: Optional[torch.Tensor] = None
-    carried = 0
-    for label_idx in _labels_to_indices(labels):
+    for label_idx in indices:
         video_path, start, _ = targets.meta[label_idx]
         video_cache = cache.get(video_path, {})
         hidden = video_cache.pop(int(start), None)
@@ -1279,17 +1299,16 @@ def _streaming_initial_state(
         sample_states.append(hidden)
         if hidden is not None and template is None:
             template = hidden
-        if hidden is not None:
-            carried += 1
 
+    carried_flags = [hidden is not None for hidden in sample_states]
     if template is None:
-        return None, carried, len(sample_states)
+        return None, carried_flags
 
     stacked = torch.stack(
         [hidden if hidden is not None else torch.zeros_like(template) for hidden in sample_states],
         dim=1,
     )
-    return TemporalState(hidden_state=stacked), carried, len(sample_states)
+    return TemporalState(hidden_state=stacked), carried_flags
 
 
 def _update_streaming_cache(
@@ -1369,15 +1388,21 @@ def run_epoch(
                     if is_train
                     else batch_targets.last_action
                 )
+                fresh_state_mask: Optional[torch.Tensor] = None
                 if use_streaming_state:
-                    initial_state, carried, total = _streaming_initial_state(
+                    initial_state, carried_flags = _streaming_initial_state(
                         labels,
                         targets,
                         streaming_cache,
                         streaming_reset_indices if is_train else None,
                     )
-                    stream_carried += int(carried)
-                    stream_total += int(total)
+                    stream_carried += sum(1 for flag in carried_flags if flag)
+                    stream_total += len(carried_flags)
+                    fresh_state_mask = torch.tensor(
+                        [not flag for flag in carried_flags],
+                        device=device,
+                        dtype=torch.bool,
+                    )
                     output, next_state = model(
                         frames,
                         state=initial_state,
@@ -1392,6 +1417,7 @@ def run_epoch(
                     batch_targets,
                     cfg,
                     button_pos_weight=button_pos_weight,
+                    fresh_state_mask=fresh_state_mask,
                 )
                 loss_div = loss / int(cfg.grad_accum)
 
@@ -1421,10 +1447,11 @@ def run_epoch(
             cfg,
             step1_stats,
             final_stats,
+            fresh_state_mask=fresh_state_mask,
         )
         if threshold_fitter is not None:
             final_idx = int(cfg.prediction_horizon) - 1
-            horizon_valid = second_half_only(batch_targets.horizon_valid)
+            horizon_valid = warmup_masked_valid(batch_targets.horizon_valid, fresh_state_mask)
             threshold_fitter.update(
                 torch.sigmoid(output.horizon_button_logits[:, :, final_idx].float()),
                 batch_targets.button_horizon[:, :, final_idx] > 0.5,
