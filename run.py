@@ -453,11 +453,6 @@ def main() -> None:
     # Custom sensitivity optimization overrides (Tweak these variables to adjust turning rules!)
     # w, a, s, d
     # cfg.button_state_thresholds = (0.50, 0.5, 0.4, 0.5)
-    if cfg.last_action_conditioning:
-        # Legacy checkpoint (pre last-action removal): its stored thresholds were
-        # fitted at +10 and over-fire at +1. F1-optimal @+1 fit on val via
-        # `train.py --eval-only`. New checkpoints store +1-fitted thresholds.
-        cfg.button_state_thresholds = (0.714, 0.775, 0.900, 0.789)
     RUNTIME_CFG = cfg
 
     model = DrivingVideoPolicy(cfg).to(device)
@@ -471,7 +466,7 @@ def main() -> None:
         f"command_offset=+{int(cfg.prediction_horizon_offsets[command_idx])}",
         f"d_model={cfg.d_model}",
         "temporal=convgru",
-        "input=masked_full_frame+last_action",
+        "input=masked_full_frame",
     )
     print(
         "Button thresholds:",
@@ -498,7 +493,6 @@ def main() -> None:
     )
 
     temporal_state = TemporalState()
-    prev_action = torch.zeros((1, cfg.num_bin), device=device, dtype=inference_dtype)
     was_autopilot = False
 
     print("=" * 60)
@@ -511,12 +505,10 @@ def main() -> None:
 
             if autopilot and not was_autopilot:
                 temporal_state = TemporalState()
-                prev_action = torch.zeros((1, cfg.num_bin), device=device, dtype=inference_dtype)
                 print("Autopilot ENABLED - temporal state reset")
 
             if (not autopilot) and was_autopilot:
                 temporal_state = TemporalState()
-                prev_action = torch.zeros((1, cfg.num_bin), device=device, dtype=inference_dtype)
                 release_all()
                 print("Autopilot DISABLED - temporal state reset")
 
@@ -533,17 +525,15 @@ def main() -> None:
                         output, temporal_state = model.forward_step(
                             frame_batch,
                             temporal_state,
-                            prev_action=prev_action,
                         )
                         button_logits = output.horizon_button_logits
                     button_probs = torch.sigmoid(button_logits[0, command_idx])
                     predicted_buttons = (button_probs >= thresholds).to(dtype=button_logits.dtype)
 
-                    applied_buttons = controller.apply(
+                    controller.apply(
                         predicted_buttons,
                         button_probs=button_probs,
                     )
-                    prev_action = applied_buttons.detach().reshape(1, cfg.num_bin).to(device=device, dtype=inference_dtype)
 
                 elapsed = time.perf_counter() - loop_start
                 remaining = float(cfg.decision_interval) - elapsed

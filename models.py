@@ -19,7 +19,6 @@ TEMPORAL_HIDDEN_CHANNELS = 128
 POLICY_INPUT_CHANNELS = 3
 TEMPORAL_RNN_LAYERS = 1
 KEYPOINT_HEATMAP_CHANNELS = 32
-LAST_ACTION_EMBEDDING_DROPOUT = 0.25
 DEFAULT_HORIZON_OFFSETS = (1, 2, 3, 5, 7, 10)
 
 
@@ -81,11 +80,6 @@ class ModelConfig:
     spatial_dropout: float = 0.10
     head_dropout: float = 0.20
     zoneout: float = 0.0
-    # Feed the previous action into the heads. Default True so legacy
-    # checkpoints (which have last_action_encoder weights) keep loading;
-    # TrainConfig overrides this to False for new runs because the copy
-    # shortcut it creates dominates the +1 head (causal confusion).
-    last_action_conditioning: bool = True
 
     button_state_threshold: float = 0.5
     button_state_thresholds: Optional[Sequence[float]] = None
@@ -121,7 +115,6 @@ class ModelConfig:
         self.spatial_dropout = _require_float_range("spatial_dropout", self.spatial_dropout, 0.0, 0.9)
         self.head_dropout = _require_float_range("head_dropout", self.head_dropout, 0.0, 0.9)
         self.zoneout = _require_float_range("zoneout", self.zoneout, 0.0, 0.9)
-        self.last_action_conditioning = bool(self.last_action_conditioning)
 
         if self.key_names is None:
             self.key_names = get_key_names(self.selected_game)
@@ -329,25 +322,9 @@ class DrivingVideoPolicy(nn.Module):
             nn.Dropout(cfg.head_dropout),
         )
 
-        if cfg.last_action_conditioning:
-            action_hidden = max(4, min(32, cfg.num_bin * 2, self.cfg.d_model // 4))
-            self.last_action_encoder = nn.Sequential(
-                nn.Linear(cfg.num_bin, action_hidden),
-                nn.ELU(inplace=True),
-                nn.Dropout(LAST_ACTION_EMBEDDING_DROPOUT),
-                nn.Linear(action_hidden, self.cfg.d_model),
-            )
-            final_action_layer = self.last_action_encoder[-1]
-            if isinstance(final_action_layer, nn.Linear):
-                nn.init.zeros_(final_action_layer.weight)
-                nn.init.zeros_(final_action_layer.bias)
-        else:
-            self.last_action_encoder = None
-
-        fusion_in = self.cfg.d_model * 2 if cfg.last_action_conditioning else self.cfg.d_model
         self.head_fusion = nn.Sequential(
-            nn.LayerNorm(fusion_in),
-            nn.Linear(fusion_in, self.cfg.d_model),
+            nn.LayerNorm(self.cfg.d_model),
+            nn.Linear(self.cfg.d_model, self.cfg.d_model),
             nn.ELU(inplace=True),
         )
 
@@ -450,39 +427,6 @@ class DrivingVideoPolicy(nn.Module):
             raise TypeError(f"frames must be a floating point or uint8 tensor, got {frames.dtype}.")
         return frames
 
-    def _last_action_features(
-        self,
-        prev_action: Optional[torch.Tensor],
-        batch_size: int,
-        time_steps: int,
-        *,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        if prev_action is None:
-            action_values = torch.zeros((batch_size, time_steps, self.cfg.num_bin), device=device, dtype=dtype)
-        else:
-            action_values = prev_action.to(device=device, dtype=dtype)
-            if action_values.dim() == 2:
-                if tuple(action_values.shape) != (batch_size, self.cfg.num_bin):
-                    raise ValueError(
-                        f"Expected prev_action shape {(batch_size, self.cfg.num_bin)} or "
-                        f"{(batch_size, time_steps, self.cfg.num_bin)}, got {tuple(action_values.shape)}."
-                    )
-                action_values = action_values.view(batch_size, 1, self.cfg.num_bin).expand(batch_size, time_steps, self.cfg.num_bin)
-            elif action_values.dim() == 3:
-                if tuple(action_values.shape) != (batch_size, time_steps, self.cfg.num_bin):
-                    raise ValueError(
-                        f"Expected prev_action shape {(batch_size, time_steps, self.cfg.num_bin)}, "
-                        f"got {tuple(action_values.shape)}."
-                    )
-            else:
-                raise ValueError(f"Expected prev_action with 2 or 3 dims, got {tuple(action_values.shape)}.")
-
-        action_values = action_values.reshape(batch_size * time_steps, self.cfg.num_bin)
-        features = self.last_action_encoder(action_values).reshape(batch_size, time_steps, self.cfg.d_model)
-        return features.to(dtype=dtype)
-
     def _apply_masks(self, frames: torch.Tensor) -> torch.Tensor:
         h, w = frames.shape[-2:]
         masked_frames = frames.clone()
@@ -508,7 +452,6 @@ class DrivingVideoPolicy(nn.Module):
         frames: torch.Tensor,
         state: Optional[TemporalState] = None,
         return_aux: bool = False,
-        prev_action: Optional[torch.Tensor] = None,
     ):
         if frames.dim() != 5:
             raise ValueError(f"Expected RGB frames with shape [B,T,3,H,W], got {tuple(frames.shape)}.")
@@ -544,13 +487,9 @@ class DrivingVideoPolicy(nn.Module):
             fused = temporal_feat + self.temporal_spatial_fusion(spatial_step)
             visual_steps.append(self._pool_features(fused))
 
-        # 3. Fuse pooled visual features with last-action context (when enabled)
+        # 3. Project the pooled visual features for the heads
         visual_feat = torch.stack(visual_steps, dim=1)
-        if self.last_action_encoder is not None:
-            action_feat = self._last_action_features(prev_action, b, t, device=frames.device, dtype=visual_feat.dtype)
-            fc_out = self.head_fusion(torch.cat([visual_feat, action_feat], dim=-1))
-        else:
-            fc_out = self.head_fusion(visual_feat)
+        fc_out = self.head_fusion(visual_feat)
 
         # 4. Action Mapping Prediction
         button = self._horizon_button_logits(fc_out)
@@ -568,7 +507,6 @@ class DrivingVideoPolicy(nn.Module):
         self,
         frame: torch.Tensor,
         state: TemporalState,
-        prev_action: Optional[torch.Tensor] = None,
     ):
         if frame.dim() != 4 or frame.size(1) != 3:
             raise ValueError(f"Expected RGB frame with shape [B,3,H,W], got {tuple(frame.shape)}.")
@@ -598,16 +536,9 @@ class DrivingVideoPolicy(nn.Module):
         temporal_feat, new_hidden = self._temporal_step(spatial_feat, h_t)
         fused = temporal_feat + self.temporal_spatial_fusion(spatial_feat)
 
-        # 4. Pool the fused features and add last-action context (when enabled)
+        # 4. Pool the fused features and project for the heads
         visual_feat = self._pool_features(fused)
-        if self.last_action_encoder is not None:
-            action_feat = self._last_action_features(prev_action, b, 1, device=frame.device, dtype=visual_feat.dtype).reshape(
-                b,
-                self.cfg.d_model,
-            )
-            fc_out = self.head_fusion(torch.cat([visual_feat, action_feat], dim=-1))
-        else:
-            fc_out = self.head_fusion(visual_feat)
+        fc_out = self.head_fusion(visual_feat)
 
         # 5. Project to action space values
         button = self._horizon_button_logits(fc_out)

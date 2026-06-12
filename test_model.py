@@ -252,7 +252,6 @@ def infer_video(
     }
 
     state = TemporalState()
-    prev_action = torch.zeros((1, cfg.num_bin), device=device, dtype=inference_dtype)
     h_idx = max(0, min(int(command_horizon) - 1, int(cfg.prediction_horizon) - 1))
     horizon_offsets = tuple(int(offset) for offset in cfg.prediction_horizon_offsets)
     target_offset = horizon_offsets[h_idx] + int(action_label_offset)
@@ -279,13 +278,11 @@ def infer_video(
                     output, state = model.forward_step(
                         frame,
                         state,
-                        prev_action=prev_action,
                     )
                     button_logits = output.horizon_button_logits[:, h_idx]
                     predicted_action = (torch.sigmoid(button_logits.float()) >= threshold_tensor.view(1, -1)).to(
                         dtype=inference_dtype
                     )
-                    prev_action = predicted_action.detach().to(dtype=inference_dtype)
 
             target_idx = source_idx + target_offset
             if 0 <= target_idx < total_frames:

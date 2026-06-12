@@ -130,12 +130,6 @@ class TrainConfig(ModelConfig):
     streaming_segment_min_chunks: int = 2
     streaming_segment_max_chunks: int = 20
     action_label_offset: int = 0
-    # New runs train WITHOUT last-action input: with it, the +1 head collapses
-    # into copying prev_action (causal confusion) and never learns transitions.
-    last_action_conditioning: bool = False
-    last_action_sequence_dropout: float = 0.2
-    last_action_key_dropout: float = 0.4
-    last_action_corruption_prob: float = 0.05
     skipped_key_names: Optional[Sequence[str]] = ("e", "q", "c", "z")
     button_label_smoothing: float = 0.05
     # Extra BCE weight on frames where a key changes state. Transitions are
@@ -276,24 +270,6 @@ class TrainConfig(ModelConfig):
             )
         self.grad_clip = _require_float_at_least("grad_clip", self.grad_clip, 0.0)
         self.action_label_offset = _require_int("action_label_offset", self.action_label_offset)
-        self.last_action_sequence_dropout = _require_float_range(
-            "last_action_sequence_dropout",
-            self.last_action_sequence_dropout,
-            0.0,
-            1.0,
-        )
-        self.last_action_key_dropout = _require_float_range(
-            "last_action_key_dropout",
-            self.last_action_key_dropout,
-            0.0,
-            1.0,
-        )
-        self.last_action_corruption_prob = _require_float_range(
-            "last_action_corruption_prob",
-            self.last_action_corruption_prob,
-            0.0,
-            1.0,
-        )
         self.button_label_smoothing = _require_float_range("button_label_smoothing", self.button_label_smoothing, 0.0, 0.2)
         self.aug_brightness = _require_float_range("aug_brightness", self.aug_brightness, 0.0, 0.5)
         self.aug_contrast = _require_float_range("aug_contrast", self.aug_contrast, 0.0, 0.5)
@@ -366,7 +342,6 @@ class TrainConfig(ModelConfig):
 class WindowTargets:
     button_horizon: torch.Tensor
     horizon_valid: torch.Tensor
-    last_action: torch.Tensor
     meta: Optional[List[Tuple[str, int, int]]] = None
 
 
@@ -611,7 +586,6 @@ def build_window_targets(
     stride = _require_int_at_least("stride", stride, 1)
     button_windows: List[np.ndarray] = []
     valid_windows: List[np.ndarray] = []
-    last_action_windows: List[np.ndarray] = []
     meta: List[Tuple[str, int, int]] = []
 
     horizon_offsets = tuple(int(offset) for offset in cfg.prediction_horizon_offsets)
@@ -627,13 +601,8 @@ def build_window_targets(
             end = start + cfg.seq_len
             button_target = np.zeros((cfg.seq_len, horizon, cfg.num_bin), dtype=np.float32)
             valid_target = np.zeros((cfg.seq_len, horizon), dtype=np.float32)
-            last_action = np.zeros((cfg.seq_len, cfg.num_bin), dtype=np.float32)
 
             frame_indices = np.arange(start, end)
-            context_indices = frame_indices + int(cfg.action_label_offset)
-            context_valid = (context_indices >= 0) & (context_indices < buttons.shape[0])
-            if np.any(context_valid):
-                last_action[context_valid] = buttons[context_indices[context_valid]]
             for horizon_idx, horizon_offset in enumerate(horizon_offsets):
                 target_indices = frame_indices + horizon_offset + int(cfg.action_label_offset)
                 prev_indices = target_indices - 1
@@ -645,7 +614,6 @@ def build_window_targets(
 
             button_windows.append(button_target)
             valid_windows.append(valid_target)
-            last_action_windows.append(last_action)
             if return_meta:
                 meta.append((video_path, start, end))
 
@@ -658,7 +626,6 @@ def build_window_targets(
     return WindowTargets(
         button_horizon=stack(button_windows),
         horizon_valid=stack(valid_windows),
-        last_action=stack(last_action_windows),
         meta=meta if return_meta else None,
     )
 
@@ -970,7 +937,6 @@ def move_bundle_to_device(bundle: WindowTargets, device: torch.device) -> Window
     return WindowTargets(
         button_horizon=bundle.button_horizon.to(device, non_blocking=True),
         horizon_valid=bundle.horizon_valid.to(device, non_blocking=True),
-        last_action=bundle.last_action.to(device, non_blocking=True),
         meta=bundle.meta,
     )
 
@@ -1053,37 +1019,6 @@ def compute_losses(
         "button": button_loss.detach(),
         "conflict": conflict_loss.detach(),
     }
-
-
-def regularize_last_action_context(last_action: torch.Tensor, cfg: TrainConfig) -> torch.Tensor:
-    prev_action = last_action.float()
-    if prev_action.dim() != 3:
-        raise ValueError(f"Expected last_action [B,T,C], got {tuple(prev_action.shape)}.")
-
-    batch_size = int(prev_action.size(0))
-    if batch_size > 1 and float(cfg.last_action_corruption_prob) > 0.0:
-        replace = (
-            torch.rand((batch_size, 1, 1), device=prev_action.device)
-            < float(cfg.last_action_corruption_prob)
-        )
-        permuted = prev_action[torch.randperm(batch_size, device=prev_action.device)]
-        prev_action = torch.where(replace, permuted, prev_action)
-
-    if float(cfg.last_action_sequence_dropout) > 0.0:
-        keep_sequence = (
-            torch.rand((batch_size, 1, 1), device=prev_action.device)
-            >= float(cfg.last_action_sequence_dropout)
-        ).to(dtype=prev_action.dtype)
-        prev_action = prev_action * keep_sequence
-
-    if float(cfg.last_action_key_dropout) > 0.0:
-        keep_key = (
-            torch.rand((batch_size, 1, int(prev_action.size(-1))), device=prev_action.device)
-            >= float(cfg.last_action_key_dropout)
-        ).to(dtype=prev_action.dtype)
-        prev_action = prev_action * keep_key
-
-    return prev_action
 
 
 @torch.no_grad()
@@ -1247,7 +1182,6 @@ def load_batch(iterator, targets: WindowTargets, device: torch.device, cfg: Trai
     target = WindowTargets(
         button_horizon=targets.button_horizon[labels],
         horizon_valid=targets.horizon_valid[labels],
-        last_action=targets.last_action[labels],
         meta=None,
     )
     return frames, target, labels
@@ -1364,11 +1298,6 @@ def run_epoch(
             frames = augment_frames(frames, cfg)
         with torch.set_grad_enabled(is_train):
             with torch.amp.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_autocast):
-                prev_action = (
-                    regularize_last_action_context(batch_targets.last_action, cfg)
-                    if is_train
-                    else batch_targets.last_action
-                )
                 if use_streaming_state:
                     initial_state, carried, total = _streaming_initial_state(
                         labels,
@@ -1382,11 +1311,10 @@ def run_epoch(
                         frames,
                         state=initial_state,
                         return_aux=True,
-                        prev_action=prev_action,
                     )
                     _update_streaming_cache(labels, targets, next_state, streaming_cache, cfg)
                 else:
-                    output = model(frames, prev_action=prev_action)
+                    output = model(frames)
                 loss, details = compute_losses(
                     output,
                     batch_targets,
@@ -1598,12 +1526,7 @@ def parse_args() -> TrainConfig:
     add("--streaming-segment-min-chunks", type=int, default=None)
     add("--streaming-segment-max-chunks", type=int, default=None)
     add("--action-label-offset", type=int, default=None)
-    add("--last-action-conditioning", dest="last_action_conditioning", action="store_true", default=None)
-    add("--no-last-action-conditioning", dest="last_action_conditioning", action="store_false")
     add("--transition-loss-weight", type=float, default=None, help="Extra BCE weight on key state changes; 1 disables.")
-    add("--last-action-sequence-dropout", type=float, default=None)
-    add("--last-action-key-dropout", type=float, default=None)
-    add("--last-action-corruption-prob", type=float, default=None)
     add("--skip-key-names", default=None, help="Comma-separated key names to exclude from training labels.")
     add("--train-all-keys", action="store_true", help="Disable the default Greenville test filter for e,q,c,z.")
     add("--button-label-smoothing", type=float, default=None)
@@ -1695,11 +1618,7 @@ def parse_args() -> TrainConfig:
         "streaming_segment_min_chunks",
         "streaming_segment_max_chunks",
         "action_label_offset",
-        "last_action_conditioning",
         "transition_loss_weight",
-        "last_action_sequence_dropout",
-        "last_action_key_dropout",
-        "last_action_corruption_prob",
         "button_label_smoothing",
         "aug_brightness",
         "aug_contrast",
@@ -1813,13 +1732,7 @@ def train() -> None:
         f"train_stride={int(cfg.train_seq_stride)}",
         f"seq_len={int(cfg.seq_len)}",
     )
-    print(
-        "Last action conditioning:",
-        f"enabled={bool(cfg.last_action_conditioning)}",
-        f"seq_drop={cfg.last_action_sequence_dropout:.2f}",
-        f"key_drop={cfg.last_action_key_dropout:.2f}",
-        f"corrupt={cfg.last_action_corruption_prob:.2f}",
-    )
+    print("Model inputs: vision only (no last-action conditioning).")
     train_persist = persistence_baseline_metrics(train_targets, cfg)
     print(f"Persistence baseline: train_f1@+{first_horizon_offset}={train_persist['macro_f1']:.4f}")
     if val_targets is not None:
@@ -1901,11 +1814,6 @@ def train() -> None:
     if cfg.eval_only:
         eval_ckpt_path = cfg.eval_ckpt or os.path.join(cfg.ckpt_dir, "model_best.pt")
         eval_state = torch.load(eval_ckpt_path, map_location=device)
-        ckpt_config = eval_state.get("config") if isinstance(eval_state, dict) else None
-        if isinstance(ckpt_config, dict):
-            # architecture-affecting flag must match the checkpoint under eval
-            # (legacy checkpoints predate the flag and were trained with it on)
-            cfg.last_action_conditioning = bool(ckpt_config.get("last_action_conditioning", True))
 
     base_model: torch.nn.Module = DrivingVideoPolicy(cfg).to(device)
     base_model = base_model.to(memory_format=torch.channels_last)
@@ -1916,8 +1824,7 @@ def train() -> None:
         base_model.load_state_dict(eval_state["model_state"])
         print(
             f"Eval-only: loaded {eval_ckpt} (epoch={eval_state.get('epoch')}"
-            f" best_score={eval_state.get('best_score')}"
-            f" last_action_conditioning={bool(cfg.last_action_conditioning)})"
+            f" best_score={eval_state.get('best_score')})"
         )
         start_epoch, global_step, best_score, resumed_ema_state = 0, 0, float("-inf"), None
         ema = None

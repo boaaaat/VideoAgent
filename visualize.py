@@ -514,13 +514,6 @@ def _action_index(cfg: ModelConfig, action_name: str) -> Optional[int]:
     return None
 
 
-def _button_thresholds(cfg: ModelConfig, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    thresholds = getattr(cfg, "button_state_thresholds", None)
-    if thresholds is None or len(tuple(thresholds)) != int(cfg.num_bin):
-        thresholds = tuple(float(cfg.button_state_threshold) for _ in range(int(cfg.num_bin)))
-    return torch.tensor(tuple(float(value) for value in thresholds), device=device, dtype=dtype)
-
-
 def _button_threshold_value(cfg: ModelConfig, action_idx: Optional[int]) -> float:
     if action_idx is None:
         return float(getattr(cfg, "button_state_threshold", 0.5))
@@ -609,7 +602,6 @@ def _policy_visuals_for_frame(
     device: torch.device,
     *,
     state: Optional[TemporalState],
-    prev_action: Optional[torch.Tensor],
     layer: FeatureLayer,
     resize_to: Optional[int],
     robust_norm: bool,
@@ -619,7 +611,7 @@ def _policy_visuals_for_frame(
     amp_dtype: torch.dtype,
     use_autocast: bool,
     need_trajectory: bool,
-) -> Tuple[np.ndarray, torch.Tensor, Optional[TemporalState], Optional[np.ndarray], Optional[torch.Tensor]]:
+) -> Tuple[np.ndarray, torch.Tensor, Optional[TemporalState], Optional[np.ndarray]]:
     orig_h, orig_w = frame_bgr.shape[:2]
     proc = frame_bgr
     if resize_to is not None and (orig_h != resize_to or orig_w != resize_to):
@@ -631,7 +623,6 @@ def _policy_visuals_for_frame(
         x = x.contiguous(memory_format=torch.channels_last)
 
     trajectory_probs: Optional[np.ndarray] = None
-    next_action: Optional[torch.Tensor] = prev_action
 
     with torch.inference_mode():
         with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_autocast and x.is_cuda):
@@ -685,27 +676,10 @@ def _policy_visuals_for_frame(
 
                 if bool(need_trajectory):
                     fused = temporal_feat + model.temporal_spatial_fusion(spatial_feat)
-                    pooled = model.pool(fused)
-                    visual_feat = model.fc_features(pooled.reshape(b, -1))
-                    if prev_action is None:
-                        prev_for_head = torch.zeros((b, int(cfg.num_bin)), device=visual_feat.device, dtype=visual_feat.dtype)
-                    else:
-                        prev_for_head = prev_action.to(device=visual_feat.device, dtype=visual_feat.dtype)
-                    action_feat = model._last_action_features(
-                        prev_for_head,
-                        b,
-                        1,
-                        device=visual_feat.device,
-                        dtype=visual_feat.dtype,
-                    ).reshape(b, cfg.d_model)
-                    fc_out = model.head_fusion(torch.cat([visual_feat, action_feat], dim=-1))
+                    visual_feat = model._pool_features(fused)
+                    fc_out = model.head_fusion(visual_feat)
                     logits = model._horizon_button_logits(fc_out)[0].detach().float()
                     trajectory_probs = torch.sigmoid(logits).detach().cpu().numpy().astype(np.float32)
-                    command_idx = min(int(cfg.prediction_horizon) - 1, 9)
-                    thresholds = _button_thresholds(cfg, device=logits.device, dtype=logits.dtype)
-                    next_action = (
-                        torch.sigmoid(logits[command_idx]) >= thresholds
-                    ).to(dtype=visual_feat.dtype).reshape(1, int(cfg.num_bin)).detach()
 
             if feat is None:
                 raise RuntimeError(f"Policy layer {layer!r} did not produce a feature map.")
@@ -719,7 +693,7 @@ def _policy_visuals_for_frame(
         q_high=q_high,
         gamma=gamma,
     )
-    return heat_color, frame_rgb.detach(), state, trajectory_probs, next_action
+    return heat_color, frame_rgb.detach(), state, trajectory_probs
 
 
 def _trajectory_points(
@@ -1014,7 +988,6 @@ def process_video_cnn(
     frame_idx = 0
     previous_frame_rgb: Optional[torch.Tensor] = None
     policy_state: Optional[TemporalState] = None
-    trajectory_prev_action: Optional[torch.Tensor] = None
     trajectory_cfg = model.cfg if isinstance(model, DrivingVideoPolicy) else None
     trajectory_enabled = (
         bool(draw_trajectory)
@@ -1043,14 +1016,13 @@ def process_video_cnn(
             trajectory_probs: Optional[np.ndarray] = None
             real_trajectory_probs: Optional[np.ndarray] = None
             if isinstance(model, DrivingVideoPolicy) and trajectory_cfg is not None:
-                heat_color, previous_frame_rgb, policy_state, trajectory_probs, trajectory_prev_action = (
+                heat_color, previous_frame_rgb, policy_state, trajectory_probs = (
                     _policy_visuals_for_frame(
                         frame,
                         model,
                         trajectory_cfg,
                         device,
                         state=policy_state,
-                        prev_action=trajectory_prev_action,
                         layer=layer,
                         resize_to=resize_to,
                         robust_norm=robust_norm,
