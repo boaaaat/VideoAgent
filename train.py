@@ -4,6 +4,7 @@ import glob
 import math
 import os
 import random
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -96,9 +97,9 @@ def _require_float_range(name: str, value: object, minimum: float, maximum: floa
 @dataclass
 class TrainConfig(ModelConfig):
     batch_size: int = 1
-    target_effective_batch: int = 16
+    target_effective_batch: int = 8
     grad_accum: int = field(init=False)
-    num_epochs: int = 20
+    num_epochs: int = 25
 
     lr: float = 2e-4
     min_lr: float = 1e-5
@@ -112,11 +113,15 @@ class TrainConfig(ModelConfig):
 
     train_split: float = 0.8
     split_seed: int = 1337
-    pos_weight_power: float = 0.8
+    pos_weight_power: float = 0.65
     pos_weight_clamp: float = 25
-    button_threshold_from_pos_weight: bool = False
+    ema_decay: float = 0.999
+    button_threshold_from_pos_weight: bool = True
     button_threshold_min: float = 0.2
     button_threshold_max: float = 0.9
+    fit_thresholds_from_val: bool = True
+    eval_only: bool = False
+    eval_ckpt: Optional[str] = None
 
     button_loss_weight: float = 1.0
     conflicting_button_loss_weight: float = 0.03
@@ -125,25 +130,31 @@ class TrainConfig(ModelConfig):
     streaming_segment_min_chunks: int = 2
     streaming_segment_max_chunks: int = 20
     action_label_offset: int = 0
+    # New runs train WITHOUT last-action input: with it, the +1 head collapses
+    # into copying prev_action (causal confusion) and never learns transitions.
+    last_action_conditioning: bool = False
     last_action_sequence_dropout: float = 0.2
     last_action_key_dropout: float = 0.4
     last_action_corruption_prob: float = 0.05
     skipped_key_names: Optional[Sequence[str]] = ("e", "q", "c", "z")
-    button_label_smoothing: float = 0.02
+    button_label_smoothing: float = 0.05
+    # Extra BCE weight on frames where a key changes state. Transitions are
+    # ~5% of labels but are all that matters for control.
+    transition_loss_weight: float = 4.0
 
-    aug_brightness: float = 0.1
-    aug_contrast: float = 0.15
-    aug_noise_std: float = 0.006
-    aug_gray_prob: float = 0.03
-    aug_translate_frac: float = 0.0
-    aug_scale_frac: float = 0.0
-    aug_edges_crop_prob: float = 0.0
-    aug_edges_crop_min_frac: float = 0.0
-    aug_edges_crop_max_frac: float = 0.0
-    aug_cutout_prob: float = 0.0
+    aug_brightness: float = 0.15
+    aug_contrast: float = 0.20
+    aug_noise_std: float = 0.01
+    aug_gray_prob: float = 0.05
+    aug_translate_frac: float = 0.02
+    aug_scale_frac: float = 0.03
+    aug_edges_crop_prob: float = 0.25
+    aug_edges_crop_min_frac: float = 0.02
+    aug_edges_crop_max_frac: float = 0.06
+    aug_cutout_prob: float = 0.5
     aug_cutout_min_frac: float = 0.04
-    aug_cutout_max_frac: float = 0.10
-    aug_cutout_count: int = 1
+    aug_cutout_max_frac: float = 0.12
+    aug_cutout_count: int = 2
 
     early_stop_patience: int = 0
 
@@ -223,10 +234,16 @@ class TrainConfig(ModelConfig):
         self.dali_shuffle_seed = _require_int("dali_shuffle_seed", self.dali_shuffle_seed)
         self.pos_weight_power = _require_float_at_least("pos_weight_power", self.pos_weight_power, 0.0)
         self.pos_weight_clamp = _require_float_at_least("pos_weight_clamp", self.pos_weight_clamp, 1.0)
+        self.ema_decay = _require_float_range("ema_decay", self.ema_decay, 0.0, 0.99999)
         self.button_threshold_from_pos_weight = _require_bool(
             "button_threshold_from_pos_weight",
             self.button_threshold_from_pos_weight,
         )
+        self.fit_thresholds_from_val = _require_bool("fit_thresholds_from_val", self.fit_thresholds_from_val)
+        self.eval_only = _require_bool("eval_only", self.eval_only)
+        if self.eval_ckpt is not None:
+            self.eval_ckpt = str(self.eval_ckpt)
+        self.transition_loss_weight = max(1.0, float(self.transition_loss_weight))
         self.button_threshold_min = _require_float_range("button_threshold_min", self.button_threshold_min, 0.0, 1.0)
         self.button_threshold_max = _require_float_range("button_threshold_max", self.button_threshold_max, 0.0, 1.0)
         if self.button_threshold_max < self.button_threshold_min:
@@ -420,6 +437,108 @@ class BinaryStats:
             "fp": self.fp,
             "fn": self.fn,
         }
+
+
+@dataclass
+class ThresholdFitter:
+    """Per-key histograms of predicted probabilities on validation data,
+    used to pick the F1-optimal decision threshold for each key."""
+
+    num_classes: int
+    device: torch.device
+    bins: int = 512
+
+    def __post_init__(self) -> None:
+        self.pos = torch.zeros(self.num_classes, self.bins, dtype=torch.float64, device=self.device)
+        self.neg = torch.zeros(self.num_classes, self.bins, dtype=torch.float64, device=self.device)
+
+    @torch.no_grad()
+    def update(self, probs: torch.Tensor, true: torch.Tensor, valid: torch.Tensor) -> None:
+        if probs.shape != true.shape:
+            raise ValueError(f"probs shape {tuple(probs.shape)} must match true shape {tuple(true.shape)}.")
+        idx = (probs.float().clamp(0.0, 1.0) * (self.bins - 1)).long()
+        class_offset = torch.arange(self.num_classes, device=idx.device).view(*([1] * (idx.dim() - 1)), -1)
+        flat = idx + class_offset * self.bins
+        sel = valid.unsqueeze(-1).expand_as(true)
+        flat = flat[sel]
+        is_pos = true[sel]
+        if flat.numel() == 0:
+            return
+        size = self.num_classes * self.bins
+        self.pos += torch.bincount(flat[is_pos], minlength=size).reshape(self.num_classes, self.bins).to(self.pos.dtype)
+        self.neg += torch.bincount(flat[~is_pos], minlength=size).reshape(self.num_classes, self.bins).to(self.neg.dtype)
+
+    def fit(self, min_threshold: float, max_threshold: float) -> Tuple[List[Optional[float]], List[float]]:
+        """Return (per-key F1-optimal threshold or None when unsupported, per-key F1 at it).
+
+        A sample is predicted positive when prob >= threshold; bin i collects
+        probs in [i/(bins-1), (i+1)/(bins-1)), so the count of bins >= i equals
+        the positives at threshold i/(bins-1).
+        """
+        tp = self.pos.flip(-1).cumsum(-1).flip(-1)
+        fp = self.neg.flip(-1).cumsum(-1).flip(-1)
+        fn = self.pos.sum(dim=-1, keepdim=True) - tp
+        f1 = (2.0 * tp) / (2.0 * tp + fp + fn).clamp(min=1e-9)
+        best_idx = f1.argmax(dim=-1)
+        best_f1 = f1.gather(-1, best_idx.unsqueeze(-1)).squeeze(-1)
+        support = self.pos.sum(dim=-1)
+        thresholds = (best_idx.to(torch.float64) / float(self.bins - 1)).clamp(
+            min=float(min_threshold), max=float(max_threshold)
+        )
+        fitted = [
+            float(threshold) if float(count) > 0.0 else None
+            for threshold, count in zip(thresholds.tolist(), support.tolist())
+        ]
+        return fitted, [float(x) for x in best_f1.tolist()]
+
+
+class ModelEMA:
+    """Exponential moving average of model weights.
+
+    Validation and the best checkpoint use the averaged weights, which are
+    less noisy and generalize better than the raw weights on small datasets.
+    """
+
+    def __init__(self, model: torch.nn.Module, decay: float = 0.999):
+        self.decay = float(decay)
+        self._model = model
+        self.shadow = {
+            key: value.detach().clone().float()
+            for key, value in model.state_dict().items()
+            if value.dtype.is_floating_point
+        }
+
+    @torch.no_grad()
+    def update(self) -> None:
+        for key, value in self._model.state_dict().items():
+            shadow = self.shadow.get(key)
+            if shadow is not None:
+                shadow.lerp_(value.detach().float(), 1.0 - self.decay)
+
+    def state_dict(self) -> Dict[str, torch.Tensor]:
+        return {key: value.clone() for key, value in self.shadow.items()}
+
+    @torch.no_grad()
+    def load_state_dict(self, state: Dict[str, torch.Tensor]) -> None:
+        for key, value in state.items():
+            if key in self.shadow:
+                self.shadow[key].copy_(value.float())
+
+    @contextmanager
+    def swap(self):
+        """Temporarily load the averaged weights into the live model."""
+        live = self._model.state_dict()
+        backup = {key: live[key].detach().clone() for key in self.shadow}
+        with torch.no_grad():
+            for key, value in self.shadow.items():
+                live[key].copy_(value.to(dtype=live[key].dtype))
+        try:
+            yield
+        finally:
+            live_after = self._model.state_dict()
+            with torch.no_grad():
+                for key, value in backup.items():
+                    live_after[key].copy_(value)
 
 
 def find_runs(data_root: str, video_ext: str, csv_ext: str) -> List[Tuple[str, str]]:
@@ -700,6 +819,9 @@ def video_pipeline(
         reader_kwargs["file_list"] = file_list
         if use_reader_resize:
             reader_kwargs["file_list_frame_num"] = True
+            # Pin the current default so a future DALI upgrade cannot silently
+            # shift every window's frames by one.
+            reader_kwargs["file_list_include_preceding_frame"] = False
         else:
             reader_kwargs.update(
                 {
@@ -797,15 +919,22 @@ def second_half_only(valid: torch.Tensor) -> torch.Tensor:
 
 
 def decision_thresholds_from_pos_weight(pos_weight: torch.Tensor, cfg: TrainConfig) -> torch.Tensor:
-    """Undo the logit prior introduced by weighted BCE, softened by an alpha parameter."""
+    """Undo the probability overshoot introduced by weighted BCE.
+
+    Training with pos_weight rho drives the optimal output to
+    p = rho*q / (rho*q + 1 - q) for true conditional q, so deciding q > 0.5
+    requires thresholding p at rho/(rho+1), not 0.5. alpha < 1 softens the
+    correction back toward 0.5 (trading precision for recall on rare keys).
+    These act as priors for epoch 1; val-fitted thresholds replace them.
+    """
     if not bool(cfg.button_threshold_from_pos_weight):
         return torch.full_like(pos_weight.float(), float(cfg.button_state_threshold))
-    
-    alpha = 0.2 
+
+    alpha = 0.35
     effective_weight = 1.0 + (pos_weight.float() - 1.0) * alpha
-    
-    thresholds = 1.0 / (effective_weight + 1.0)
-    
+
+    thresholds = effective_weight / (effective_weight + 1.0)
+
     return thresholds.clamp(min=float(cfg.button_threshold_min), max=float(cfg.button_threshold_max))
 
 
@@ -905,7 +1034,18 @@ def compute_losses(
             dtype=button_logits.dtype,
         ).view(1, 1, horizon_count, 1)
         loss_weight = loss_weight * horizon_weight
-    button_loss = (button_loss_raw * loss_weight).sum() / (loss_weight.sum() * cfg.num_bin).clamp(min=1.0)
+    if float(cfg.transition_loss_weight) > 1.0:
+        # Per-key upweight where the label flips vs the previous frame; the
+        # weighted mean keeps the loss scale stable as the weight changes.
+        raw_labels = targets.button_horizon > 0.5
+        transition = torch.zeros_like(raw_labels)
+        transition[:, 1:] = raw_labels[:, 1:] != raw_labels[:, :-1]
+        button_weight = loss_weight * (
+            1.0 + (float(cfg.transition_loss_weight) - 1.0) * transition.float()
+        )
+        button_loss = (button_loss_raw * button_weight).sum() / button_weight.sum().clamp(min=1.0)
+    else:
+        button_loss = (button_loss_raw * loss_weight).sum() / (loss_weight.sum() * cfg.num_bin).clamp(min=1.0)
     conflict_loss = conflicting_button_loss(button_logits, loss_weight, cfg)
 
     total = cfg.button_loss_weight * button_loss + cfg.conflicting_button_loss_weight * conflict_loss
@@ -1191,6 +1331,7 @@ def run_epoch(
     total_steps: int = 1,
     global_step: int = 0,
     streaming_reset_indices: Optional[set[int]] = None,
+    ema: Optional[ModelEMA] = None,
 ) -> Tuple[Dict[str, float], int]:
     is_train = optimizer is not None
     model.train(is_train)
@@ -1201,6 +1342,12 @@ def run_epoch(
     detail_sums = {name: torch.zeros((), device=device) for name in ("button", "conflict")}
     step1_stats = BinaryStats(cfg.num_bin, device)
     final_stats = BinaryStats(cfg.num_bin, device)
+    threshold_fitter = (
+        ThresholdFitter(cfg.num_bin, device)
+        if (not is_train and bool(getattr(cfg, "fit_thresholds_from_val", False)))
+        else None
+    )
+    threshold_fitter_step1 = ThresholdFitter(cfg.num_bin, device) if threshold_fitter is not None else None
     steps = 0
     streaming_cache: StreamingStateCache = {}
     use_streaming_state = bool(
@@ -1265,6 +1412,8 @@ def run_epoch(
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
                     global_step += 1
+                    if ema is not None:
+                        ema.update()
 
         update_metrics(
             output,
@@ -1273,6 +1422,19 @@ def run_epoch(
             step1_stats,
             final_stats,
         )
+        if threshold_fitter is not None:
+            final_idx = int(cfg.prediction_horizon) - 1
+            horizon_valid = second_half_only(batch_targets.horizon_valid)
+            threshold_fitter.update(
+                torch.sigmoid(output.horizon_button_logits[:, :, final_idx].float()),
+                batch_targets.button_horizon[:, :, final_idx] > 0.5,
+                horizon_valid[:, :, final_idx] > 0.5,
+            )
+            threshold_fitter_step1.update(
+                torch.sigmoid(output.horizon_button_logits[:, :, 0].float()),
+                batch_targets.button_horizon[:, :, 0] > 0.5,
+                horizon_valid[:, :, 0] > 0.5,
+            )
         loss_sum += loss.detach().float()
         for name, value in details.items():
             detail_sums[name] += value.float()
@@ -1307,6 +1469,15 @@ def run_epoch(
     }
     if use_streaming_state:
         metrics["stream_state_carry_rate"] = float(stream_carried / max(1, stream_total))
+    if threshold_fitter is not None:
+        fitted_thresholds, fitted_f1 = threshold_fitter.fit(cfg.button_threshold_min, cfg.button_threshold_max)
+        metrics["fitted_button_thresholds"] = fitted_thresholds
+        metrics["fitted_button_f1"] = fitted_f1
+        fitted_thresholds_step1, fitted_f1_step1 = threshold_fitter_step1.fit(
+            cfg.button_threshold_min, cfg.button_threshold_max
+        )
+        metrics["fitted_button_thresholds_step1"] = fitted_thresholds_step1
+        metrics["fitted_button_f1_step1"] = fitted_f1_step1
     return metrics, global_step
 
 
@@ -1326,18 +1497,19 @@ def save_checkpoint(
     epoch: int,
     global_step: int,
     best_score: float,
+    ema: Optional[ModelEMA] = None,
 ) -> None:
-    torch.save(
-        {
-            "model_state": model.state_dict(),
-            "optimizer_state": optimizer.state_dict(),
-            "config": asdict(cfg),
-            "epoch": int(epoch),
-            "global_step": int(global_step),
-            "best_score": float(best_score),
-        },
-        path,
-    )
+    payload = {
+        "model_state": model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "config": asdict(cfg),
+        "epoch": int(epoch),
+        "global_step": int(global_step),
+        "best_score": float(best_score),
+    }
+    if ema is not None:
+        payload["ema_state"] = ema.state_dict()
+    torch.save(payload, path)
 
 
 def maybe_resume(
@@ -1345,15 +1517,15 @@ def maybe_resume(
     optimizer: torch.optim.Optimizer,
     cfg: TrainConfig,
     device: torch.device,
-) -> Tuple[int, int, float]:
+) -> Tuple[int, int, float, Optional[Dict[str, torch.Tensor]]]:
     if not cfg.resume:
-        return 0, 0, -1e9
+        return 0, 0, -1e9, None
     if cfg.resume_path is not None:
         ckpt_path = cfg.resume_path
     else:
         ckpt_path = latest_checkpoint(cfg.ckpt_dir)
     if not ckpt_path:
-        return 0, 0, -1e9
+        return 0, 0, -1e9, None
     print(f"Resuming from {ckpt_path}")
     state = torch.load(ckpt_path, map_location=device)
     if not isinstance(state, dict):
@@ -1378,7 +1550,7 @@ def maybe_resume(
             "the current optimizer/model parameters. Start a fresh run with --no-resume "
             "or choose a compatible --resume-path."
         ) from exc
-    return int(state["epoch"]), int(state["global_step"]), float(state["best_score"])
+    return int(state["epoch"]), int(state["global_step"]), float(state["best_score"]), state.get("ema_state")
 
 
 def parse_args() -> TrainConfig:
@@ -1409,10 +1581,15 @@ def parse_args() -> TrainConfig:
     add("--train-split", type=float, default=None)
     add("--pos-weight-power", type=float, default=None)
     add("--pos-weight-clamp", type=float, default=None)
+    add("--ema-decay", type=float, default=None, help="EMA decay for eval/best weights; 0 disables.")
     add("--button-threshold-from-pos-weight", dest="button_threshold_from_pos_weight", action="store_true", default=None)
     add("--flat-button-threshold", dest="button_threshold_from_pos_weight", action="store_false", default=None)
     add("--button-threshold-min", type=float, default=None)
     add("--button-threshold-max", type=float, default=None)
+    add("--fit-thresholds-from-val", dest="fit_thresholds_from_val", action="store_true", default=None)
+    add("--no-fit-thresholds-from-val", dest="fit_thresholds_from_val", action="store_false")
+    add("--eval-only", dest="eval_only", action="store_true", default=None, help="Run a single validation pass on a checkpoint and exit (no training).")
+    add("--eval-ckpt", default=None, help="Checkpoint for --eval-only. Defaults to <ckpt-dir>/model_best.pt.")
     add("--conflicting-button-loss-weight", type=float, default=None)
     add("--streaming-state-training", dest="streaming_state_training", action="store_true", default=None)
     add("--no-streaming-state-training", dest="streaming_state_training", action="store_false")
@@ -1421,6 +1598,9 @@ def parse_args() -> TrainConfig:
     add("--streaming-segment-min-chunks", type=int, default=None)
     add("--streaming-segment-max-chunks", type=int, default=None)
     add("--action-label-offset", type=int, default=None)
+    add("--last-action-conditioning", dest="last_action_conditioning", action="store_true", default=None)
+    add("--no-last-action-conditioning", dest="last_action_conditioning", action="store_false")
+    add("--transition-loss-weight", type=float, default=None, help="Extra BCE weight on key state changes; 1 disables.")
     add("--last-action-sequence-dropout", type=float, default=None)
     add("--last-action-key-dropout", type=float, default=None)
     add("--last-action-corruption-prob", type=float, default=None)
@@ -1502,15 +1682,21 @@ def parse_args() -> TrainConfig:
         "train_split",
         "pos_weight_power",
         "pos_weight_clamp",
+        "ema_decay",
         "button_threshold_from_pos_weight",
         "button_threshold_min",
         "button_threshold_max",
+        "fit_thresholds_from_val",
+        "eval_only",
+        "eval_ckpt",
         "conflicting_button_loss_weight",
         "streaming_state_training",
         "streaming_state_validation",
         "streaming_segment_min_chunks",
         "streaming_segment_max_chunks",
         "action_label_offset",
+        "last_action_conditioning",
+        "transition_loss_weight",
         "last_action_sequence_dropout",
         "last_action_key_dropout",
         "last_action_corruption_prob",
@@ -1616,6 +1802,7 @@ def train() -> None:
         "Loss supervision:",
         f"frames={supervised_start}-{supervised_end}",
         f"conflict_weight={float(cfg.conflicting_button_loss_weight):.4f}",
+        f"transition_weight={float(cfg.transition_loss_weight):.1f}",
     )
     print(
         "Streaming state training:",
@@ -1628,7 +1815,7 @@ def train() -> None:
     )
     print(
         "Last action conditioning:",
-        "enabled=True",
+        f"enabled={bool(cfg.last_action_conditioning)}",
         f"seq_drop={cfg.last_action_sequence_dropout:.2f}",
         f"key_drop={cfg.last_action_key_dropout:.2f}",
         f"corrupt={cfg.last_action_corruption_prob:.2f}",
@@ -1710,11 +1897,36 @@ def train() -> None:
         raise RuntimeError("This trainer supports bf16/fp32 only.")
     print(f"AMP: dtype={amp_dtype} autocast={use_autocast}")
 
+    eval_state = None
+    if cfg.eval_only:
+        eval_ckpt_path = cfg.eval_ckpt or os.path.join(cfg.ckpt_dir, "model_best.pt")
+        eval_state = torch.load(eval_ckpt_path, map_location=device)
+        ckpt_config = eval_state.get("config") if isinstance(eval_state, dict) else None
+        if isinstance(ckpt_config, dict):
+            # architecture-affecting flag must match the checkpoint under eval
+            # (legacy checkpoints predate the flag and were trained with it on)
+            cfg.last_action_conditioning = bool(ckpt_config.get("last_action_conditioning", True))
+
     base_model: torch.nn.Module = DrivingVideoPolicy(cfg).to(device)
     base_model = base_model.to(memory_format=torch.channels_last)
     optimizer = torch.optim.AdamW(base_model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay, fused=True)
     print(f"Parameters: {sum(p.numel() for p in base_model.parameters()) / 1e6:.4f}M")
-    start_epoch, global_step, best_score = maybe_resume(base_model, optimizer, cfg, device)
+    if cfg.eval_only:
+        eval_ckpt = cfg.eval_ckpt or os.path.join(cfg.ckpt_dir, "model_best.pt")
+        base_model.load_state_dict(eval_state["model_state"])
+        print(
+            f"Eval-only: loaded {eval_ckpt} (epoch={eval_state.get('epoch')}"
+            f" best_score={eval_state.get('best_score')}"
+            f" last_action_conditioning={bool(cfg.last_action_conditioning)})"
+        )
+        start_epoch, global_step, best_score, resumed_ema_state = 0, 0, float("-inf"), None
+        ema = None
+    else:
+        start_epoch, global_step, best_score, resumed_ema_state = maybe_resume(base_model, optimizer, cfg, device)
+        ema = ModelEMA(base_model, decay=cfg.ema_decay) if float(cfg.ema_decay) > 0.0 else None
+        if ema is not None and resumed_ema_state:
+            ema.load_state_dict(resumed_ema_state)
+        print(f"Weight EMA: {'decay=%.4f (val + best checkpoint use averaged weights)' % cfg.ema_decay if ema else 'disabled'}")
 
     if cfg.compile_model:
         compile_kwargs = {"fullgraph": False, "dynamic": False}
@@ -1724,6 +1936,55 @@ def train() -> None:
         print(f"torch.compile enabled: mode={cfg.compile_mode}")
     else:
         model = base_model
+
+    if cfg.eval_only:
+        if val_iter is None or val_targets is None or val_batches <= 0:
+            raise RuntimeError("eval_only requires a validation split.")
+        with torch.inference_mode():
+            val_metrics, _ = run_epoch(
+                desc="Eval [val]",
+                model=model,
+                iterator=val_iter,
+                batches=val_batches,
+                targets=val_targets,
+                cfg=cfg,
+                device=device,
+                amp_dtype=amp_dtype,
+                use_autocast=use_autocast,
+                button_pos_weight=button_pos_weight,
+            )
+        eval_first = int(horizon_offsets[0])
+        eval_final = int(horizon_offsets[-1])
+        print(
+            f"Eval: va_loss={val_metrics['loss']:.4f}"
+            f" va_f1@+{eval_first}={val_metrics['step1_button_macro_f1']:.4f}"
+            f" va_f1@+{eval_final}={val_metrics['final_button_macro_f1']:.4f}"
+            f" va_carry={val_metrics.get('stream_state_carry_rate', 0.0):.3f}"
+        )
+        print_button_stats_table(
+            f"Eval val per-key/button @+{eval_first}:",
+            val_metrics["step1_button_rows"],
+        )
+        if int(cfg.prediction_horizon) > 1:
+            print_button_stats_table(
+                f"Eval val per-key/button @+{eval_final}:",
+                val_metrics["final_button_rows"],
+            )
+        for label, thr_key, f1_key in (
+            (f"+{eval_first}", "fitted_button_thresholds_step1", "fitted_button_f1_step1"),
+            (f"+{eval_final}", "fitted_button_thresholds", "fitted_button_f1"),
+        ):
+            fitted = val_metrics.get(thr_key)
+            if fitted:
+                fitted_f1 = val_metrics.get(f1_key) or [0.0] * len(button_names)
+                print(
+                    f"Fitted val thresholds @{label}: "
+                    + " ".join(
+                        f"{name}={'n/a' if threshold is None else f'{threshold:.3f}'}(f1={f1:.3f})"
+                        for name, threshold, f1 in zip(button_names, fitted, fitted_f1)
+                    )
+                )
+        return
 
     optimizer_steps_per_epoch = int(math.ceil(train_batches / float(cfg.grad_accum)))
     total_steps = max(1, optimizer_steps_per_epoch * cfg.num_epochs)
@@ -1768,12 +2029,14 @@ def train() -> None:
             total_steps=total_steps,
             global_step=global_step,
             streaming_reset_indices=streaming_reset_indices,
+            ema=ema,
         )
 
         val_metrics = None
         score = driving_score(train_metrics, cfg)
         if val_iter is not None and val_targets is not None and val_batches > 0:
-            with torch.inference_mode():
+            ema_context = ema.swap() if ema is not None else nullcontext()
+            with ema_context, torch.inference_mode():
                 val_metrics, _ = run_epoch(
                     desc=f"Epoch {epoch + 1}/{cfg.num_epochs} [val]",
                     model=model,
@@ -1787,20 +2050,52 @@ def train() -> None:
                     button_pos_weight=button_pos_weight,
                 )
             score = driving_score(val_metrics, cfg)
+            fitted_step1 = val_metrics.get("fitted_button_thresholds_step1")
+            if fitted_step1:
+                # run.py executes the +1 head, so the thresholds stored in the
+                # checkpoint config are the +1-fitted ones.
+                current_thresholds = list(cfg.button_state_thresholds)
+                cfg.button_state_thresholds = tuple(
+                    current if new is None else float(new)
+                    for current, new in zip(current_thresholds, fitted_step1)
+                )
+                fitted_f1_step1 = val_metrics.get("fitted_button_f1_step1") or [0.0] * len(button_names)
+                print(
+                    f"Fitted val thresholds @+{first_horizon_offset} (deployed): "
+                    + " ".join(
+                        f"{name}={threshold:.3f}(f1={f1:.3f})"
+                        for name, threshold, f1 in zip(button_names, cfg.button_state_thresholds, fitted_f1_step1)
+                    )
+                )
+            fitted_final = val_metrics.get("fitted_button_thresholds")
+            if fitted_final:
+                fitted_f1 = val_metrics.get("fitted_button_f1") or [0.0] * len(button_names)
+                print(
+                    f"Fitted val thresholds @+{final_horizon_offset}: "
+                    + " ".join(
+                        f"{name}={'n/a' if threshold is None else f'{threshold:.3f}'}(f1={f1:.3f})"
+                        for name, threshold, f1 in zip(button_names, fitted_final, fitted_f1)
+                    )
+                )
 
         improved = score > best_score
         if improved:
             best_score = score
             epochs_without_improvement = 0
-            save_checkpoint(
-                os.path.join(cfg.ckpt_dir, "model_best.pt"),
-                model=base_model,
-                optimizer=optimizer,
-                cfg=cfg,
-                epoch=epoch + 1,
-                global_step=global_step,
-                best_score=best_score,
-            )
+            # model_best holds the EMA weights (the ones validation measured),
+            # so run.py / test_model.py deploy exactly what was selected.
+            best_context = ema.swap() if ema is not None else nullcontext()
+            with best_context:
+                save_checkpoint(
+                    os.path.join(cfg.ckpt_dir, "model_best.pt"),
+                    model=base_model,
+                    optimizer=optimizer,
+                    cfg=cfg,
+                    epoch=epoch + 1,
+                    global_step=global_step,
+                    best_score=best_score,
+                    ema=ema,
+                )
         else:
             epochs_without_improvement += 1
 
@@ -1812,6 +2107,7 @@ def train() -> None:
             epoch=epoch + 1,
             global_step=global_step,
             best_score=best_score,
+            ema=ema,
         )
         if (epoch + 1) % cfg.save_every == 0:
             save_checkpoint(
@@ -1822,6 +2118,7 @@ def train() -> None:
                 epoch=epoch + 1,
                 global_step=global_step,
                 best_score=best_score,
+                ema=ema,
             )
 
         parts = [

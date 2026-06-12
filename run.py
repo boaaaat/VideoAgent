@@ -48,21 +48,26 @@ def disable_high_resolution_timer():
 @dataclass
 class RuntimeConfig(ModelConfig):
     ckpt_dir: str = "./checkpoints_rt"
-    ckpt_path: Optional[str] = r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\checkpoints_rt\model_latest.pt'
+    ckpt_path: Optional[str] = r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\checkpoints_rt\model_best.pt'
     pos_weight_power: float = 0.5
     pos_weight_clamp: float = 8.0
     button_threshold_from_pos_weight: bool = False
     button_threshold_min: float = 0.5  # Lowered to help sensitivity sliders
     button_threshold_max: float = 0.9
-    use_checkpoint_button_thresholds: bool = False
+    use_checkpoint_button_thresholds: bool = True
 
     decision_interval: float = 1.0 / 20.0
-    command_horizon: int = 10
+    # Actions always execute the +1 prediction; the longer horizons exist for
+    # path planning / debugging, never actuation.
+    command_horizon: int = 1
     print_every: int = 2
     print_prob_decimals: int = 3
 
     mouse_buttons_enabled: bool = False
     gru_memory_frames: int = 80
+    # data.py records at 512x512 INTER_LINEAR before DALI linear-resizes to
+    # model_size; runtime capture must mirror that two-stage path.
+    record_frame_size: int = 512
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -76,6 +81,7 @@ class RuntimeConfig(ModelConfig):
         self.button_threshold_max = float(np.clip(float(self.button_threshold_max), self.button_threshold_min, 1.0))
         self.mouse_buttons_enabled = bool(self.mouse_buttons_enabled)
         self.gru_memory_frames = max(1, int(self.gru_memory_frames))
+        self.record_frame_size = max(1, int(self.record_frame_size))
 
 
 RUNTIME_CFG = RuntimeConfig()
@@ -195,10 +201,14 @@ def capture_frame(cfg: RuntimeConfig) -> Optional[torch.Tensor]:
         return None
 
     mx, my = pdi.position()
-    _, hcursor, _, _ = get_cursor_info()
+    flags, hcursor, _, _ = get_cursor_info()
 
-    img = cv2.resize(img, (cfg.model_size, cfg.model_size), interpolation=cv2.INTER_AREA)
-    img = draw_cursor_on_image(img, mx, my, hcursor)
+    record_size = int(cfg.record_frame_size)
+    img = cv2.resize(img, (record_size, record_size), interpolation=cv2.INTER_LINEAR)
+    if flags == 1 and hcursor:
+        img = draw_cursor_on_image(img, mx, my, hcursor)
+    if record_size != int(cfg.model_size):
+        img = cv2.resize(img, (cfg.model_size, cfg.model_size), interpolation=cv2.INTER_LINEAR)
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     return torch.from_numpy(img.astype(np.float32) / 255.0).permute(2, 0, 1)
 
@@ -239,6 +249,7 @@ def _coerce_config_types(cfg: RuntimeConfig) -> RuntimeConfig:
             thresholds = tuple(float(cfg.button_state_threshold) for _ in range(cfg.num_bin))
         # FIX 2: Removed hardcoded (0.5, 0.5, 0.5, 0.3) line to support custom decision configurations
         cfg.button_state_thresholds = thresholds
+    cfg.record_frame_size = max(1, int(getattr(cfg, "record_frame_size", 512)))
     return cfg
 
 
@@ -438,20 +449,26 @@ def main() -> None:
         torch.set_float32_matmul_precision("high")
 
     cfg, model_state = load_checkpoint(cfg, device)
-    
+
     # Custom sensitivity optimization overrides (Tweak these variables to adjust turning rules!)
     # w, a, s, d
     # cfg.button_state_thresholds = (0.50, 0.5, 0.4, 0.5)
+    if cfg.last_action_conditioning:
+        # Legacy checkpoint (pre last-action removal): its stored thresholds were
+        # fitted at +10 and over-fire at +1. F1-optimal @+1 fit on val via
+        # `train.py --eval-only`. New checkpoints store +1-fitted thresholds.
+        cfg.button_state_thresholds = (0.714, 0.775, 0.900, 0.789)
     RUNTIME_CFG = cfg
 
     model = DrivingVideoPolicy(cfg).to(device)
     model.load_state_dict(model_state)
+    command_idx = max(0, min(int(cfg.command_horizon) - 1, int(cfg.prediction_horizon) - 1))
     print(
         "Model:",
         f"size={cfg.model_size}",
         f"horizon={cfg.prediction_horizon}",
         f"command_horizon={cfg.command_horizon}",
-        f"command_offset=+{int(cfg.prediction_horizon_offsets[cfg.command_horizon - 1])}",
+        f"command_offset=+{int(cfg.prediction_horizon_offsets[command_idx])}",
         f"d_model={cfg.d_model}",
         "temporal=convgru",
         "input=masked_full_frame+last_action",
@@ -473,6 +490,12 @@ def main() -> None:
 
     model.eval()
     controller = ActionController(cfg)
+
+    thresholds = torch.tensor(
+        list(cfg.button_state_thresholds),
+        device=device,
+        dtype=inference_dtype,
+    )
 
     temporal_state = TemporalState()
     prev_action = torch.zeros((1, cfg.num_bin), device=device, dtype=inference_dtype)
@@ -513,13 +536,7 @@ def main() -> None:
                             prev_action=prev_action,
                         )
                         button_logits = output.horizon_button_logits
-                    command_idx = max(0, min(int(cfg.command_horizon) - 1, int(cfg.prediction_horizon) - 1))
                     button_probs = torch.sigmoid(button_logits[0, command_idx])
-                    thresholds = torch.tensor(
-                        list(cfg.button_state_thresholds),
-                        device=button_probs.device,
-                        dtype=button_probs.dtype,
-                    )
                     predicted_buttons = (button_probs >= thresholds).to(dtype=button_logits.dtype)
 
                     applied_buttons = controller.apply(
