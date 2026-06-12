@@ -10,6 +10,11 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 from tqdm.auto import tqdm
 
+try:
+    import cv2
+except ImportError:
+    cv2 = None
+
 import torch
 import torch.nn.functional as F
 
@@ -297,6 +302,26 @@ def load_run_arrays(csv_path: str, cfg: TrainConfig) -> Dict[str, np.ndarray]:
     return {"buttons": buttons, "dt": dt}
 
 
+_CV2_WARNING_PRINTED = False
+
+
+def _video_frame_count(video_path: str) -> Optional[int]:
+    global _CV2_WARNING_PRINTED
+    if cv2 is None:
+        if not _CV2_WARNING_PRINTED:
+            print("cv2 not available; skipping video frame count vs CSV row count validation.")
+            _CV2_WARNING_PRINTED = True
+        return None
+    capture = cv2.VideoCapture(video_path)
+    try:
+        if not capture.isOpened():
+            return None
+        count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+    finally:
+        capture.release()
+    return count if count > 0 else None
+
+
 def build_window_targets(
     pairs: Sequence[Tuple[str, str]],
     cfg: TrainConfig,
@@ -314,10 +339,20 @@ def build_window_targets(
         run = load_run_arrays(csv_path, cfg)
         buttons = run["buttons"]
         dt = run["dt"].astype(np.float32)
-        if buttons.shape[0] < cfg.seq_len:
+
+        usable = int(buttons.shape[0])
+        frame_count = _video_frame_count(video_path)
+        if frame_count is not None:
+            if abs(frame_count - usable) > 2:
+                print(
+                    f"Frame/CSV mismatch for {video_path}: video={frame_count} csv={usable}; "
+                    "trimming windows to the shorter of the two."
+                )
+            usable = min(usable, frame_count)
+        if usable < cfg.seq_len:
             continue
 
-        max_start = buttons.shape[0] - cfg.seq_len
+        max_start = usable - cfg.seq_len
         for start in range(0, max_start + 1, max(1, int(stride))):
             end = start + cfg.seq_len
             button_target = np.zeros((cfg.seq_len, horizon, cfg.num_bin), dtype=np.float32)
@@ -327,7 +362,7 @@ def build_window_targets(
             for h in range(1, horizon + 1):
                 target_indices = frame_indices + h + int(cfg.action_label_offset)
                 prev_indices = target_indices - 1
-                valid = (target_indices >= 0) & (target_indices < buttons.shape[0]) & (prev_indices >= 0)
+                valid = (target_indices >= 0) & (target_indices < usable) & (prev_indices >= 0)
                 if np.any(valid):
                     valid_target_indices = target_indices[valid]
                     button_target[valid, h - 1] = buttons[valid_target_indices]
@@ -493,11 +528,12 @@ def normalize_dali_labels(labels: torch.Tensor) -> torch.Tensor:
     return labels.reshape(-1).long()
 
 
-def compute_pos_weight(labels: torch.Tensor, power: float, clamp: float) -> torch.Tensor:
+def compute_pos_weight(labels: torch.Tensor, valid: torch.Tensor, power: float, clamp: float) -> torch.Tensor:
     labels = labels.float()
-    pos = labels.sum(dim=tuple(range(labels.dim() - 1)))
-    total = labels.numel() / max(1, labels.shape[-1])
-    neg = torch.full_like(pos, float(total)) - pos
+    mask = valid.float().unsqueeze(-1)
+    pos = (labels * mask).sum(dim=tuple(range(labels.dim() - 1)))
+    total = mask.sum()
+    neg = (total - pos).clamp(min=0.0)
     weight = (neg / pos.clamp(min=1.0)).pow(float(power))
     return weight.clamp(min=1.0, max=float(clamp)).float()
 
@@ -575,6 +611,8 @@ def compute_losses(
     valid = targets.horizon_valid.float()
     valid_4d = valid.unsqueeze(-1)
     button_target = targets.button_horizon.float()
+    # Smoothing is applied before the pos-weighted BCE on purpose: positives keep
+    # their pos_weight emphasis while both classes get a small confidence floor.
     if float(cfg.button_label_smoothing) > 0.0:
         eps = float(cfg.button_label_smoothing)
         button_target = button_target * (1.0 - eps) + 0.5 * eps
@@ -769,6 +807,9 @@ def run_epoch(
     final_stats = BinaryStats(cfg.num_bin, device)
     steps = 0
 
+    full_accum_batches = (int(batches) // max(1, int(cfg.grad_accum))) * max(1, int(cfg.grad_accum))
+    tail_accum = max(1, int(batches) - full_accum_batches)
+
     iterator_it = iter(iterator)
     pbar = tqdm(range(int(batches)), desc=desc, dynamic_ncols=True)
     for batch_idx in pbar:
@@ -784,7 +825,8 @@ def run_epoch(
                     cfg,
                     button_pos_weight=button_pos_weight,
                 )
-                loss_div = loss / max(1, int(cfg.grad_accum))
+                accum_window = cfg.grad_accum if batch_idx < full_accum_batches else tail_accum
+                loss_div = loss / max(1, int(accum_window))
 
             if is_train:
                 loss_div.backward()
@@ -922,6 +964,10 @@ def parse_args() -> TrainConfig:
     add("--d-model", type=int, default=None)
     add("--frame-spatial-pool", type=int, default=None)
     add("--frame-spatial-channels", type=int, default=None)
+    add("--spatial-layers", type=int, default=None)
+    add("--spatial-heads", type=int, default=None)
+    add("--spatial-mlp-ratio", type=float, default=None)
+    add("--summary-tokens", type=int, default=None)
     add("--temporal-layers", type=int, default=None)
     add("--temporal-heads", type=int, default=None)
     add("--temporal-mlp-ratio", type=float, default=None)
@@ -999,6 +1045,10 @@ def parse_args() -> TrainConfig:
         "d_model",
         "frame_spatial_pool",
         "frame_spatial_channels",
+        "spatial_layers",
+        "spatial_heads",
+        "spatial_mlp_ratio",
+        "summary_tokens",
         "temporal_layers",
         "temporal_heads",
         "temporal_mlp_ratio",
@@ -1113,7 +1163,12 @@ def train() -> None:
             raise RuntimeError("Validation window metadata is required for DALI file list generation.")
         write_window_file_list(val_targets.meta, val_file_list)
 
-    button_pos_weight = compute_pos_weight(train_targets.button_horizon.reshape(-1, cfg.num_bin), cfg.pos_weight_power, cfg.pos_weight_clamp).to(device)
+    button_pos_weight = compute_pos_weight(
+        train_targets.button_horizon,
+        train_targets.horizon_valid,
+        cfg.pos_weight_power,
+        cfg.pos_weight_clamp,
+    ).to(device)
     button_thresholds = decision_thresholds_from_pos_weight(button_pos_weight, cfg).detach().cpu()
     cfg.button_state_thresholds = tuple(float(x) for x in button_thresholds.tolist())
     print(
@@ -1139,6 +1194,12 @@ def train() -> None:
         last_batch_policy=LastBatchPolicy.DROP,
     )
     train_batches = int(train_targets.button_horizon.shape[0]) // int(cfg.batch_size)
+    if cfg.max_train_batches is not None and cfg.max_train_batches < train_batches:
+        print(
+            f"max_train_batches={cfg.max_train_batches} caps the epoch ({train_batches} batches available); "
+            "the DALI iterator cannot reset mid-epoch, so later epochs continue mid-stream. "
+            "max_val_batches has the same effect and can skew val metrics."
+        )
     if cfg.max_train_batches is not None:
         train_batches = min(train_batches, cfg.max_train_batches)
     if train_batches <= 0:
@@ -1166,9 +1227,31 @@ def train() -> None:
 
     base_model: torch.nn.Module = ActionConditionedVideoPolicy(cfg).to(device)
     base_model = base_model.to(memory_format=torch.channels_last)
-    optimizer = torch.optim.AdamW(base_model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay, fused=True)
+    no_decay_suffixes = ("pos_embed", "row_embed", "col_embed", "queries")
+    decay_params: List[torch.nn.Parameter] = []
+    no_decay_params: List[torch.nn.Parameter] = []
+    for name, param in base_model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if param.ndim < 2 or name.endswith(no_decay_suffixes):
+            no_decay_params.append(param)
+        else:
+            decay_params.append(param)
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": decay_params, "weight_decay": cfg.weight_decay},
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ],
+        lr=cfg.lr,
+        fused=True,
+    )
     print(f"Parameters: {sum(p.numel() for p in base_model.parameters()) / 1e6:.4f}M")
     start_epoch, global_step, best_score = maybe_resume(base_model, optimizer, cfg, device)
+    if start_epoch >= cfg.num_epochs:
+        print(
+            f"Resumed checkpoint is at epoch {start_epoch} >= num_epochs={cfg.num_epochs}; "
+            "no epochs left to train. Increase --num-epochs or pass --no-resume."
+        )
 
     if cfg.compile_model:
         compile_kwargs = {"fullgraph": False, "dynamic": False}

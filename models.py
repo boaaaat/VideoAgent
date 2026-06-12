@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -31,10 +32,16 @@ class ModelConfig:
     key_names: Optional[List[str]] = None
     mouse_button_names: Optional[List[str]] = None
 
-    d_model: int = 128
+    d_model: int = 192
     frame_spatial_pool: int = 8
+    # Kept for checkpoint/config compatibility; the spatial encoder now works
+    # directly at d_model width, so this value is unused by the model.
     frame_spatial_channels: int = 32
-    temporal_layers: int = 2
+    spatial_layers: int = 2
+    spatial_heads: int = 4
+    spatial_mlp_ratio: float = 2.0
+    summary_tokens: int = 4
+    temporal_layers: int = 4
     temporal_heads: int = 4
     temporal_mlp_ratio: float = 2.0
     dropout: float = 0.10
@@ -62,9 +69,12 @@ class ModelConfig:
         self.d_model = max(64, int(self.d_model))
         self.frame_spatial_pool = max(1, int(self.frame_spatial_pool))
         self.frame_spatial_channels = int(self.frame_spatial_channels)
-        if self.frame_spatial_channels <= 0:
-            self.frame_spatial_channels = max(16, self.d_model // 4)
-        self.frame_spatial_channels = max(8, min(int(self.frame_spatial_channels), int(self.d_model)))
+        self.spatial_layers = max(1, int(self.spatial_layers))
+        self.spatial_heads = max(1, int(self.spatial_heads))
+        while self.d_model % self.spatial_heads != 0 and self.spatial_heads > 1:
+            self.spatial_heads -= 1
+        self.spatial_mlp_ratio = float(min(max(self.spatial_mlp_ratio, 1.0), 8.0))
+        self.summary_tokens = max(1, int(self.summary_tokens))
         self.temporal_layers = max(1, int(self.temporal_layers))
         self.temporal_heads = max(1, int(self.temporal_heads))
         while self.d_model % self.temporal_heads != 0 and self.temporal_heads > 1:
@@ -148,12 +158,14 @@ class ResidualConvBlock(nn.Module):
 
 
 class FrameCNN(nn.Module):
+    """Stride-16 conv backbone producing a d_model-wide spatial token grid."""
+
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         widths = [
-            max(32, cfg.d_model // 8),
-            max(48, cfg.d_model // 4),
-            max(96, cfg.d_model // 2),
+            max(32, cfg.d_model // 4),
+            max(48, cfg.d_model // 2),
+            max(96, (3 * cfg.d_model) // 4),
             cfg.d_model,
         ]
         layers: List[nn.Module] = []
@@ -161,54 +173,108 @@ class FrameCNN(nn.Module):
         for idx, out_channels in enumerate(widths):
             layers.append(ConvBlock(in_channels, out_channels, stride=2, dropout=cfg.dropout * 0.2))
             layers.append(ResidualConvBlock(out_channels, dropout=cfg.dropout * 0.2))
-            in_channels = out_channels
             if idx >= 1:
                 layers.append(ResidualConvBlock(out_channels, dropout=cfg.dropout * 0.2))
+            in_channels = out_channels
         self.net = nn.Sequential(*layers)
         self.pool_size = int(cfg.frame_spatial_pool)
-        spatial_channels = int(cfg.frame_spatial_channels)
-        self.spatial_proj = nn.Sequential(
-            nn.Conv2d(cfg.d_model, cfg.d_model, kernel_size=3, padding=1, groups=cfg.d_model, bias=False),
-            nn.GroupNorm(_group_count(cfg.d_model), cfg.d_model),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(cfg.d_model, spatial_channels, kernel_size=1, bias=False),
-            nn.GroupNorm(_group_count(spatial_channels), spatial_channels),
-            nn.SiLU(inplace=True),
-        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.net(x)
-        x = self.spatial_proj(x)
         x = F.adaptive_avg_pool2d(x, output_size=(self.pool_size, self.pool_size))
         return x.flatten(2).transpose(1, 2).contiguous()
 
 
-class CausalAttentionBlock(nn.Module):
-    def __init__(self, cfg: ModelConfig):
+class TransformerBlock(nn.Module):
+    """Pre-LN self-attention block; causal when an attn_mask is supplied."""
+
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        mlp_ratio: float,
+        dropout: float,
+        *,
+        depth: int = 1,
+    ):
         super().__init__()
-        self.attn_norm = nn.LayerNorm(cfg.d_model)
+        self.attn_norm = nn.LayerNorm(d_model)
         self.attn = nn.MultiheadAttention(
-            embed_dim=cfg.d_model,
-            num_heads=cfg.temporal_heads,
-            dropout=cfg.dropout,
+            embed_dim=d_model,
+            num_heads=num_heads,
+            dropout=dropout,
             batch_first=True,
         )
-        self.attn_drop = nn.Dropout(cfg.dropout)
-        self.mlp_norm = nn.LayerNorm(cfg.d_model)
-        hidden_dim = max(cfg.d_model, int(round(cfg.d_model * float(cfg.temporal_mlp_ratio))))
+        self.attn_drop = nn.Dropout(dropout)
+        self.mlp_norm = nn.LayerNorm(d_model)
+        hidden_dim = max(d_model, int(round(d_model * float(mlp_ratio))))
         self.mlp = nn.Sequential(
-            nn.Linear(cfg.d_model, hidden_dim),
+            nn.Linear(d_model, hidden_dim),
             nn.GELU(),
-            nn.Dropout(cfg.dropout),
-            nn.Linear(hidden_dim, cfg.d_model),
-            nn.Dropout(cfg.dropout),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, d_model),
+            nn.Dropout(dropout),
         )
+        residual_std = 0.02 / math.sqrt(2.0 * max(1, int(depth)))
+        nn.init.trunc_normal_(self.attn.out_proj.weight, std=residual_std)
+        nn.init.zeros_(self.attn.out_proj.bias)
+        nn.init.trunc_normal_(self.mlp[3].weight, std=residual_std)
+        nn.init.zeros_(self.mlp[3].bias)
 
-    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         y = self.attn_norm(x)
         y, _ = self.attn(y, y, y, attn_mask=attn_mask, need_weights=False)
         x = x + self.attn_drop(y)
         return x + self.mlp(self.mlp_norm(x))
+
+
+class SpatialEncoder(nn.Module):
+    """Per-frame spatial reasoning: 2D pos embeddings, self-attention over the
+    token grid, then attention pooling into a compact frame summary."""
+
+    def __init__(self, cfg: ModelConfig):
+        super().__init__()
+        grid = int(cfg.frame_spatial_pool)
+        d = int(cfg.d_model)
+        self.grid = grid
+        self.row_embed = nn.Parameter(torch.zeros(grid, d))
+        self.col_embed = nn.Parameter(torch.zeros(grid, d))
+        self.blocks = nn.ModuleList(
+            TransformerBlock(
+                d,
+                cfg.spatial_heads,
+                cfg.spatial_mlp_ratio,
+                cfg.dropout,
+                depth=cfg.spatial_layers,
+            )
+            for _ in range(cfg.spatial_layers)
+        )
+        self.norm = nn.LayerNorm(d)
+        self.queries = nn.Parameter(torch.zeros(int(cfg.summary_tokens), d))
+        self.pool_attn = nn.MultiheadAttention(
+            embed_dim=d,
+            num_heads=cfg.spatial_heads,
+            dropout=cfg.dropout,
+            batch_first=True,
+        )
+        self.out = nn.Sequential(
+            nn.Linear(int(cfg.summary_tokens) * d, d),
+            nn.LayerNorm(d),
+        )
+        nn.init.trunc_normal_(self.row_embed, std=0.02)
+        nn.init.trunc_normal_(self.col_embed, std=0.02)
+        nn.init.trunc_normal_(self.queries, std=0.02)
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        n = tokens.size(0)
+        pos = (self.row_embed.unsqueeze(1) + self.col_embed.unsqueeze(0)).view(self.grid * self.grid, -1)
+        x = tokens + pos.to(device=tokens.device, dtype=tokens.dtype).unsqueeze(0)
+        for block in self.blocks:
+            x = block(x)
+        x = self.norm(x)
+        queries = self.queries.to(device=x.device, dtype=x.dtype).unsqueeze(0).expand(n, -1, -1)
+        pooled, _ = self.pool_attn(queries, x, x, need_weights=False)
+        return self.out(pooled.flatten(1))
 
 
 class CausalAttentionTemporal(nn.Module):
@@ -219,7 +285,16 @@ class CausalAttentionTemporal(nn.Module):
         self.in_norm = nn.LayerNorm(input_dim)
         self.in_proj = nn.Linear(input_dim, cfg.d_model)
         self.pos_embed = nn.Parameter(torch.zeros(self.max_context, cfg.d_model))
-        self.blocks = nn.ModuleList(CausalAttentionBlock(cfg) for _ in range(cfg.temporal_layers))
+        self.blocks = nn.ModuleList(
+            TransformerBlock(
+                cfg.d_model,
+                cfg.temporal_heads,
+                cfg.temporal_mlp_ratio,
+                cfg.dropout,
+                depth=cfg.temporal_layers,
+            )
+            for _ in range(cfg.temporal_layers)
+        )
         self.norm = nn.LayerNorm(cfg.d_model)
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
 
@@ -242,43 +317,51 @@ class CausalAttentionTemporal(nn.Module):
         *,
         update_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        if update_cache:
-            context = x if hidden is None else torch.cat([hidden.to(device=x.device, dtype=x.dtype), x], dim=1)
-            if context.size(1) > self.max_context:
-                context = context[:, -self.max_context :].contiguous()
-            y = self._encode_context(context)
-            return y[:, -x.size(1) :].contiguous(), context.detach()
         if hidden is not None:
             hidden = hidden.to(device=x.device, dtype=x.dtype)
             context = torch.cat([hidden, x], dim=1)
-            if context.size(1) > self.max_context:
-                context = context[:, -self.max_context :].contiguous()
-            y = self._encode_context(context)
-            return y[:, -x.size(1) :].contiguous(), context.detach()
-        return self._encode_context(x), None
+        else:
+            context = x
+        if context.size(1) > self.max_context:
+            context = context[:, -self.max_context :].contiguous()
+        y = self._encode_context(context)
+        if hidden is None and not update_cache:
+            return y, None
+        return y[:, -x.size(1) :].contiguous(), context.detach()
 
 
 class ActionConditionedVideoPolicy(nn.Module):
+    """CNN + spatial transformer + causal temporal transformer driving policy.
+
+    Streaming note: `TemporalState.hidden_state` caches the post-fusion temporal
+    inputs (one d_model vector per frame), which are exactly the tensors that
+    `forward()` feeds into the temporal stack — so `forward_step` reproduces
+    `forward()` logits while only encoding the newest frame each step. Once the
+    cache exceeds `max_context`, the window slides and positional embeddings
+    realign to the truncated context (same behavior as full-sequence forward).
+    """
+
     def __init__(self, cfg: Optional[ModelConfig] = None):
         super().__init__()
         self.cfg = cfg if cfg is not None else ModelConfig()
         self.frame_tokens = int(self.cfg.frame_spatial_pool) * int(self.cfg.frame_spatial_pool)
-        self.frame_feature_dim = self.frame_tokens * int(self.cfg.frame_spatial_channels)
+        self.frame_feature_dim = int(self.cfg.d_model)
 
         self.frame_encoder = FrameCNN(self.cfg)
+        self.spatial_encoder = SpatialEncoder(self.cfg)
         self.dt_embed = nn.Sequential(
             nn.Linear(3, self.cfg.d_model),
             nn.GELU(),
-            nn.Linear(self.cfg.d_model, self.frame_feature_dim),
+            nn.Linear(self.cfg.d_model, self.cfg.d_model),
         )
         self.fuse = nn.Sequential(
-            nn.LayerNorm(self.frame_feature_dim),
-            nn.Linear(self.frame_feature_dim, self.cfg.d_model),
+            nn.LayerNorm(self.cfg.d_model),
+            nn.Linear(self.cfg.d_model, self.cfg.d_model),
             nn.GELU(),
             nn.Dropout(self.cfg.dropout),
-            nn.Linear(self.cfg.d_model, self.frame_feature_dim),
+            nn.Linear(self.cfg.d_model, self.cfg.d_model),
         )
-        self.temporal = CausalAttentionTemporal(self.cfg, input_dim=self.frame_feature_dim)
+        self.temporal = CausalAttentionTemporal(self.cfg, input_dim=self.cfg.d_model)
         self.head = nn.Sequential(
             nn.LayerNorm(self.cfg.d_model),
             nn.Linear(self.cfg.d_model, self.cfg.d_model),
@@ -389,13 +472,12 @@ class ActionConditionedVideoPolicy(nn.Module):
 
         chunks: List[torch.Tensor] = []
         for start in range(0, x.size(0), int(self.cfg.encode_chunk_size)):
-            chunks.append(self.frame_encoder(x[start : start + int(self.cfg.encode_chunk_size)]))
-        visual = torch.cat(chunks, dim=0).view(b, t, self.frame_tokens, self.cfg.frame_spatial_channels)
+            tokens = self.frame_encoder(x[start : start + int(self.cfg.encode_chunk_size)])
+            chunks.append(self.spatial_encoder(tokens))
+        visual = torch.cat(chunks, dim=0).view(b, t, self.cfg.d_model)
         return visual, frames[:, -1].detach()
 
     def _build_inputs(self, visual: torch.Tensor, dt: torch.Tensor) -> torch.Tensor:
-        if visual.dim() == 4:
-            visual = visual.flatten(2)
         if dt.dim() == 1:
             dt = dt.unsqueeze(1).expand(visual.shape[0], visual.shape[1])
         dt_emb = self._dt_features(dt).to(dtype=visual.dtype)
@@ -470,9 +552,29 @@ RealTimeTemporalControlNet = ActionConditionedVideoPolicy
 
 if __name__ == "__main__":
     torch.manual_seed(0)
-    cfg = ModelConfig(model_size=256, seq_len=100, prediction_horizon=1, max_context=100)
-    model = ActionConditionedVideoPolicy(cfg)
+    cfg = ModelConfig(model_size=256, seq_len=16, prediction_horizon=5, max_context=16)
+    model = ActionConditionedVideoPolicy(cfg).eval()
+    params = sum(p.numel() for p in model.parameters())
+    print(f"params={params / 1e6:.2f}M num_bin={cfg.num_bin}")
+
     x = torch.rand(1, cfg.seq_len, 3, cfg.model_size, cfg.model_size)
     dt = torch.full((1, cfg.seq_len), cfg.prediction_dt)
-    out = model(x, dt=dt)
-    print(tuple(out.horizon_button_logits.shape))
+    with torch.no_grad():
+        out = model(x, dt=dt)
+    assert out.button_logits.shape == (1, cfg.seq_len, cfg.num_bin), tuple(out.button_logits.shape)
+    assert out.horizon_button_logits.shape == (1, cfg.seq_len, cfg.prediction_horizon, cfg.num_bin)
+
+    state = model.init_state(1)
+    with torch.no_grad():
+        for t in range(cfg.seq_len):
+            step_out, state = model.forward_step(x[:, t], dt[:, t], state)
+            ref = out.horizon_button_logits[:, t]
+            diff = (step_out.horizon_button_logits - ref).abs().max()
+            assert torch.allclose(step_out.horizon_button_logits, ref, atol=1e-4), f"step {t}: max diff {diff}"
+    print("streaming equivalence OK")
+
+    x_u8 = (x * 255.0).to(torch.uint8)
+    with torch.no_grad():
+        out_u8 = model(x_u8, dt=dt)
+    assert out_u8.horizon_button_logits.shape == out.horizon_button_logits.shape
+    print("uint8 path OK:", tuple(out.horizon_button_logits.shape))
