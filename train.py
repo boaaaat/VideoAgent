@@ -32,6 +32,7 @@ from models import (
     ModelConfig,
     PolicyOutput,
     TemporalState,
+    apply_static_masks,
 )
 
 
@@ -367,6 +368,9 @@ class WindowTargets:
     button_horizon: torch.Tensor
     horizon_valid: torch.Tensor
     last_action: torch.Tensor
+    # 1.0 where the labelled key state differs from the true previous frame
+    # (computed from the full CSV, so chunk-boundary flips at frame 0 count).
+    button_transition: Optional[torch.Tensor] = None
     meta: Optional[List[Tuple[str, int, int]]] = None
 
 
@@ -612,6 +616,7 @@ def build_window_targets(
     button_windows: List[np.ndarray] = []
     valid_windows: List[np.ndarray] = []
     last_action_windows: List[np.ndarray] = []
+    transition_windows: List[np.ndarray] = []
     meta: List[Tuple[str, int, int]] = []
 
     horizon_offsets = tuple(int(offset) for offset in cfg.prediction_horizon_offsets)
@@ -628,6 +633,7 @@ def build_window_targets(
             button_target = np.zeros((cfg.seq_len, horizon, cfg.num_bin), dtype=np.float32)
             valid_target = np.zeros((cfg.seq_len, horizon), dtype=np.float32)
             last_action = np.zeros((cfg.seq_len, cfg.num_bin), dtype=np.float32)
+            transition_target = np.zeros((cfg.seq_len, horizon, cfg.num_bin), dtype=np.float32)
 
             frame_indices = np.arange(start, end)
             context_indices = frame_indices + int(cfg.action_label_offset)
@@ -641,11 +647,15 @@ def build_window_targets(
                 if np.any(valid):
                     valid_target_indices = target_indices[valid]
                     button_target[valid, horizon_idx] = buttons[valid_target_indices]
+                    transition_target[valid, horizon_idx] = (
+                        buttons[valid_target_indices] != buttons[prev_indices[valid]]
+                    ).astype(np.float32)
                     valid_target[valid, horizon_idx] = 1.0
 
             button_windows.append(button_target)
             valid_windows.append(valid_target)
             last_action_windows.append(last_action)
+            transition_windows.append(transition_target)
             if return_meta:
                 meta.append((video_path, start, end))
 
@@ -659,6 +669,7 @@ def build_window_targets(
         button_horizon=stack(button_windows),
         horizon_valid=stack(valid_windows),
         last_action=stack(last_action_windows),
+        button_transition=stack(transition_windows),
         meta=meta if return_meta else None,
     )
 
@@ -988,6 +999,9 @@ def move_bundle_to_device(bundle: WindowTargets, device: torch.device) -> Window
         button_horizon=bundle.button_horizon.to(device, non_blocking=True),
         horizon_valid=bundle.horizon_valid.to(device, non_blocking=True),
         last_action=bundle.last_action.to(device, non_blocking=True),
+        button_transition=(
+            None if bundle.button_transition is None else bundle.button_transition.to(device, non_blocking=True)
+        ),
         meta=bundle.meta,
     )
 
@@ -1044,9 +1058,11 @@ def compute_losses(
     loss_weight = valid_4d
     horizon_count = int(button_logits.size(2))
     if horizon_count > 1:
+        # run.py only actuates the +1 head, so it gets the largest weight; the
+        # far horizons stay as anticipation auxiliaries, not the main objective.
         horizon_weight = torch.linspace(
-            0.5,
             1.5,
+            0.5,
             horizon_count,
             device=button_logits.device,
             dtype=button_logits.dtype,
@@ -1055,9 +1071,14 @@ def compute_losses(
     if float(cfg.transition_loss_weight) > 1.0:
         # Per-key upweight where the label flips vs the previous frame; the
         # weighted mean keeps the loss scale stable as the weight changes.
-        raw_labels = targets.button_horizon > 0.5
-        transition = torch.zeros_like(raw_labels)
-        transition[:, 1:] = raw_labels[:, 1:] != raw_labels[:, :-1]
+        if targets.button_transition is not None:
+            # Built from the full CSV, so flips at frame 0 (chunk boundaries,
+            # now supervised on carried-state chunks) are upweighted too.
+            transition = targets.button_transition > 0.5
+        else:
+            raw_labels = targets.button_horizon > 0.5
+            transition = torch.zeros_like(raw_labels)
+            transition[:, 1:] = raw_labels[:, 1:] != raw_labels[:, :-1]
         button_weight = loss_weight * (
             1.0 + (float(cfg.transition_loss_weight) - 1.0) * transition.float()
         )
@@ -1187,7 +1208,9 @@ def driving_score(metrics: Dict[str, float], cfg: TrainConfig) -> float:
     if int(cfg.prediction_horizon) <= 1:
         return step1_score
     final_score = score_rows(metrics.get("final_button_rows", []), metrics["final_button_macro_f1"])
-    return 0.2 * step1_score + 0.8 * final_score
+    # Checkpoint selection follows deployment: run.py actuates the +1 head, so
+    # it dominates; the far horizon stays as a small anticipation signal.
+    return 0.8 * step1_score + 0.2 * final_score
 
 
 def print_button_stats_table(title: str, rows: Sequence[Dict[str, float | int | str]]) -> None:
@@ -1267,6 +1290,9 @@ def load_batch(iterator, targets: WindowTargets, device: torch.device, cfg: Trai
         button_horizon=targets.button_horizon[labels],
         horizon_valid=targets.horizon_valid[labels],
         last_action=targets.last_action[labels],
+        button_transition=(
+            None if targets.button_transition is None else targets.button_transition[labels]
+        ),
         meta=None,
     )
     return frames, target, labels
@@ -1369,6 +1395,7 @@ def run_epoch(
     threshold_fitter_step1 = ThresholdFitter(cfg.num_bin, device) if threshold_fitter is not None else None
     steps = 0
     streaming_cache: StreamingStateCache = {}
+    segment_aug_seeds: Dict[str, int] = {}
     use_streaming_state = bool(
         cfg.streaming_state_training and (is_train or cfg.streaming_state_validation)
     )
@@ -1379,8 +1406,43 @@ def run_epoch(
     pbar = tqdm(range(int(batches)), desc=desc, dynamic_ncols=True)
     for batch_idx in pbar:
         frames, batch_targets, labels = load_batch(iterator_it, targets, device, cfg)
+
+        initial_state: Optional[TemporalState] = None
+        fresh_state_mask: Optional[torch.Tensor] = None
+        carried_flags: List[bool] = []
+        if use_streaming_state:
+            initial_state, carried_flags = _streaming_initial_state(
+                labels,
+                targets,
+                streaming_cache,
+                streaming_reset_indices if is_train else None,
+            )
+            stream_carried += sum(1 for flag in carried_flags if flag)
+            stream_total += len(carried_flags)
+            fresh_state_mask = torch.tensor(
+                [not flag for flag in carried_flags],
+                device=device,
+                dtype=torch.bool,
+            )
+
         if is_train:
-            frames = augment_frames(frames, cfg)
+            # Pre-mask so geometric augmentation cannot shift HUD/minimap
+            # pixels out from under the model's fixed masks (train-only
+            # leakage the model could learn to read).
+            frames = apply_static_masks(frames)
+            aug_generator: Optional[torch.Generator] = None
+            if use_streaming_state and targets.meta is not None and len(carried_flags) == 1:
+                # One transform per streaming segment: re-seeding the generator
+                # with the segment's seed makes every chunk draw identical
+                # augmentation params, so the carried ConvGRU state never sees
+                # the scene appearance jump mid-episode.
+                video_path = targets.meta[_labels_to_indices(labels)[0]][0]
+                if not carried_flags[0] or video_path not in segment_aug_seeds:
+                    segment_aug_seeds[video_path] = random.getrandbits(63)
+                aug_generator = torch.Generator(device=frames.device)
+                aug_generator.manual_seed(segment_aug_seeds[video_path])
+            frames = augment_frames(frames, cfg, generator=aug_generator)
+
         with torch.set_grad_enabled(is_train):
             with torch.amp.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_autocast):
                 prev_action = (
@@ -1388,21 +1450,7 @@ def run_epoch(
                     if is_train
                     else batch_targets.last_action
                 )
-                fresh_state_mask: Optional[torch.Tensor] = None
                 if use_streaming_state:
-                    initial_state, carried_flags = _streaming_initial_state(
-                        labels,
-                        targets,
-                        streaming_cache,
-                        streaming_reset_indices if is_train else None,
-                    )
-                    stream_carried += sum(1 for flag in carried_flags if flag)
-                    stream_total += len(carried_flags)
-                    fresh_state_mask = torch.tensor(
-                        [not flag for flag in carried_flags],
-                        device=device,
-                        dtype=torch.bool,
-                    )
                     output, next_state = model(
                         frames,
                         state=initial_state,

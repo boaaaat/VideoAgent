@@ -19,6 +19,8 @@ TEMPORAL_HIDDEN_CHANNELS = 128
 POLICY_INPUT_CHANNELS = 3
 TEMPORAL_RNN_LAYERS = 1
 KEYPOINT_HEATMAP_CHANNELS = 32
+GRU_MEMORY_MIN_FRAMES = 2.0
+GRU_MEMORY_MAX_FRAMES = 40.0
 LAST_ACTION_EMBEDDING_DROPOUT = 0.25
 DEFAULT_HORIZON_OFFSETS = (1, 2, 3, 5, 7, 10)
 
@@ -77,7 +79,7 @@ class ModelConfig:
     key_names: Optional[List[str]] = None
     mouse_button_names: Optional[List[str]] = None
 
-    d_model: int = 256
+    d_model: int = 128
     spatial_dropout: float = 0.10
     head_dropout: float = 0.20
     zoneout: float = 0.0
@@ -235,6 +237,28 @@ class CustomSpatialEncoder(nn.Module):
         return self.stage3(self.stage2(self.stage1(self.stem(x))))
 
 
+def apply_static_masks(frames: torch.Tensor) -> torch.Tensor:
+    """Zero out the HUD, minimap, and Roblox UI regions (relative coords)."""
+    h, w = frames.shape[-2:]
+    masked_frames = frames.clone()
+
+    # 1. Mask the Bottom Left HUD (Speedometer)
+    hud_y1 = int(h * 0.96)
+    masked_frames[..., hud_y1:, :] = 0.0
+
+    # 2. Mask the Minimap (Mid-Right)
+    map_y1, map_y2 = int(h * 0.05), int(h * 0.2)
+    map_x1 = int(w * 0.75)
+    masked_frames[..., map_y1:map_y2, map_x1:] = 0.0
+
+    # 3. Top Left Roblox UI
+    roblox_ui_y2 = int(h * 0.1)
+    roblox_ui_x2 = int(w * 0.1)
+    masked_frames[..., :roblox_ui_y2, :roblox_ui_x2] = 0.0
+
+    return masked_frames
+
+
 class ConvGRUCell(nn.Module):
     """
     A GRU cell that replaces standard Linear matrix multiplications with Conv2d,
@@ -266,8 +290,17 @@ class ConvGRUCell(nn.Module):
     def reset_parameters(self) -> None:
         if self.gates_conv.bias is not None:
             nn.init.zeros_(self.gates_conv.bias)
-            # Update gate starts near z=0.27 so the cell keeps ~73% of its state per step.
-            nn.init.constant_(self.gates_conv.bias[self.hidden_dim:], -1.0)
+            # Per-channel memory timescales log-spaced over 2-40 frames:
+            # update-gate bias -log(T-1) gives z = sigmoid(b) = 1/T, i.e. a
+            # ~T-frame memory. Log spacing keeps most channels fast (median
+            # ~9 frames, healthy z(1-z) gate gradients) while the tail reaches
+            # 40 frames; a uniform slow init (chrono-style) starved the cell
+            # of input and froze the gates.
+            with torch.no_grad():
+                log_timescales = torch.linspace(
+                    math.log(GRU_MEMORY_MIN_FRAMES), math.log(GRU_MEMORY_MAX_FRAMES), self.hidden_dim
+                )
+                self.gates_conv.bias[self.hidden_dim:] = -torch.log(torch.exp(log_timescales) - 1.0)
         if self.candidate_conv.bias is not None:
             nn.init.zeros_(self.candidate_conv.bias)
 
@@ -484,24 +517,7 @@ class DrivingVideoPolicy(nn.Module):
         return features.to(dtype=dtype)
 
     def _apply_masks(self, frames: torch.Tensor) -> torch.Tensor:
-        h, w = frames.shape[-2:]
-        masked_frames = frames.clone()
-
-        # 1. Mask the Bottom Left HUD (Speedometer)
-        hud_y1 = int(h * 0.96)
-        masked_frames[..., hud_y1:, :] = 0.0
-
-        # 2. Mask the Minimap (Mid-Right)
-        map_y1, map_y2 = int(h * 0.05), int(h * 0.2)
-        map_x1 = int(w * 0.75)
-        masked_frames[..., map_y1:map_y2, map_x1:] = 0.0
-
-        # 3. Top Left Roblox UI
-        roblox_ui_y2 = int(h * 0.1)
-        roblox_ui_x2 = int(w * 0.1)
-        masked_frames[..., :roblox_ui_y2, :roblox_ui_x2] = 0.0
-
-        return masked_frames
+        return apply_static_masks(frames)
 
     def forward(
         self,

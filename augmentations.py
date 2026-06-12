@@ -86,7 +86,13 @@ def _sample_time_shape(frames: torch.Tensor, same_over_time: bool) -> tuple[int,
     return b, 1 if same_over_time else t
 
 
-def _spatial_jitter(frames: torch.Tensor, cfg: VideoAugmentConfig, *, same_over_time: bool) -> torch.Tensor:
+def _spatial_jitter(
+    frames: torch.Tensor,
+    cfg: VideoAugmentConfig,
+    *,
+    same_over_time: bool,
+    generator: Optional[torch.Generator] = None,
+) -> torch.Tensor:
     translate_frac = float(cfg.aug_translate_frac)
     scale_frac = float(cfg.aug_scale_frac)
     if translate_frac <= 0.0 and scale_frac <= 0.0:
@@ -98,14 +104,14 @@ def _spatial_jitter(frames: torch.Tensor, cfg: VideoAugmentConfig, *, same_over_
     sample_shape = _sample_time_shape(frames, same_over_time)
     scale = torch.ones(sample_shape, device=frames.device, dtype=torch.float32)
     if scale_frac > 0.0:
-        scale.uniform_(1.0 - scale_frac, 1.0 + scale_frac)
+        scale.uniform_(1.0 - scale_frac, 1.0 + scale_frac, generator=generator)
     scale = scale.expand(b, t)
 
     tx = torch.zeros(sample_shape, device=frames.device, dtype=torch.float32)
     ty = torch.zeros(sample_shape, device=frames.device, dtype=torch.float32)
     if translate_frac > 0.0:
-        tx.uniform_(-2.0 * translate_frac, 2.0 * translate_frac)
-        ty.uniform_(-2.0 * translate_frac, 2.0 * translate_frac)
+        tx.uniform_(-2.0 * translate_frac, 2.0 * translate_frac, generator=generator)
+        ty.uniform_(-2.0 * translate_frac, 2.0 * translate_frac, generator=generator)
     tx = tx.expand(b, t)
     ty = ty.expand(b, t)
 
@@ -122,7 +128,13 @@ def _spatial_jitter(frames: torch.Tensor, cfg: VideoAugmentConfig, *, same_over_
     return jittered.reshape(b, t, c, h, w).to(dtype=frames.dtype)
 
 
-def _edges_crop_blackout(frames: torch.Tensor, cfg: VideoAugmentConfig, *, same_over_time: bool) -> torch.Tensor:
+def _edges_crop_blackout(
+    frames: torch.Tensor,
+    cfg: VideoAugmentConfig,
+    *,
+    same_over_time: bool,
+    generator: Optional[torch.Generator] = None,
+) -> torch.Tensor:
     prob = float(cfg.aug_edges_crop_prob)
     min_frac = float(cfg.aug_edges_crop_min_frac)
     max_frac = float(cfg.aug_edges_crop_max_frac)
@@ -136,7 +148,9 @@ def _edges_crop_blackout(frames: torch.Tensor, cfg: VideoAugmentConfig, *, same_
         return frames
 
     sample_shape = _sample_time_shape(frames, same_over_time)
-    crop_frac = torch.empty(sample_shape, device=frames.device, dtype=torch.float32).uniform_(min_frac, max_frac)
+    crop_frac = torch.empty(sample_shape, device=frames.device, dtype=torch.float32).uniform_(
+        min_frac, max_frac, generator=generator
+    )
     edge_w = torch.clamp((crop_frac * float(w)).round().long(), min=1, max=max(1, w // 2))
     xx = torch.arange(w, device=frames.device).view(1, 1, 1, 1, w)
     keep = (xx >= edge_w.view(*sample_shape, 1, 1, 1)) & (xx < (w - edge_w).view(*sample_shape, 1, 1, 1))
@@ -144,11 +158,17 @@ def _edges_crop_blackout(frames: torch.Tensor, cfg: VideoAugmentConfig, *, same_
 
     if prob >= 1.0:
         return cropped
-    mask = (torch.rand((*sample_shape, 1, 1, 1), device=frames.device) < prob).to(dtype=torch.bool)
+    mask = (torch.rand((*sample_shape, 1, 1, 1), device=frames.device, generator=generator) < prob).to(dtype=torch.bool)
     return torch.where(mask, cropped, frames)
 
 
-def _cutout(frames: torch.Tensor, cfg: VideoAugmentConfig, *, same_over_time: bool) -> torch.Tensor:
+def _cutout(
+    frames: torch.Tensor,
+    cfg: VideoAugmentConfig,
+    *,
+    same_over_time: bool,
+    generator: Optional[torch.Generator] = None,
+) -> torch.Tensor:
     prob = float(cfg.aug_cutout_prob)
     min_frac = float(cfg.aug_cutout_min_frac)
     max_frac = float(cfg.aug_cutout_max_frac)
@@ -172,11 +192,13 @@ def _cutout(frames: torch.Tensor, cfg: VideoAugmentConfig, *, same_over_time: bo
     center_y1 = max(center_y0 + 1, h - edge_y)
 
     for _ in range(count):
-        active = (torch.rand(sample_shape, device=frames.device) < prob).view(*sample_shape, 1, 1, 1)
-        frac = torch.empty(sample_shape, device=frames.device, dtype=torch.float32).uniform_(min_frac, max_frac)
+        active = (torch.rand(sample_shape, device=frames.device, generator=generator) < prob).view(*sample_shape, 1, 1, 1)
+        frac = torch.empty(sample_shape, device=frames.device, dtype=torch.float32).uniform_(
+            min_frac, max_frac, generator=generator
+        )
         cut_h = torch.clamp((frac * float(h)).round().long(), min=1, max=h)
         cut_w = torch.clamp((frac * float(w)).round().long(), min=1, max=w)
-        band = torch.randint(0, 4, sample_shape, device=frames.device)
+        band = torch.randint(0, 4, sample_shape, device=frames.device, generator=generator)
 
         zeros = torch.zeros(sample_shape, device=frames.device, dtype=torch.long)
         full_w = torch.full(sample_shape, w, device=frames.device, dtype=torch.long)
@@ -198,8 +220,8 @@ def _cutout(frames: torch.Tensor, cfg: VideoAugmentConfig, *, same_over_time: bo
 
         span_x = (band_w - cut_w + 1).clamp(min=1)
         span_y = (band_h - cut_h + 1).clamp(min=1)
-        x0 = band_x0 + torch.floor(torch.rand(sample_shape, device=frames.device) * span_x.float()).long()
-        y0 = band_y0 + torch.floor(torch.rand(sample_shape, device=frames.device) * span_y.float()).long()
+        x0 = band_x0 + torch.floor(torch.rand(sample_shape, device=frames.device, generator=generator) * span_x.float()).long()
+        y0 = band_y0 + torch.floor(torch.rand(sample_shape, device=frames.device, generator=generator) * span_y.float()).long()
         x1 = x0 + cut_w
         y1 = y0 + cut_h
 
@@ -214,42 +236,58 @@ def _cutout(frames: torch.Tensor, cfg: VideoAugmentConfig, *, same_over_time: bo
     return out
 
 
-def augment_frames(frames: torch.Tensor, cfg: VideoAugmentConfig, *, same_over_time: bool = True) -> torch.Tensor:
-    """Video-safe training augmentations. No flips: those would require action remapping."""
+def augment_frames(
+    frames: torch.Tensor,
+    cfg: VideoAugmentConfig,
+    *,
+    same_over_time: bool = True,
+    generator: Optional[torch.Generator] = None,
+) -> torch.Tensor:
+    """Video-safe training augmentations. No flips: those would require action remapping.
+
+    Pass a generator re-seeded with the same value to draw identical transforms
+    across calls (used to keep augmentation constant across the chunks of a
+    streaming segment, so the carried ConvGRU state never sees the scene
+    appearance jump mid-episode).
+    """
     if not frames.is_floating_point():
         return frames
     device = frames.device
     sample_shape = _sample_time_shape(frames, same_over_time)
-    out = _spatial_jitter(frames, cfg, same_over_time=same_over_time)
-    out = _edges_crop_blackout(out, cfg, same_over_time=same_over_time)
+    out = _spatial_jitter(frames, cfg, same_over_time=same_over_time, generator=generator)
+    out = _edges_crop_blackout(out, cfg, same_over_time=same_over_time, generator=generator)
 
     if cfg.aug_contrast > 0.0:
         contrast = torch.empty((*sample_shape, 1, 1, 1), device=device, dtype=torch.float32).uniform_(
-            1.0 - float(cfg.aug_contrast), 1.0 + float(cfg.aug_contrast)
+            1.0 - float(cfg.aug_contrast), 1.0 + float(cfg.aug_contrast), generator=generator
         ).to(dtype=out.dtype)
         mean = out.mean(dim=(-1, -2), keepdim=True)
         out = (out - mean) * contrast + mean
 
     if cfg.aug_brightness > 0.0:
         gain = torch.empty((*sample_shape, 1, 1, 1), device=device, dtype=torch.float32).uniform_(
-            1.0 - float(cfg.aug_brightness), 1.0 + float(cfg.aug_brightness)
+            1.0 - float(cfg.aug_brightness), 1.0 + float(cfg.aug_brightness), generator=generator
         ).to(dtype=out.dtype)
         bias = torch.empty((*sample_shape, 1, 1, 1), device=device, dtype=torch.float32).uniform_(
-            -float(cfg.aug_brightness), float(cfg.aug_brightness)
+            -float(cfg.aug_brightness), float(cfg.aug_brightness), generator=generator
         ).to(dtype=out.dtype)
         out = out * gain + bias
 
     if cfg.aug_gray_prob > 0.0:
-        mask = (torch.rand((*sample_shape, 1, 1, 1), device=device) < float(cfg.aug_gray_prob)).to(dtype=torch.bool)
+        mask = (torch.rand((*sample_shape, 1, 1, 1), device=device, generator=generator) < float(cfg.aug_gray_prob)).to(
+            dtype=torch.bool
+        )
         gray = out.mean(dim=2, keepdim=True).expand_as(out)
         out = torch.where(mask, gray, out)
 
     if cfg.aug_noise_std > 0.0:
         noise_shape = (out.size(0), 1, *out.shape[2:]) if same_over_time else out.shape
-        noise = torch.randn(noise_shape, device=device, dtype=torch.float32) * float(cfg.aug_noise_std)
+        noise = torch.randn(noise_shape, device=device, dtype=torch.float32, generator=generator) * float(
+            cfg.aug_noise_std
+        )
         out = out + noise.to(dtype=out.dtype)
 
-    out = _cutout(out, cfg, same_over_time=same_over_time)
+    out = _cutout(out, cfg, same_over_time=same_over_time, generator=generator)
     return out.clamp_(0.0, 1.0)
 
 
