@@ -24,9 +24,6 @@ from inverse_dynamics import (  # noqa: E402
 from models import (  # noqa: E402
     ActionConditionedVideoPolicy,
     ModelConfig,
-    get_key_names as MODEL_GET_KEY_NAMES,
-    get_mouse_button_names as MODEL_GET_MOUSE_BUTTON_NAMES,
-    policy_checkpoint_family_mismatch_reason,
 )
 
 
@@ -113,34 +110,8 @@ class FFmpegWriter:
 
 
 def _coerce_config_types(cfg: ModelConfig) -> ModelConfig:
-    if cfg.key_names is None:
-        cfg.key_names = MODEL_GET_KEY_NAMES(cfg.selected_game)
-    else:
-        cfg.key_names = list(cfg.key_names)
-
-    if cfg.mouse_button_names is None:
-        cfg.mouse_button_names = MODEL_GET_MOUSE_BUTTON_NAMES(cfg.selected_game)
-    else:
-        cfg.mouse_button_names = list(cfg.mouse_button_names)
-
-    cfg.seq_len = int(cfg.seq_len)
-    cfg.train_seq_stride = int(cfg.train_seq_stride)
-    cfg.val_seq_stride = int(cfg.val_seq_stride)
-    cfg.model_size = int(cfg.model_size)
-    cfg.max_context = int(cfg.max_context)
-    cfg.local_context_frames = int(cfg.local_context_frames)
-    cfg.prediction_dt = float(cfg.prediction_dt)
-    cfg.require_pretrained_backbone = bool(cfg.require_pretrained_backbone)
-    cfg.num_bin = len(cfg.key_names) + len(cfg.mouse_button_names)
-    cfg.prev_action_dim = cfg.num_bin + 2
+    cfg.__post_init__()
     return cfg
-
-
-def _apply_config_overrides(cfg: ModelConfig, overrides: Dict) -> ModelConfig:
-    for key, value in overrides.items():
-        if hasattr(cfg, key):
-            setattr(cfg, key, value)
-    return _coerce_config_types(cfg)
 
 
 def _load_checkpoint_state(ckpt_path: str, device: torch.device):
@@ -156,6 +127,8 @@ def _extract_checkpoint_config(state) -> Dict:
 def _extract_model_state(state):
     if isinstance(state, dict) and "model_state" in state:
         return state["model_state"]
+    if isinstance(state, dict) and "model" in state:
+        return state["model"]
     return state
 
 
@@ -165,7 +138,17 @@ def _detect_checkpoint_kind(state) -> LoadedModelKind:
     policy_keys = {field.name for field in fields(ModelConfig)}
 
     inverse_markers = {"output_seq_len", "visual_encoder_name", "cnn_channels", "gru_hidden_size", "gru_layers"}
-    policy_markers = {"policy_model_family", "prev_action_dim", "future_horizons", "max_context", "token_count"}
+    policy_markers = {
+        "prediction_horizon",
+        "frame_spatial_pool",
+        "spatial_layers",
+        "spatial_heads",
+        "summary_tokens",
+        "temporal_heads",
+        "temporal_mlp_ratio",
+        "encode_chunk_size",
+        "max_context",
+    }
     if any(key in config_dict for key in inverse_markers):
         return "inverse"
     if any(key in config_dict for key in policy_markers):
@@ -180,9 +163,26 @@ def _detect_checkpoint_kind(state) -> LoadedModelKind:
 
     model_state = _extract_model_state(state)
     if isinstance(model_state, dict):
-        inverse_state_markers = ("visual_encoder.", "frame_projector.", "temporal_model.", "action_head.")
+        inverse_state_markers = (
+            "visual_encoder.",
+            "frame_projector.",
+            "temporal_model.",
+            "action_head.",
+            "frame_encoder.net.",
+            "mouse_active_head.",
+            "mouse_delta_head.",
+        )
         if any(str(key).startswith(inverse_state_markers) for key in model_state):
             return "inverse"
+        policy_state_markers = (
+            "frame_encoder.stage1.",
+            "frame_encoder.lateral4.",
+            "spatial_encoder.",
+            "dt_embed.",
+            "temporal.in_proj.",
+        )
+        if any(str(key).startswith(policy_state_markers) for key in model_state):
+            return "policy"
     return "policy"
 
 
@@ -198,6 +198,9 @@ def _find_latest_checkpoint(ckpt_dir: str) -> Optional[str]:
         best_ckpt = os.path.join(directory, "model_best.pt")
         if os.path.exists(best_ckpt):
             return best_ckpt
+        latest_ckpt = os.path.join(directory, "model_latest.pt")
+        if os.path.exists(latest_ckpt):
+            return latest_ckpt
         epoch_ckpts = glob.glob(os.path.join(directory, "model_epoch_*.pt"))
         if epoch_ckpts:
             epoch_ckpts.sort(key=os.path.getmtime)
@@ -214,9 +217,8 @@ def initialize_model_lazy_layers(
     model.eval()
     with torch.no_grad():
         dummy_frames = torch.zeros(1, 1, 3, cfg.model_size, cfg.model_size, device=device)
-        dummy_prev = torch.zeros(1, 1, cfg.prev_action_dim, device=device)
         dummy_dt = torch.full((1, 1), float(cfg.prediction_dt), device=device)
-        _ = model(dummy_frames, prev_actions=dummy_prev, dt=dummy_dt)
+        _ = model(dummy_frames, dt=dummy_dt)
     model.train(was_training)
 
 
@@ -225,14 +227,17 @@ def load_model_from_checkpoint(
     device: torch.device,
 ) -> Tuple[ActionConditionedVideoPolicy, ModelConfig]:
     state = _load_checkpoint_state(ckpt_path, device)
-    cfg = ModelConfig()
     config_dict = _extract_checkpoint_config(state)
-    family_reason = policy_checkpoint_family_mismatch_reason(config_dict)
-    if family_reason is not None:
-        raise RuntimeError(f"Cannot load policy checkpoint {ckpt_path}: {family_reason}")
+    if inverse_checkpoint_family_mismatch_reason(config_dict) is None:
+        raise RuntimeError(
+            f"Cannot load policy checkpoint {ckpt_path}: checkpoint looks like inverse-dynamics. "
+            "Use --model-kind inverse or --model-kind auto."
+        )
     if config_dict:
-        cfg = _apply_config_overrides(cfg, config_dict)
+        valid_keys = {field.name for field in fields(ModelConfig)}
+        cfg = ModelConfig(**{key: value for key, value in config_dict.items() if key in valid_keys})
     else:
+        cfg = ModelConfig()
         cfg = _coerce_config_types(cfg)
 
     model = ActionConditionedVideoPolicy(cfg=cfg).to(device)
@@ -268,9 +273,19 @@ def load_inverse_model_from_checkpoint(
         else:
             filtered["output_seq_len"] = int(filtered.get("seq_len", InverseDynamicsConfig().seq_len))
     cfg = InverseDynamicsConfig(**filtered)
-    if isinstance(state, dict) and "velocity_scales" in state:
-        cfg.mouse_velocity_scales = tuple(float(item) for item in state["velocity_scales"])
-        cfg.__post_init__()
+    if isinstance(state, dict):
+        needs_reinit = False
+        if "mouse_delta_scales" in state:
+            cfg.mouse_delta_scales = tuple(float(item) for item in state["mouse_delta_scales"])
+            needs_reinit = True
+        elif "velocity_scales" in state:
+            cfg.mouse_delta_scales = tuple(float(item) for item in state["velocity_scales"])
+            needs_reinit = True
+        if "scroll_delta_scales" in state:
+            cfg.scroll_delta_scales = tuple(float(item) for item in state["scroll_delta_scales"])
+            needs_reinit = True
+        if needs_reinit:
+            cfg.__post_init__()
 
     model = InverseDynamicsModel(cfg=cfg).to(device)
     initialize_inverse_lazy_layers(model, cfg, device)
@@ -301,17 +316,80 @@ def _compute_feature_map(
     x: torch.Tensor,
     layer: FeatureLayer,
 ) -> torch.Tensor:
-    x = model._normalize_frames(x)
-    x32, x16, x8 = model.backbone(x)
-    if layer == "x32":
-        return x32
-    if layer == "x16":
-        return x16
-    if layer == "x8":
-        return x8
-    if layer == "fused":
-        return model.fpn(x32, x16, x8)
+    if isinstance(model, ActionConditionedVideoPolicy):
+        return _compute_policy_feature_map(model, x, layer)
+    if isinstance(model, InverseDynamicsModel):
+        return _compute_inverse_feature_map(model, x, layer)
+    if hasattr(model, "frame_encoder") and hasattr(model, "spatial_encoder"):
+        return _compute_policy_feature_map(model, x, layer)  # type: ignore[arg-type]
+    if hasattr(model, "frame_encoder") and hasattr(model.frame_encoder, "net"):
+        return _compute_inverse_feature_map(model, x, layer)  # type: ignore[arg-type]
     raise ValueError(f"Unknown layer {layer!r}")
+
+
+def _compute_policy_feature_map(
+    model: ActionConditionedVideoPolicy,
+    x: torch.Tensor,
+    layer: FeatureLayer,
+) -> torch.Tensor:
+    if x.dim() != 4:
+        raise ValueError(f"Expected frame batch [B,3,H,W], got {tuple(x.shape)}.")
+    frames = model._normalize_frames(x)
+    motion = torch.zeros_like(frames)
+    edges = model._edge_channel(frames.unsqueeze(1))[:, 0]
+    conv_in = torch.cat([frames, motion, edges], dim=1)
+    if conv_in.is_cuda:
+        conv_in = conv_in.contiguous(memory_format=torch.channels_last)
+
+    encoder = model.frame_encoder
+    x1 = encoder.stage1(conv_in)
+    s2 = encoder.stage2(x1)
+    s3 = encoder.stage3(s2)
+    s4 = encoder.stage4(s3)
+    fused = encoder.post_fuse(s4 + encoder.lateral4(s2) + encoder.lateral8(s3))
+
+    if layer == "x8":
+        return s3
+    if layer in ("x16", "x32"):
+        return s4
+    if layer == "fused":
+        return fused
+    raise ValueError(f"Unknown layer {layer!r}")
+
+
+def _compute_inverse_feature_map(
+    model: InverseDynamicsModel,
+    x: torch.Tensor,
+    layer: FeatureLayer,
+) -> torch.Tensor:
+    if x.dim() != 4:
+        raise ValueError(f"Expected frame batch [B,3,H,W], got {tuple(x.shape)}.")
+    frames = x.float().clamp(0.0, 1.0)
+    frames = (frames * 2.0) - 1.0
+    motion = torch.zeros_like(frames)
+    conv_in = torch.cat([frames, motion], dim=1)
+    if conv_in.is_cuda:
+        conv_in = conv_in.contiguous(memory_format=torch.channels_last)
+
+    features_by_stride: Dict[int, torch.Tensor] = {}
+    feat = conv_in
+    in_h = max(1, int(conv_in.shape[-2]))
+    for block in model.frame_encoder.net:
+        feat = block(feat)
+        if feat.dim() == 4:
+            stride = max(1, int(round(in_h / max(1, int(feat.shape[-2])))))
+            features_by_stride[stride] = feat
+
+    if layer == "fused":
+        return feat
+    target_stride = {"x8": 8, "x16": 16, "x32": 32}.get(layer)
+    if target_stride is None:
+        raise ValueError(f"Unknown layer {layer!r}")
+    if not features_by_stride:
+        return feat
+    available = sorted(features_by_stride)
+    stride = min(available, key=lambda item: (abs(item - target_stride), item < target_stride))
+    return features_by_stride[stride]
 
 
 def _feature_heatmap_for_frame(
@@ -386,9 +464,17 @@ def process_video_cnn(
     ffmpeg_codec: str = "hevc_nvenc",
     ffmpeg_preset: str = "p4",
     ffmpeg_crf: int = 20,
+    start_frame_index: int = 0,
+    max_frames: Optional[int] = None,
 ) -> None:
     if not os.path.exists(input_path):
         raise FileNotFoundError(f"Input video not found: {input_path}")
+
+    start_frame_index = max(0, int(start_frame_index))
+    if max_frames is not None:
+        max_frames = int(max_frames)
+        if max_frames < 1:
+            raise ValueError(f"max_frames must be at least 1 when set, got {max_frames}.")
 
     cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
@@ -399,6 +485,14 @@ def process_video_cnn(
         fps = 30.0
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if total_frames > 0 and start_frame_index >= total_frames:
+        cap.release()
+        raise ValueError(
+            f"start_frame_index={start_frame_index} is outside video with {total_frames} frames."
+        )
+    if start_frame_index > 0:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame_index)
 
     out_w = width
     if mode == "side_by_side":
@@ -419,11 +513,21 @@ def process_video_cnn(
         quality=int(ffmpeg_crf),
     )
 
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    pbar = tqdm(total=max(0, total_frames), desc=f"CNN vis [{model_kind}] ({layer}, {mode})")
+    if total_frames > 0:
+        remaining_frames: Optional[int] = max(0, total_frames - start_frame_index)
+    else:
+        remaining_frames = None
+    if max_frames is not None:
+        progress_total = min(remaining_frames, max_frames) if remaining_frames is not None else max_frames
+    else:
+        progress_total = remaining_frames
+
+    pbar = tqdm(total=progress_total, desc=f"CNN vis [{model_kind}] ({layer}, {mode})")
     frame_idx = 0
     try:
         while True:
+            if max_frames is not None and frame_idx >= max_frames:
+                break
             ret, frame = cap.read()
             if not ret:
                 break
@@ -462,30 +566,30 @@ def process_video_cnn(
         writer.release()
         cap.release()
 
-    print(f"[CNN] Done. Wrote {frame_idx} frames to {output_path}")
+    print(f"[CNN] Done. Wrote {frame_idx} frames starting at source frame {start_frame_index} to {output_path}")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Visualize CNN/FPN feature maps from policy or inverse checkpoints.")
-    parser.add_argument("--input", default=None, help="Input video path. Defaults to the newest run in cfg.data_root.")
+    parser.add_argument("--input", default=r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\data\greenville\run_20260526_180139.mp4', help="Input video path. Defaults to the newest run in cfg.data_root.")
     parser.add_argument("--output", default=None, help="Output video path (.mp4). Default auto-names next to input.")
     parser.add_argument(
         "--model-kind",
         choices=["auto", "policy", "inverse"],
-        default="inverse",
+        default="auto",
         help="Checkpoint type. Default auto-detects from the checkpoint config/state dict.",
     )
     parser.add_argument(
         "--ckpt-path",
-        default=r"C:\Users\Abhil\Desktop\vs_code_stuff\python\ai\checkpoints_idm\model_epoch_27.pt",
+        default=None,
         help="Checkpoint path. If omitted, auto-select from --ckpt-dir.",
     )
     parser.add_argument(
         "--ckpt-dir",
-        default="C:/Users/Abhil/Desktop/vs_code_stuff/python/ai/checkpoints_rt",
+        default="./checkpoints_rt",
         help="Checkpoint directory used when --ckpt-path is omitted.",
     )
-    parser.add_argument("--layer", choices=["x32", "x16", "x8", "fused"], default="fused")
+    parser.add_argument("--layer", choices=["x32", "x16", "x8", "fused"], default="x32")
     parser.add_argument("--mode", choices=["heat", "overlay", "side_by_side", "triple"], default="side_by_side")
     parser.add_argument("--alpha", type=float, default=0.5, help="Overlay blend factor.")
     parser.add_argument(
@@ -497,6 +601,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--q-low", type=float, default=0.05)
     parser.add_argument("--q-high", type=float, default=0.95)
     parser.add_argument("--gamma", type=float, default=0.75)
+    parser.add_argument(
+        "--start-frame-index",
+        type=int,
+        default=0,
+        help="Zero-based source frame index to start visualizing from.",
+    )
+    parser.add_argument(
+        "--max-frames",
+        type=int,
+        default=4000,
+        help="Maximum number of frames to visualize after --start-frame-index. Default processes all remaining frames.",
+    )
     parser.add_argument("--no-robust-norm", action="store_true", help="Use min/max normalization instead of quantiles.")
     parser.add_argument("--fp16", action="store_true", help="Use fp16 autocast on CUDA instead of bf16.")
     parser.add_argument("--no-amp", action="store_true", help="Disable autocast during encoder inference.")
@@ -516,6 +632,10 @@ def main() -> None:
     if ckpt_path is None:
         raise FileNotFoundError(
             f"No checkpoint found. Set --ckpt-path or provide a valid --ckpt-dir (got {args.ckpt_dir!r})."
+        )
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(
+            f"Checkpoint not found: {ckpt_path}. Omit --ckpt-path to auto-select from --ckpt-dir."
         )
     print(f"Loading checkpoint: {ckpt_path}")
 
@@ -559,6 +679,8 @@ def main() -> None:
         ffmpeg_codec=str(args.ffmpeg_codec),
         ffmpeg_preset=str(args.ffmpeg_preset),
         ffmpeg_crf=int(args.ffmpeg_crf),
+        start_frame_index=int(args.start_frame_index),
+        max_frames=None if args.max_frames is None else int(args.max_frames),
     )
 
 

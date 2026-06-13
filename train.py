@@ -92,7 +92,7 @@ class TrainConfig(ModelConfig):
     dataset_sync_delete_stale: Optional[bool] = None
     dataset_sync_hash_same_size: bool = True
 
-    resume: bool = False
+    resume: bool = True
     resume_path: Optional[str] = None
     ckpt_dir: str = "./checkpoints_rt"
     save_every: int = 1
