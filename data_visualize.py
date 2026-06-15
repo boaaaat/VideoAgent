@@ -360,7 +360,7 @@ def main() -> int:
     parser.add_argument(
         "--video",
         help="Path to the video file.",
-        default=r'C:\Users\Abhil\Desktop\vs_code_stuff\python\ai\data\greenville\run_20260518_153515.mp4',
+        default=r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\data\greenville\run_20260615_125949.mp4',
     )
     parser.add_argument(
         "--csv",
@@ -388,13 +388,13 @@ def main() -> int:
     parser.add_argument(
         "--command-horizon",
         type=int,
-        default=10,
+        default=1,
         help="1-based horizon head to visualize when --prediction-horizon is omitted.",
     )
     parser.add_argument(
         "--action-label-offset",
         type=int,
-        default=0,
+        default=-1,
         help="Same offset used by train.py. Target idx = frame + frame_offset + label_offset.",
     )
     parser.add_argument(

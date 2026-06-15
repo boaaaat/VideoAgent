@@ -135,13 +135,13 @@ class TrainConfig(ModelConfig):
     streaming_state_validation: bool = True
     streaming_segment_min_chunks: int = 2
     streaming_segment_max_chunks: int = 20
-    action_label_offset: int = 0
+    action_label_offset: int = 1
     # New runs train WITHOUT last-action input: with it, the +1 head collapses
     # into copying prev_action (causal confusion) and never learns transitions.
-    last_action_conditioning: bool = False
-    last_action_sequence_dropout: float = 0.2
+    last_action_conditioning: bool = True
+    last_action_sequence_dropout: float = 0.05
     last_action_key_dropout: float = 0.4
-    last_action_corruption_prob: float = 0.05
+    last_action_corruption_prob: float = 0.0
     skipped_key_names: Optional[Sequence[str]] = ("e", "q", "c", "z")
     button_label_smoothing: float = 0.05
     # Extra BCE weight on frames where a key changes state. Transitions are
@@ -152,12 +152,12 @@ class TrainConfig(ModelConfig):
     aug_contrast: float = 0.20
     aug_noise_std: float = 0.01
     aug_gray_prob: float = 0.05
-    aug_translate_frac: float = 0.02
-    aug_scale_frac: float = 0.03
-    aug_edges_crop_prob: float = 0.25
+    aug_translate_frac: float = 0.0
+    aug_scale_frac: float = 0.0
+    aug_edges_crop_prob: float = 0.0
     aug_edges_crop_min_frac: float = 0.02
     aug_edges_crop_max_frac: float = 0.06
-    aug_cutout_prob: float = 0.5
+    aug_cutout_prob: float = 0.0
     aug_cutout_min_frac: float = 0.04
     aug_cutout_max_frac: float = 0.12
     aug_cutout_count: int = 2
