@@ -4,6 +4,7 @@ from typing import List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from action_space import (
     game_data_root,
@@ -16,13 +17,14 @@ from action_space import (
 
 SPATIAL_FEATURE_CHANNELS = 128
 TEMPORAL_HIDDEN_CHANNELS = 128
-POLICY_INPUT_CHANNELS = 3
+POLICY_INPUT_CHANNELS = 6
 TEMPORAL_RNN_LAYERS = 1
 KEYPOINT_HEATMAP_CHANNELS = 32
+FPN_FUSION_CHANNELS = 128
 GRU_MEMORY_MIN_FRAMES = 2.0
 GRU_MEMORY_MAX_FRAMES = 40.0
 LAST_ACTION_EMBEDDING_DROPOUT = 0.25
-DEFAULT_HORIZON_OFFSETS = (1, 2, 3, 5, 7, 10)
+DEFAULT_PREDICTION_OFFSET = 1
 
 
 def _require_int_at_least(name: str, value: object, minimum: int) -> int:
@@ -51,15 +53,20 @@ def _require_float_range(name: str, value: object, minimum: float, maximum: floa
     return result
 
 
-def _default_horizon_offsets(prediction_horizon: int) -> Tuple[int, ...]:
+def _single_prediction_offset(prediction_horizon: int, offsets: Optional[Sequence[int]]) -> Tuple[int, ...]:
     horizon = int(prediction_horizon)
-    if horizon > len(DEFAULT_HORIZON_OFFSETS):
-        raise ValueError(
-            "prediction_horizon exceeds the default horizon offsets. "
-            f"Provide explicit prediction_horizon_offsets for horizon={horizon}; "
-            f"defaults support up to {len(DEFAULT_HORIZON_OFFSETS)}."
-        )
-    return tuple(DEFAULT_HORIZON_OFFSETS[:horizon])
+    if offsets is None:
+        if horizon != 1:
+            raise ValueError("This policy is single-horizon only; prediction_horizon must be 1.")
+        return (DEFAULT_PREDICTION_OFFSET,)
+
+    parsed = tuple(
+        _require_int_at_least(f"prediction_horizon_offsets[{idx}]", offset, 1)
+        for idx, offset in enumerate(offsets)
+    )
+    if len(parsed) != 1:
+        raise ValueError(f"This policy is single-horizon only; provide exactly one offset, got {parsed}.")
+    return parsed
 
 
 @dataclass
@@ -73,7 +80,7 @@ class ModelConfig:
     seq_len: int = 80
     train_seq_stride: int = 20
     val_seq_stride: int = 80
-    prediction_horizon: int = 6
+    prediction_horizon: int = 1
     prediction_horizon_offsets: Optional[Sequence[int]] = None
 
     key_names: Optional[List[str]] = None
@@ -103,19 +110,11 @@ class ModelConfig:
         self.train_seq_stride = _require_int_at_least("train_seq_stride", self.train_seq_stride, 1)
         self.val_seq_stride = _require_int_at_least("val_seq_stride", self.val_seq_stride, 1)
         self.prediction_horizon = _require_int_at_least("prediction_horizon", self.prediction_horizon, 1)
-        if self.prediction_horizon_offsets is None:
-            self.prediction_horizon_offsets = _default_horizon_offsets(self.prediction_horizon)
-        else:
-            offsets = tuple(
-                _require_int_at_least(f"prediction_horizon_offsets[{idx}]", offset, 1)
-                for idx, offset in enumerate(self.prediction_horizon_offsets)
-            )
-            if not offsets:
-                raise ValueError("prediction_horizon_offsets must contain at least one frame offset.")
-            if any(curr <= prev for prev, curr in zip(offsets, offsets[1:])):
-                raise ValueError(f"prediction_horizon_offsets must be strictly increasing, got {offsets}.")
-            self.prediction_horizon_offsets = offsets
-            self.prediction_horizon = len(offsets)
+        self.prediction_horizon_offsets = _single_prediction_offset(
+            self.prediction_horizon,
+            self.prediction_horizon_offsets,
+        )
+        self.prediction_horizon = 1
 
         self.d_model = _require_int_at_least("d_model", self.d_model, 64)
         if self.d_model % 4 != 0:
@@ -161,12 +160,12 @@ class ModelConfig:
 @dataclass
 class PolicyOutput:
     button_logits: torch.Tensor
-    horizon_button_logits: torch.Tensor
 
 
 @dataclass
 class TemporalState:
     hidden_state: Optional[torch.Tensor] = None
+    prev_frame: Optional[torch.Tensor] = None
 
 
 class ResidualBlock(nn.Module):
@@ -192,9 +191,9 @@ class ResidualBlock(nn.Module):
 
 class CustomSpatialEncoder(nn.Module):
     """
-    GroupNorm residual CNN encoder.
-    Full-capacity stages at H/4 (64x64) and H/8 (32x32) encode fine lane-line and
-    edge detail; the output grid is [B, SPATIAL_FEATURE_CHANNELS, H/16, W/16].
+    GroupNorm residual CNN encoder with a compact FPN-style fusion neck.
+    It keeps H/4, H/8, and H/16 feature stages, then fuses them into an H/8
+    grid so lane and curb geometry is not forced through a 16x16 bottleneck.
     GroupNorm keeps statistics batch-independent (training runs at batch_size=1).
     """
     def __init__(self, in_channels: int = 3, dropout: float = 0.2):
@@ -217,6 +216,7 @@ class CustomSpatialEncoder(nn.Module):
             nn.SiLU(inplace=True),
             ResidualBlock(96, dropout),
             ResidualBlock(96, dropout),
+            ResidualBlock(96, dropout),
         )
         self.stage3 = nn.Sequential(
             nn.Conv2d(96, SPATIAL_FEATURE_CHANNELS, kernel_size=3, stride=2, padding=1, bias=False),  # /16
@@ -225,16 +225,61 @@ class CustomSpatialEncoder(nn.Module):
             ResidualBlock(SPATIAL_FEATURE_CHANNELS, dropout),
             ResidualBlock(SPATIAL_FEATURE_CHANNELS, dropout),
         )
+        self.fpn_64_to_32 = nn.Sequential(
+            nn.Conv2d(64, FPN_FUSION_CHANNELS, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.GroupNorm(8, FPN_FUSION_CHANNELS),
+            nn.SiLU(inplace=True),
+        )
+        self.fpn_32 = nn.Sequential(
+            nn.Conv2d(96, FPN_FUSION_CHANNELS, kernel_size=1, bias=False),
+            nn.GroupNorm(8, FPN_FUSION_CHANNELS),
+            nn.SiLU(inplace=True),
+            ResidualBlock(FPN_FUSION_CHANNELS, dropout),
+            ResidualBlock(FPN_FUSION_CHANNELS, dropout),
+        )
+        self.fpn_16 = nn.Sequential(
+            nn.Conv2d(SPATIAL_FEATURE_CHANNELS, FPN_FUSION_CHANNELS, kernel_size=1, bias=False),
+            nn.GroupNorm(8, FPN_FUSION_CHANNELS),
+            nn.SiLU(inplace=True),
+        )
+        self.fpn_refine = nn.Sequential(
+            nn.Conv2d(FPN_FUSION_CHANNELS * 3, FPN_FUSION_CHANNELS, kernel_size=1, bias=False),
+            nn.GroupNorm(8, FPN_FUSION_CHANNELS),
+            nn.SiLU(inplace=True),
+            ResidualBlock(FPN_FUSION_CHANNELS, dropout),
+            ResidualBlock(FPN_FUSION_CHANNELS, dropout),
+        )
+
+    def _fuse_stages(
+        self,
+        stage1: torch.Tensor,
+        stage2: torch.Tensor,
+        stage3: torch.Tensor,
+    ) -> torch.Tensor:
+        stage1_32 = self.fpn_64_to_32(stage1)
+        stage2_32 = self.fpn_32(stage2)
+        stage3_32 = F.interpolate(
+            self.fpn_16(stage3),
+            size=stage2_32.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+        return self.fpn_refine(torch.cat([stage1_32, stage2_32, stage3_32], dim=1))
 
     def feature_stages(self, x: torch.Tensor) -> List[torch.Tensor]:
         stem = self.stem(x)
         stage1 = self.stage1(stem)
         stage2 = self.stage2(stage1)
         stage3 = self.stage3(stage2)
-        return [stem, stage1, stage2, stage3]
+        fused = self._fuse_stages(stage1, stage2, stage3)
+        return [stage1, stage2, stage3, fused]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.stage3(self.stage2(self.stage1(self.stem(x))))
+        stem = self.stem(x)
+        stage1 = self.stage1(stem)
+        stage2 = self.stage2(stage1)
+        stage3 = self.stage3(stage2)
+        return self._fuse_stages(stage1, stage2, stage3)
 
 
 def apply_static_masks(frames: torch.Tensor) -> torch.Tensor:
@@ -384,17 +429,17 @@ class DrivingVideoPolicy(nn.Module):
             nn.ELU(inplace=True),
         )
 
-        horizon_hidden = max(128, self.cfg.d_model)
+        head_hidden = max(128, self.cfg.d_model)
         self.button_head = nn.Sequential(
             nn.LayerNorm(self.cfg.d_model),
-            nn.Linear(self.cfg.d_model, horizon_hidden),
+            nn.Linear(self.cfg.d_model, head_hidden),
             nn.SiLU(inplace=True),
             nn.Dropout(cfg.head_dropout * 0.5),
-            nn.Linear(horizon_hidden, self.cfg.prediction_horizon * self.cfg.num_bin),
+            nn.Linear(head_hidden, self.cfg.num_bin),
         )
-        final_button_layer = self.button_head[-1]
-        if isinstance(final_button_layer, nn.Linear):
-            nn.init.constant_(final_button_layer.bias, -1.0)
+        output_layer = self.button_head[-1]
+        if isinstance(output_layer, nn.Linear):
+            nn.init.constant_(output_layer.bias, -1.0)
 
     def _initial_temporal_state(
         self,
@@ -470,11 +515,10 @@ class DrivingVideoPolicy(nn.Module):
         context = fused.mean(dim=(-2, -1))
         return self.fc_features(torch.cat([keypoints, context], dim=1))
 
-    def _horizon_button_logits(self, features: torch.Tensor) -> torch.Tensor:
+    def _button_logits(self, features: torch.Tensor) -> torch.Tensor:
         if features.size(-1) != self.cfg.d_model:
             raise ValueError(f"Expected final feature dim {self.cfg.d_model}, got {features.size(-1)}.")
-        logits = self.button_head(features)
-        return logits.reshape(*features.shape[:-1], self.cfg.prediction_horizon, self.cfg.num_bin)
+        return self.button_head(features)
 
     def _normalize_frames(self, frames: torch.Tensor) -> torch.Tensor:
         if frames.dtype == torch.uint8:
@@ -519,6 +563,56 @@ class DrivingVideoPolicy(nn.Module):
     def _apply_masks(self, frames: torch.Tensor) -> torch.Tensor:
         return apply_static_masks(frames)
 
+    def _previous_frame_from_state(
+        self,
+        state: Optional[TemporalState],
+        expected_shape: Tuple[int, int, int, int],
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        if state is None or state.prev_frame is None:
+            return None
+        previous = state.prev_frame.to(device=device, dtype=dtype)
+        if tuple(previous.shape) != expected_shape:
+            raise ValueError(f"Expected previous frame shape {expected_shape}, got {tuple(previous.shape)}.")
+        return previous
+
+    def _frames_with_motion(
+        self,
+        frames: torch.Tensor,
+        state: Optional[TemporalState],
+    ) -> torch.Tensor:
+        b, t, c, h, w = frames.shape
+        previous_first = self._previous_frame_from_state(
+            state,
+            (b, c, h, w),
+            device=frames.device,
+            dtype=frames.dtype,
+        )
+        if previous_first is None:
+            previous_first = frames[:, 0]
+        previous_first = previous_first.unsqueeze(1)
+        previous = previous_first if t == 1 else torch.cat([previous_first, frames[:, :-1]], dim=1)
+        motion = frames - previous
+        return torch.cat([frames, motion], dim=2)
+
+    def _frame_with_motion(
+        self,
+        frame: torch.Tensor,
+        state: Optional[TemporalState],
+    ) -> torch.Tensor:
+        previous = self._previous_frame_from_state(
+            state,
+            tuple(frame.shape),
+            device=frame.device,
+            dtype=frame.dtype,
+        )
+        if previous is None:
+            previous = frame
+        motion = frame - previous
+        return torch.cat([frame, motion], dim=1)
+
     def forward(
         self,
         frames: torch.Tensor,
@@ -534,9 +628,10 @@ class DrivingVideoPolicy(nn.Module):
 
         frames = self._normalize_frames(frames)
         frames = self._apply_masks(frames)
+        model_input = self._frames_with_motion(frames, state)
 
         # 1. Spatial Processing
-        x = frames.reshape(b * t, POLICY_INPUT_CHANNELS, h, w)
+        x = model_input.reshape(b * t, POLICY_INPUT_CHANNELS, h, w)
         if x.is_cuda:
             x = x.contiguous(memory_format=torch.channels_last)
         spatial_feats = self.spatial_encoder(x)
@@ -569,15 +664,11 @@ class DrivingVideoPolicy(nn.Module):
             fc_out = self.head_fusion(visual_feat)
 
         # 4. Action Mapping Prediction
-        button = self._horizon_button_logits(fc_out)
-
-        step_button = button[:, :, 0]
         output = PolicyOutput(
-            button_logits=step_button,
-            horizon_button_logits=button,
+            button_logits=self._button_logits(fc_out),
         )
         if return_aux:
-            return output, TemporalState(hidden_state=h_t.detach())
+            return output, TemporalState(hidden_state=h_t.detach(), prev_frame=frames[:, -1].detach())
         return output
 
     def forward_step(
@@ -593,9 +684,10 @@ class DrivingVideoPolicy(nn.Module):
         # 1. Normalize and mask out the car layout exactly once
         frame_norm = self._normalize_frames(frame)
         masked_frame = self._apply_masks(frame_norm)
+        model_input = self._frame_with_motion(masked_frame, state)
 
         # 2. Extract spatial primitives
-        x = masked_frame
+        x = model_input
         if x.is_cuda:
             x = x.contiguous(memory_format=torch.channels_last)
         spatial_feat = self.spatial_encoder(x)
@@ -626,13 +718,10 @@ class DrivingVideoPolicy(nn.Module):
             fc_out = self.head_fusion(visual_feat)
 
         # 5. Project to action space values
-        button = self._horizon_button_logits(fc_out)
-
         squeezed = PolicyOutput(
-            button_logits=button[:, 0],
-            horizon_button_logits=button,
+            button_logits=self._button_logits(fc_out),
         )
 
         # 6. Detach hidden state to prevent backpropagation graph memory leaks
-        new_state = TemporalState(hidden_state=new_hidden.detach())
+        new_state = TemporalState(hidden_state=new_hidden.detach(), prev_frame=masked_frame.detach())
         return squeezed, new_state

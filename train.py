@@ -36,6 +36,9 @@ from models import (
 )
 
 
+CONFLICTING_BUTTON_PAIRS = (("w", "s"), ("a", "d"))
+
+
 def _require_bool(name: str, value: object) -> bool:
     if not isinstance(value, bool):
         raise ValueError(f"{name} must be a bool, got {value!r}.")
@@ -125,7 +128,9 @@ class TrainConfig(ModelConfig):
     eval_ckpt: Optional[str] = None
 
     button_loss_weight: float = 1.0
-    conflicting_button_loss_weight: float = 0.03
+    # Keep binary heads, but make impossible driving chords costly enough to
+    # matter during training.
+    conflicting_button_loss_weight: float = 0.20
     streaming_state_training: bool = True
     streaming_state_validation: bool = True
     streaming_segment_min_chunks: int = 2
@@ -176,7 +181,7 @@ class TrainConfig(ModelConfig):
 
     resume: bool = True
     resume_path: Optional[str] = None
-    ckpt_dir: str = "./checkpoints_rt"
+    ckpt_dir: str = "./checkpoints_rt_1h"
     save_every: int = 1
     print_every: int = 20
     max_train_batches: Optional[int] = None
@@ -365,8 +370,8 @@ class TrainConfig(ModelConfig):
 
 @dataclass
 class WindowTargets:
-    button_horizon: torch.Tensor
-    horizon_valid: torch.Tensor
+    button_target: torch.Tensor
+    target_valid: torch.Tensor
     last_action: torch.Tensor
     # 1.0 where the labelled key state differs from the true previous frame
     # (computed from the full CSV, so chunk-boundary flips at frame 0 count).
@@ -374,7 +379,7 @@ class WindowTargets:
     meta: Optional[List[Tuple[str, int, int]]] = None
 
 
-StreamingStateCache = Dict[str, Dict[int, torch.Tensor]]
+StreamingStateCache = Dict[str, Dict[int, TemporalState]]
 
 
 @dataclass
@@ -619,8 +624,7 @@ def build_window_targets(
     transition_windows: List[np.ndarray] = []
     meta: List[Tuple[str, int, int]] = []
 
-    horizon_offsets = tuple(int(offset) for offset in cfg.prediction_horizon_offsets)
-    horizon = len(horizon_offsets)
+    prediction_offset = int(tuple(cfg.prediction_horizon_offsets)[0])
     for video_path, csv_path in pairs:
         run = load_run_arrays(csv_path, cfg)
         buttons = run["buttons"]
@@ -630,27 +634,26 @@ def build_window_targets(
         max_start = buttons.shape[0] - cfg.seq_len
         for start in range(0, max_start + 1, stride):
             end = start + cfg.seq_len
-            button_target = np.zeros((cfg.seq_len, horizon, cfg.num_bin), dtype=np.float32)
-            valid_target = np.zeros((cfg.seq_len, horizon), dtype=np.float32)
+            button_target = np.zeros((cfg.seq_len, cfg.num_bin), dtype=np.float32)
+            valid_target = np.zeros((cfg.seq_len,), dtype=np.float32)
             last_action = np.zeros((cfg.seq_len, cfg.num_bin), dtype=np.float32)
-            transition_target = np.zeros((cfg.seq_len, horizon, cfg.num_bin), dtype=np.float32)
+            transition_target = np.zeros((cfg.seq_len, cfg.num_bin), dtype=np.float32)
 
             frame_indices = np.arange(start, end)
             context_indices = frame_indices + int(cfg.action_label_offset)
             context_valid = (context_indices >= 0) & (context_indices < buttons.shape[0])
             if np.any(context_valid):
                 last_action[context_valid] = buttons[context_indices[context_valid]]
-            for horizon_idx, horizon_offset in enumerate(horizon_offsets):
-                target_indices = frame_indices + horizon_offset + int(cfg.action_label_offset)
-                prev_indices = target_indices - 1
-                valid = (target_indices >= 0) & (target_indices < buttons.shape[0]) & (prev_indices >= 0)
-                if np.any(valid):
-                    valid_target_indices = target_indices[valid]
-                    button_target[valid, horizon_idx] = buttons[valid_target_indices]
-                    transition_target[valid, horizon_idx] = (
-                        buttons[valid_target_indices] != buttons[prev_indices[valid]]
-                    ).astype(np.float32)
-                    valid_target[valid, horizon_idx] = 1.0
+            target_indices = frame_indices + prediction_offset + int(cfg.action_label_offset)
+            prev_indices = target_indices - 1
+            valid = (target_indices >= 0) & (target_indices < buttons.shape[0]) & (prev_indices >= 0)
+            if np.any(valid):
+                valid_target_indices = target_indices[valid]
+                button_target[valid] = buttons[valid_target_indices]
+                transition_target[valid] = (
+                    buttons[valid_target_indices] != buttons[prev_indices[valid]]
+                ).astype(np.float32)
+                valid_target[valid] = 1.0
 
             button_windows.append(button_target)
             valid_windows.append(valid_target)
@@ -666,8 +669,8 @@ def build_window_targets(
         return torch.from_numpy(np.stack(items, axis=0)).float()
 
     return WindowTargets(
-        button_horizon=stack(button_windows),
-        horizon_valid=stack(valid_windows),
+        button_target=stack(button_windows),
+        target_valid=stack(valid_windows),
         last_action=stack(last_action_windows),
         button_transition=stack(transition_windows),
         meta=meta if return_meta else None,
@@ -908,8 +911,8 @@ def compute_pos_weight(
 
 
 def supervised_start_frame(seq_len: int) -> int:
-    seq_len = _require_int_at_least("seq_len", seq_len, 1)
-    return seq_len // 4
+    _require_int_at_least("seq_len", seq_len, 1)
+    return 0
 
 
 def supervised_frame_range(seq_len: int) -> Tuple[int, int]:
@@ -917,7 +920,7 @@ def supervised_frame_range(seq_len: int) -> Tuple[int, int]:
     return supervised_start_frame(seq_len), seq_len
 
 
-def second_half_only(valid: torch.Tensor) -> torch.Tensor:
+def supervised_frames_only(valid: torch.Tensor) -> torch.Tensor:
     if valid.dim() < 2:
         raise ValueError(f"Expected a time dimension in valid mask, got shape {tuple(valid.shape)}")
     time = torch.arange(valid.size(1), device=valid.device) >= supervised_start_frame(valid.size(1))
@@ -930,20 +933,19 @@ def second_half_only(valid: torch.Tensor) -> torch.Tensor:
 
 
 def warmup_masked_valid(valid: torch.Tensor, fresh_state: Optional[torch.Tensor]) -> torch.Tensor:
-    """Warmup-mask only samples that started from a zero hidden state.
+    """Return the valid mask for supervised frames.
 
-    Chunks that inherited a carried ConvGRU state have full temporal context
-    from frame 0; masking their early frames would delete exactly the
-    supervision that rewards carrying useful state across chunk boundaries.
+    All frames are supervised; fresh_state is retained for shape validation and
+    compatibility with the streaming-state call sites.
     """
     if fresh_state is None:
-        return second_half_only(valid)
+        return supervised_frames_only(valid)
     if fresh_state.dim() != 1 or int(fresh_state.size(0)) != int(valid.size(0)):
         raise ValueError(
             f"Expected fresh_state shape [{int(valid.size(0))}], got {tuple(fresh_state.shape)}."
         )
     fresh = fresh_state.to(device=valid.device, dtype=torch.bool).view(-1, *([1] * (valid.dim() - 1)))
-    return torch.where(fresh, second_half_only(valid), valid)
+    return torch.where(fresh, supervised_frames_only(valid), valid)
 
 
 def decision_thresholds_from_pos_weight(pos_weight: torch.Tensor, cfg: TrainConfig) -> torch.Tensor:
@@ -996,8 +998,8 @@ def resolve_amp_settings(amp: str) -> Tuple[torch.dtype, bool, bool]:
 
 def move_bundle_to_device(bundle: WindowTargets, device: torch.device) -> WindowTargets:
     return WindowTargets(
-        button_horizon=bundle.button_horizon.to(device, non_blocking=True),
-        horizon_valid=bundle.horizon_valid.to(device, non_blocking=True),
+        button_target=bundle.button_target.to(device, non_blocking=True),
+        target_valid=bundle.target_valid.to(device, non_blocking=True),
         last_action=bundle.last_action.to(device, non_blocking=True),
         button_transition=(
             None if bundle.button_transition is None else bundle.button_transition.to(device, non_blocking=True)
@@ -1018,10 +1020,9 @@ def conflicting_button_loss(
 ) -> torch.Tensor:
     if float(cfg.conflicting_button_loss_weight) <= 0.0:
         return button_logits.new_zeros(())
-    pairs = (("w", "s"), ("a", "d"))
     probs = torch.sigmoid(button_logits)
     conflicts: List[torch.Tensor] = []
-    for first, second in pairs:
+    for first, second in CONFLICTING_BUTTON_PAIRS:
         first_idx = action_index(cfg, first)
         second_idx = action_index(cfg, second)
         if first_idx is not None and second_idx is not None:
@@ -1029,7 +1030,7 @@ def conflicting_button_loss(
     if not conflicts:
         return button_logits.new_zeros(())
 
-    pair_conflict = torch.stack(conflicts, dim=-1).mean(dim=-1)
+    pair_conflict = torch.stack(conflicts, dim=-1).sum(dim=-1)
     weight = loss_weight.squeeze(-1)
     return (pair_conflict * weight).sum() / weight.sum().clamp(min=1.0)
 
@@ -1042,32 +1043,20 @@ def compute_losses(
     button_pos_weight: torch.Tensor,
     fresh_state_mask: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    valid = warmup_masked_valid(targets.horizon_valid, fresh_state_mask).float()
-    valid_4d = valid.unsqueeze(-1)
-    button_target = targets.button_horizon.float()
+    valid = warmup_masked_valid(targets.target_valid, fresh_state_mask).float()
+    valid_weight = valid.unsqueeze(-1)
+    button_target = targets.button_target.float()
     if float(cfg.button_label_smoothing) > 0.0:
         eps = float(cfg.button_label_smoothing)
         button_target = button_target * (1.0 - eps) + 0.5 * eps
-    button_logits = output.horizon_button_logits.float()
+    button_logits = output.button_logits.float()
     button_loss_raw = F.binary_cross_entropy_with_logits(
         button_logits,
         button_target,
-        pos_weight=button_pos_weight.view(1, 1, 1, -1).float(),
+        pos_weight=button_pos_weight.view(1, 1, -1).float(),
         reduction="none",
     )
-    loss_weight = valid_4d
-    horizon_count = int(button_logits.size(2))
-    if horizon_count > 1:
-        # run.py only actuates the +1 head, so it gets the largest weight; the
-        # far horizons stay as anticipation auxiliaries, not the main objective.
-        horizon_weight = torch.linspace(
-            1.5,
-            0.5,
-            horizon_count,
-            device=button_logits.device,
-            dtype=button_logits.dtype,
-        ).view(1, 1, horizon_count, 1)
-        loss_weight = loss_weight * horizon_weight
+    loss_weight = valid_weight
     if float(cfg.transition_loss_weight) > 1.0:
         # Per-key upweight where the label flips vs the previous frame; the
         # weighted mean keeps the loss scale stable as the weight changes.
@@ -1076,7 +1065,7 @@ def compute_losses(
             # now supervised on carried-state chunks) are upweighted too.
             transition = targets.button_transition > 0.5
         else:
-            raw_labels = targets.button_horizon > 0.5
+            raw_labels = targets.button_target > 0.5
             transition = torch.zeros_like(raw_labels)
             transition[:, 1:] = raw_labels[:, 1:] != raw_labels[:, :-1]
         button_weight = loss_weight * (
@@ -1130,19 +1119,13 @@ def update_metrics(
     output: PolicyOutput,
     targets: WindowTargets,
     cfg: TrainConfig,
-    step1_stats: BinaryStats,
-    final_stats: BinaryStats,
+    button_stats: BinaryStats,
     fresh_state_mask: Optional[torch.Tensor] = None,
 ) -> None:
-    valid = warmup_masked_valid(targets.horizon_valid, fresh_state_mask)
-    step1_valid = valid[:, :, 0] > 0.5
-    final_idx = int(cfg.prediction_horizon) - 1
-    final_valid = valid[:, :, final_idx] > 0.5
-    thresholds = button_threshold_tensor(cfg, device=output.horizon_button_logits.device).view(1, 1, -1)
-    step1_pred = torch.sigmoid(output.horizon_button_logits[:, :, 0].float()) >= thresholds
-    final_pred = torch.sigmoid(output.horizon_button_logits[:, :, final_idx].float()) >= thresholds
-    step1_stats.update(step1_pred, targets.button_horizon[:, :, 0] > 0.5, step1_valid)
-    final_stats.update(final_pred, targets.button_horizon[:, :, final_idx] > 0.5, final_valid)
+    valid = warmup_masked_valid(targets.target_valid, fresh_state_mask)
+    thresholds = button_threshold_tensor(cfg, device=output.button_logits.device).view(1, 1, -1)
+    button_pred = torch.sigmoid(output.button_logits.float()) >= thresholds
+    button_stats.update(button_pred, targets.button_target > 0.5, valid > 0.5)
 
 
 def per_class_f1_summary(stats: BinaryStats, names: Sequence[str], count: int = 8) -> str:
@@ -1180,11 +1163,11 @@ def binary_stats_rows(stats: BinaryStats, names: Sequence[str]) -> List[Dict[str
 
 def persistence_baseline_metrics(targets: WindowTargets, cfg: TrainConfig) -> Dict[str, float]:
     stats = BinaryStats(cfg.num_bin, torch.device("cpu"))
-    current = targets.button_horizon[:, :, 0].new_zeros(targets.button_horizon[:, :, 0].shape)
-    current[:, 1:] = targets.button_horizon[:, :-1, 0]
-    valid = second_half_only(targets.horizon_valid[:, :, 0] > 0.5)
+    current = targets.button_target.new_zeros(targets.button_target.shape)
+    current[:, 1:] = targets.button_target[:, :-1]
+    valid = supervised_frames_only(targets.target_valid > 0.5)
     valid[:, 0] = False
-    stats.update(current > 0.5, targets.button_horizon[:, :, 0] > 0.5, valid)
+    stats.update(current > 0.5, targets.button_target > 0.5, valid)
     result = stats.compute()
     result["per_class_summary"] = per_class_f1_summary(stats, list(cfg.key_names) + list(cfg.mouse_button_names))
     return result
@@ -1204,13 +1187,7 @@ def driving_score(metrics: Dict[str, float], cfg: TrainConfig) -> float:
             total_weight += float(weight)
         return state_total / max(total_weight, 1.0)
 
-    step1_score = score_rows(metrics.get("step1_button_rows", []), metrics["step1_button_macro_f1"])
-    if int(cfg.prediction_horizon) <= 1:
-        return step1_score
-    final_score = score_rows(metrics.get("final_button_rows", []), metrics["final_button_macro_f1"])
-    # Checkpoint selection follows deployment: run.py actuates the +1 head, so
-    # it dominates; the far horizon stays as a small anticipation signal.
-    return 0.8 * step1_score + 0.2 * final_score
+    return score_rows(metrics.get("button_rows", []), metrics["button_macro_f1"])
 
 
 def print_button_stats_table(title: str, rows: Sequence[Dict[str, float | int | str]]) -> None:
@@ -1282,13 +1259,13 @@ def load_batch(iterator, targets: WindowTargets, device: torch.device, cfg: Trai
     labels = normalize_dali_labels(batch["labels"]).to(device, non_blocking=True)
     if labels.numel() == 0:
         raise RuntimeError("DALI batch returned no labels.")
-    target_count = int(targets.button_horizon.size(0))
+    target_count = int(targets.button_target.size(0))
     if bool(((labels < 0) | (labels >= target_count)).any().item()):
         bad = labels[((labels < 0) | (labels >= target_count))][:8].detach().cpu().tolist()
         raise RuntimeError(f"DALI labels out of range for {target_count} windows: {bad}.")
     target = WindowTargets(
-        button_horizon=targets.button_horizon[labels],
-        horizon_valid=targets.horizon_valid[labels],
+        button_target=targets.button_target[labels],
+        target_valid=targets.target_valid[labels],
         last_action=targets.last_action[labels],
         button_transition=(
             None if targets.button_transition is None else targets.button_transition[labels]
@@ -1314,27 +1291,46 @@ def _streaming_initial_state(
         return None, [False] * len(indices)
 
     reset_indices = reset_indices or set()
-    sample_states: List[Optional[torch.Tensor]] = []
-    template: Optional[torch.Tensor] = None
+    sample_states: List[Optional[TemporalState]] = []
+    template_hidden: Optional[torch.Tensor] = None
+    template_frame: Optional[torch.Tensor] = None
     for label_idx in indices:
         video_path, start, _ = targets.meta[label_idx]
         video_cache = cache.get(video_path, {})
-        hidden = video_cache.pop(int(start), None)
+        cached = video_cache.pop(int(start), None)
         if label_idx in reset_indices:
-            hidden = None
-        sample_states.append(hidden)
-        if hidden is not None and template is None:
-            template = hidden
+            cached = None
+        sample_states.append(cached)
+        if cached is not None and cached.hidden_state is not None and template_hidden is None:
+            template_hidden = cached.hidden_state
+        if cached is not None and cached.prev_frame is not None and template_frame is None:
+            template_frame = cached.prev_frame
 
-    carried_flags = [hidden is not None for hidden in sample_states]
-    if template is None:
+    carried_flags = [cached is not None and cached.hidden_state is not None for cached in sample_states]
+    if template_hidden is None:
         return None, carried_flags
 
-    stacked = torch.stack(
-        [hidden if hidden is not None else torch.zeros_like(template) for hidden in sample_states],
+    stacked_hidden = torch.stack(
+        [
+            cached.hidden_state
+            if cached is not None and cached.hidden_state is not None
+            else torch.zeros_like(template_hidden)
+            for cached in sample_states
+        ],
         dim=1,
     )
-    return TemporalState(hidden_state=stacked), carried_flags
+    stacked_frame = None
+    if template_frame is not None:
+        stacked_frame = torch.stack(
+            [
+                cached.prev_frame
+                if cached is not None and cached.prev_frame is not None
+                else torch.zeros_like(template_frame)
+                for cached in sample_states
+            ],
+            dim=0,
+        )
+    return TemporalState(hidden_state=stacked_hidden, prev_frame=stacked_frame), carried_flags
 
 
 def _update_streaming_cache(
@@ -1348,11 +1344,15 @@ def _update_streaming_cache(
         return
 
     hidden = state.hidden_state.detach()
+    prev_frame = state.prev_frame.detach() if state.prev_frame is not None else None
     max_pending = max(2, int(math.ceil(float(cfg.seq_len) / float(cfg.train_seq_stride))) + 2)
     for batch_idx, label_idx in enumerate(_labels_to_indices(labels)):
         video_path, _, end = targets.meta[label_idx]
         video_cache = cache.setdefault(video_path, {})
-        video_cache[int(end)] = hidden[:, batch_idx].detach()
+        video_cache[int(end)] = TemporalState(
+            hidden_state=hidden[:, batch_idx].detach(),
+            prev_frame=None if prev_frame is None else prev_frame[batch_idx].detach(),
+        )
         while len(video_cache) > max_pending:
             # Evict the oldest-inserted entry (stale leftovers from out-of-order
             # segments), never the freshly stored state for the active segment.
@@ -1385,14 +1385,12 @@ def run_epoch(
 
     loss_sum = torch.zeros((), device=device)
     detail_sums = {name: torch.zeros((), device=device) for name in ("button", "conflict")}
-    step1_stats = BinaryStats(cfg.num_bin, device)
-    final_stats = BinaryStats(cfg.num_bin, device)
+    button_stats = BinaryStats(cfg.num_bin, device)
     threshold_fitter = (
         ThresholdFitter(cfg.num_bin, device)
         if (not is_train and bool(getattr(cfg, "fit_thresholds_from_val", False)))
         else None
     )
-    threshold_fitter_step1 = ThresholdFitter(cfg.num_bin, device) if threshold_fitter is not None else None
     steps = 0
     streaming_cache: StreamingStateCache = {}
     segment_aug_seeds: Dict[str, int] = {}
@@ -1493,22 +1491,14 @@ def run_epoch(
             output,
             batch_targets,
             cfg,
-            step1_stats,
-            final_stats,
+            button_stats,
             fresh_state_mask=fresh_state_mask,
         )
         if threshold_fitter is not None:
-            final_idx = int(cfg.prediction_horizon) - 1
-            horizon_valid = warmup_masked_valid(batch_targets.horizon_valid, fresh_state_mask)
             threshold_fitter.update(
-                torch.sigmoid(output.horizon_button_logits[:, :, final_idx].float()),
-                batch_targets.button_horizon[:, :, final_idx] > 0.5,
-                horizon_valid[:, :, final_idx] > 0.5,
-            )
-            threshold_fitter_step1.update(
-                torch.sigmoid(output.horizon_button_logits[:, :, 0].float()),
-                batch_targets.button_horizon[:, :, 0] > 0.5,
-                horizon_valid[:, :, 0] > 0.5,
+                torch.sigmoid(output.button_logits.float()),
+                batch_targets.button_target > 0.5,
+                warmup_masked_valid(batch_targets.target_valid, fresh_state_mask) > 0.5,
             )
         loss_sum += loss.detach().float()
         for name, value in details.items():
@@ -1525,22 +1515,17 @@ def run_epoch(
             pbar.set_postfix(postfix)
     iterator.reset()
 
-    step1 = step1_stats.compute()
-    final = final_stats.compute()
+    button = button_stats.compute()
     button_names = list(cfg.key_names) + list(cfg.mouse_button_names)
     metrics = {
         "loss": float((loss_sum / max(1, steps)).item()),
         "button_loss": float((detail_sums["button"] / max(1, steps)).item()),
         "conflicting_button_loss": float((detail_sums["conflict"] / max(1, steps)).item()),
-        "step1_button_macro_f1": step1["macro_f1"],
-        "step1_button_macro_precision": step1["macro_precision"],
-        "step1_button_macro_recall": step1["macro_recall"],
-        "final_button_macro_f1": final["macro_f1"],
-        "final_button_macro_precision": final["macro_precision"],
-        "final_button_macro_recall": final["macro_recall"],
-        "per_class_summary": per_class_f1_summary(step1_stats, button_names),
-        "step1_button_rows": binary_stats_rows(step1_stats, button_names),
-        "final_button_rows": binary_stats_rows(final_stats, button_names),
+        "button_macro_f1": button["macro_f1"],
+        "button_macro_precision": button["macro_precision"],
+        "button_macro_recall": button["macro_recall"],
+        "per_class_summary": per_class_f1_summary(button_stats, button_names),
+        "button_rows": binary_stats_rows(button_stats, button_names),
     }
     if use_streaming_state:
         metrics["stream_state_carry_rate"] = float(stream_carried / max(1, stream_total))
@@ -1548,11 +1533,6 @@ def run_epoch(
         fitted_thresholds, fitted_f1 = threshold_fitter.fit(cfg.button_threshold_min, cfg.button_threshold_max)
         metrics["fitted_button_thresholds"] = fitted_thresholds
         metrics["fitted_button_f1"] = fitted_f1
-        fitted_thresholds_step1, fitted_f1_step1 = threshold_fitter_step1.fit(
-            cfg.button_threshold_min, cfg.button_threshold_max
-        )
-        metrics["fitted_button_thresholds_step1"] = fitted_thresholds_step1
-        metrics["fitted_button_f1_step1"] = fitted_f1_step1
     return metrics, global_step
 
 
@@ -1639,8 +1619,8 @@ def parse_args() -> TrainConfig:
     add("--num-epochs", type=int, default=None)
     add("--batch-size", type=int, default=None)
     add("--seq-len", type=int, default=None)
-    add("--prediction-horizon", type=int, default=None)
-    add("--prediction-horizon-offsets", default=None, help="Comma-separated future frame offsets for horizon heads.")
+    add("--prediction-horizon", type=int, default=None, help="Legacy option; single-horizon policy requires 1.")
+    add("--prediction-horizon-offsets", default=None, help="Single future frame offset, e.g. 1.")
     add("--model-size", type=int, default=None)
     add("--d-model", type=int, default=None)
     add("--spatial-dropout", type=float, default=None)
@@ -1859,18 +1839,17 @@ def train() -> None:
     if cfg.skipped_key_names:
         print(f"Skipping action keys for this training run: {', '.join(cfg.skipped_key_names)}")
     print(f"Training action keys: {', '.join(cfg.key_names + cfg.mouse_button_names)}")
-    horizon_offsets = tuple(int(offset) for offset in cfg.prediction_horizon_offsets)
-    first_horizon_offset = int(horizon_offsets[0])
-    print(f"Horizon frame offsets: {', '.join(str(offset) for offset in horizon_offsets)}")
+    prediction_offset = int(tuple(cfg.prediction_horizon_offsets)[0])
+    print(f"Prediction frame offset: +{prediction_offset}")
 
     train_targets = build_window_targets(train_pairs, cfg, stride=cfg.train_seq_stride, return_meta=True)
     val_targets = build_window_targets(val_pairs, cfg, stride=cfg.val_seq_stride, return_meta=True) if val_pairs else None
     print(
         "Windows:",
-        f"train={tuple(train_targets.button_horizon.shape)}",
-        f"val={(tuple(val_targets.button_horizon.shape) if val_targets is not None else None)}",
+        f"train={tuple(train_targets.button_target.shape)}",
+        f"val={(tuple(val_targets.button_target.shape) if val_targets is not None else None)}",
         f"action_label_offset={cfg.action_label_offset}",
-        f"horizon_offsets={horizon_offsets}",
+        f"prediction_offset=+{prediction_offset}",
     )
     supervised_start, supervised_end = supervised_frame_range(cfg.seq_len)
     print(
@@ -1896,10 +1875,10 @@ def train() -> None:
         f"corrupt={cfg.last_action_corruption_prob:.2f}",
     )
     train_persist = persistence_baseline_metrics(train_targets, cfg)
-    print(f"Persistence baseline: train_f1@+{first_horizon_offset}={train_persist['macro_f1']:.4f}")
+    print(f"Persistence baseline: train_f1@+{prediction_offset}={train_persist['macro_f1']:.4f}")
     if val_targets is not None:
         val_persist = persistence_baseline_metrics(val_targets, cfg)
-        print(f"Persistence baseline: val_f1@+{first_horizon_offset}={val_persist['macro_f1']:.4f} {val_persist['per_class_summary']}")
+        print(f"Persistence baseline: val_f1@+{prediction_offset}={val_persist['macro_f1']:.4f} {val_persist['per_class_summary']}")
 
     train_file_list = os.path.join(cfg.ckpt_dir, "train_file_list.txt")
     val_file_list = os.path.join(cfg.ckpt_dir, "val_file_list.txt")
@@ -1912,10 +1891,10 @@ def train() -> None:
         write_window_file_list(val_targets.meta, val_file_list)
 
     button_pos_weight = compute_pos_weight(
-        train_targets.button_horizon,
+        train_targets.button_target,
         cfg.pos_weight_power,
         cfg.pos_weight_clamp,
-        valid=second_half_only(train_targets.horizon_valid),
+        valid=supervised_frames_only(train_targets.target_valid),
     ).to(device)
     button_thresholds = decision_thresholds_from_pos_weight(button_pos_weight, cfg).detach().cpu()
     cfg.button_state_thresholds = tuple(float(x) for x in list(button_thresholds.tolist()))
@@ -1946,7 +1925,7 @@ def train() -> None:
             random_shuffle=cfg.dali_train_random_shuffle,
             last_batch_policy=LastBatchPolicy.DROP,
         )
-    train_batches = int(train_targets.button_horizon.shape[0]) // int(cfg.batch_size)
+    train_batches = int(train_targets.button_target.shape[0]) // int(cfg.batch_size)
     if cfg.max_train_batches is not None:
         train_batches = min(train_batches, cfg.max_train_batches)
     if train_batches <= 0:
@@ -1955,7 +1934,7 @@ def train() -> None:
     val_iter = None
     val_batches = 0
     if val_targets is not None:
-        val_batch_size = min(max(1, cfg.batch_size), int(val_targets.button_horizon.shape[0]))
+        val_batch_size = min(max(1, cfg.batch_size), int(val_targets.button_target.shape[0]))
         val_iter = make_dali_iterator(
             val_file_list,
             cfg,
@@ -1963,7 +1942,7 @@ def train() -> None:
             random_shuffle=cfg.dali_val_random_shuffle,
             last_batch_policy=LastBatchPolicy.PARTIAL,
         )
-        val_batches = int(math.ceil(int(val_targets.button_horizon.shape[0]) / float(val_batch_size)))
+        val_batches = int(math.ceil(int(val_targets.button_target.shape[0]) / float(val_batch_size)))
         if cfg.max_val_batches is not None:
             val_batches = min(val_batches, cfg.max_val_batches)
 
@@ -2028,43 +2007,30 @@ def train() -> None:
                 use_autocast=use_autocast,
                 button_pos_weight=button_pos_weight,
             )
-        eval_first = int(horizon_offsets[0])
-        eval_final = int(horizon_offsets[-1])
         print(
             f"Eval: va_loss={val_metrics['loss']:.4f}"
-            f" va_f1@+{eval_first}={val_metrics['step1_button_macro_f1']:.4f}"
-            f" va_f1@+{eval_final}={val_metrics['final_button_macro_f1']:.4f}"
+            f" va_f1@+{prediction_offset}={val_metrics['button_macro_f1']:.4f}"
             f" va_carry={val_metrics.get('stream_state_carry_rate', 0.0):.3f}"
         )
         print_button_stats_table(
-            f"Eval val per-key/button @+{eval_first}:",
-            val_metrics["step1_button_rows"],
+            f"Eval val per-key/button @+{prediction_offset}:",
+            val_metrics["button_rows"],
         )
-        if int(cfg.prediction_horizon) > 1:
-            print_button_stats_table(
-                f"Eval val per-key/button @+{eval_final}:",
-                val_metrics["final_button_rows"],
-            )
-        for label, thr_key, f1_key in (
-            (f"+{eval_first}", "fitted_button_thresholds_step1", "fitted_button_f1_step1"),
-            (f"+{eval_final}", "fitted_button_thresholds", "fitted_button_f1"),
-        ):
-            fitted = val_metrics.get(thr_key)
-            if fitted:
-                fitted_f1 = val_metrics.get(f1_key) or [0.0] * len(button_names)
-                print(
-                    f"Fitted val thresholds @{label}: "
-                    + " ".join(
-                        f"{name}={'n/a' if threshold is None else f'{threshold:.3f}'}(f1={f1:.3f})"
-                        for name, threshold, f1 in zip(button_names, fitted, fitted_f1)
-                    )
+        fitted = val_metrics.get("fitted_button_thresholds")
+        if fitted:
+            fitted_f1 = val_metrics.get("fitted_button_f1") or [0.0] * len(button_names)
+            print(
+                f"Fitted val thresholds @+{prediction_offset}: "
+                + " ".join(
+                    f"{name}={'n/a' if threshold is None else f'{threshold:.3f}'}(f1={f1:.3f})"
+                    for name, threshold, f1 in zip(button_names, fitted, fitted_f1)
                 )
+            )
         return
 
     optimizer_steps_per_epoch = int(math.ceil(train_batches / float(cfg.grad_accum)))
     total_steps = max(1, optimizer_steps_per_epoch * cfg.num_epochs)
     epochs_without_improvement = 0
-    final_horizon_offset = int(horizon_offsets[-1])
 
     for epoch in range(start_epoch, cfg.num_epochs):
         streaming_reset_indices: Optional[set[int]] = None
@@ -2125,31 +2091,19 @@ def train() -> None:
                     button_pos_weight=button_pos_weight,
                 )
             score = driving_score(val_metrics, cfg)
-            fitted_step1 = val_metrics.get("fitted_button_thresholds_step1")
-            if fitted_step1:
-                # run.py executes the +1 head, so the thresholds stored in the
-                # checkpoint config are the +1-fitted ones.
+            fitted_thresholds = val_metrics.get("fitted_button_thresholds")
+            if fitted_thresholds:
                 current_thresholds = list(cfg.button_state_thresholds)
                 cfg.button_state_thresholds = tuple(
                     current if new is None else float(new)
-                    for current, new in zip(current_thresholds, fitted_step1)
+                    for current, new in zip(current_thresholds, fitted_thresholds)
                 )
-                fitted_f1_step1 = val_metrics.get("fitted_button_f1_step1") or [0.0] * len(button_names)
-                print(
-                    f"Fitted val thresholds @+{first_horizon_offset} (deployed): "
-                    + " ".join(
-                        f"{name}={threshold:.3f}(f1={f1:.3f})"
-                        for name, threshold, f1 in zip(button_names, cfg.button_state_thresholds, fitted_f1_step1)
-                    )
-                )
-            fitted_final = val_metrics.get("fitted_button_thresholds")
-            if fitted_final:
                 fitted_f1 = val_metrics.get("fitted_button_f1") or [0.0] * len(button_names)
                 print(
-                    f"Fitted val thresholds @+{final_horizon_offset}: "
+                    f"Fitted val thresholds @+{prediction_offset} (deployed): "
                     + " ".join(
-                        f"{name}={'n/a' if threshold is None else f'{threshold:.3f}'}(f1={f1:.3f})"
-                        for name, threshold, f1 in zip(button_names, fitted_final, fitted_f1)
+                        f"{name}={threshold:.3f}(f1={f1:.3f})"
+                        for name, threshold, f1 in zip(button_names, cfg.button_state_thresholds, fitted_f1)
                     )
                 )
 
@@ -2199,17 +2153,15 @@ def train() -> None:
         parts = [
             f"Epoch {epoch + 1}/{cfg.num_epochs}",
             f"tr_loss={train_metrics['loss']:.4f}",
-            f"tr_f1@+{first_horizon_offset}={train_metrics['step1_button_macro_f1']:.4f}",
+            f"tr_f1@+{prediction_offset}={train_metrics['button_macro_f1']:.4f}",
         ]
         if "stream_state_carry_rate" in train_metrics:
             parts.append(f"tr_carry={train_metrics['stream_state_carry_rate']:.3f}")
-        if int(cfg.prediction_horizon) > 1:
-            parts.append(f"tr_f1@+{final_horizon_offset}={train_metrics['final_button_macro_f1']:.4f}")
         if val_metrics is not None:
             parts.extend(
                 [
                     f"va_loss={val_metrics['loss']:.4f}",
-                    f"va_f1@+{first_horizon_offset}={val_metrics['step1_button_macro_f1']:.4f}",
+                    f"va_f1@+{prediction_offset}={val_metrics['button_macro_f1']:.4f}",
                     (
                         f"va_carry={val_metrics['stream_state_carry_rate']:.3f}"
                         if "stream_state_carry_rate" in val_metrics
@@ -2219,52 +2171,32 @@ def train() -> None:
                     val_metrics["per_class_summary"],
                 ]
             )
-            if int(cfg.prediction_horizon) > 1:
-                parts.insert(-3, f"va_f1@+{final_horizon_offset}={val_metrics['final_button_macro_f1']:.4f}")
         else:
             parts.append(train_metrics["per_class_summary"])
         print(" | ".join(part for part in parts if part))
         train_stats = (
             f"Epoch {epoch + 1} train stats: "
-            f"f1@+{first_horizon_offset}={train_metrics['step1_button_macro_f1']:.4f} "
-            f"prec@+{first_horizon_offset}={train_metrics['step1_button_macro_precision']:.4f} "
-            f"rec@+{first_horizon_offset}={train_metrics['step1_button_macro_recall']:.4f}"
+            f"f1@+{prediction_offset}={train_metrics['button_macro_f1']:.4f} "
+            f"prec@+{prediction_offset}={train_metrics['button_macro_precision']:.4f} "
+            f"rec@+{prediction_offset}={train_metrics['button_macro_recall']:.4f}"
         )
-        if int(cfg.prediction_horizon) > 1:
-            train_stats += (
-                f" f1@+{final_horizon_offset}={train_metrics['final_button_macro_f1']:.4f}"
-            )
         print(train_stats)
         print_button_stats_table(
-            f"Epoch {epoch + 1} train per-key/button @+{first_horizon_offset}:",
-            train_metrics["step1_button_rows"],
+            f"Epoch {epoch + 1} train per-key/button @+{prediction_offset}:",
+            train_metrics["button_rows"],
         )
-        if int(cfg.prediction_horizon) > 1:
-            print_button_stats_table(
-                f"Epoch {epoch + 1} train per-key/button @+{final_horizon_offset}:",
-                train_metrics["final_button_rows"],
-            )
         if val_metrics is not None:
             val_stats = (
                 f"Epoch {epoch + 1} val stats: "
-                f"f1@+{first_horizon_offset}={val_metrics['step1_button_macro_f1']:.4f} "
-                f"prec@+{first_horizon_offset}={val_metrics['step1_button_macro_precision']:.4f} "
-                f"rec@+{first_horizon_offset}={val_metrics['step1_button_macro_recall']:.4f}"
+                f"f1@+{prediction_offset}={val_metrics['button_macro_f1']:.4f} "
+                f"prec@+{prediction_offset}={val_metrics['button_macro_precision']:.4f} "
+                f"rec@+{prediction_offset}={val_metrics['button_macro_recall']:.4f}"
             )
-            if int(cfg.prediction_horizon) > 1:
-                val_stats += (
-                    f" f1@+{final_horizon_offset}={val_metrics['final_button_macro_f1']:.4f}"
-                )
             print(val_stats)
             print_button_stats_table(
-                f"Epoch {epoch + 1} val per-key/button @+{first_horizon_offset}:",
-                val_metrics["step1_button_rows"],
+                f"Epoch {epoch + 1} val per-key/button @+{prediction_offset}:",
+                val_metrics["button_rows"],
             )
-            if int(cfg.prediction_horizon) > 1:
-                print_button_stats_table(
-                    f"Epoch {epoch + 1} val per-key/button @+{final_horizon_offset}:",
-                    val_metrics["final_button_rows"],
-                )
         if (
             val_metrics is not None
             and int(cfg.early_stop_patience) > 0

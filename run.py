@@ -47,8 +47,8 @@ def disable_high_resolution_timer():
 
 @dataclass
 class RuntimeConfig(ModelConfig):
-    ckpt_dir: str = "./checkpoints_rt"
-    ckpt_path: Optional[str] = r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\checkpoints_rt\model_best.pt'
+    ckpt_dir: str = "./checkpoints_rt_1h"
+    ckpt_path: Optional[str] = None
     pos_weight_power: float = 0.5
     pos_weight_clamp: float = 8.0
     button_threshold_from_pos_weight: bool = False
@@ -57,8 +57,7 @@ class RuntimeConfig(ModelConfig):
     use_checkpoint_button_thresholds: bool = True
 
     decision_interval: float = 1.0 / 20.0
-    # Actions always execute the +1 prediction; the longer horizons exist for
-    # path planning / debugging, never actuation.
+    # Actions execute the single configured future-frame prediction.
     command_horizon: int = 1
     print_every: int = 2
     print_prob_decimals: int = 3
@@ -218,22 +217,19 @@ def _coerce_config_types(cfg: RuntimeConfig) -> RuntimeConfig:
     cfg.train_seq_stride = int(cfg.train_seq_stride)
     cfg.val_seq_stride = int(cfg.val_seq_stride)
     cfg.model_size = int(cfg.model_size)
-    cfg.prediction_horizon = int(cfg.prediction_horizon)
+    cfg.prediction_horizon = 1
     offsets = getattr(cfg, "prediction_horizon_offsets", None)
     if offsets is None:
-        cfg.prediction_horizon_offsets = tuple(range(1, cfg.prediction_horizon + 1))
+        cfg.prediction_horizon_offsets = (1,)
     else:
         cfg.prediction_horizon_offsets = tuple(int(offset) for offset in offsets)
         if not cfg.prediction_horizon_offsets:
-            cfg.prediction_horizon_offsets = tuple(range(1, cfg.prediction_horizon + 1))
+            cfg.prediction_horizon_offsets = (1,)
         if any(offset <= 0 for offset in cfg.prediction_horizon_offsets):
             raise ValueError(f"prediction_horizon_offsets must be positive, got {cfg.prediction_horizon_offsets}.")
-        if any(curr <= prev for prev, curr in zip(cfg.prediction_horizon_offsets, cfg.prediction_horizon_offsets[1:])):
-            raise ValueError(
-                f"prediction_horizon_offsets must be strictly increasing, got {cfg.prediction_horizon_offsets}."
-            )
-        cfg.prediction_horizon = len(cfg.prediction_horizon_offsets)
-    cfg.command_horizon = max(1, min(int(cfg.command_horizon), int(cfg.prediction_horizon)))
+        if len(cfg.prediction_horizon_offsets) != 1:
+            raise ValueError(f"Single-horizon checkpoints must provide exactly one prediction offset, got {cfg.prediction_horizon_offsets}.")
+    cfg.command_horizon = 1
     cfg.d_model = int(cfg.d_model)
     cfg.mouse_buttons_enabled = bool(cfg.mouse_buttons_enabled)
     cfg.gru_memory_frames = max(1, int(getattr(cfg, "gru_memory_frames", 80)))
@@ -453,25 +449,17 @@ def main() -> None:
     # Custom sensitivity optimization overrides (Tweak these variables to adjust turning rules!)
     # w, a, s, d
     # cfg.button_state_thresholds = (0.50, 0.5, 0.4, 0.5)
-    if cfg.last_action_conditioning:
-        # Legacy checkpoint (pre last-action removal): its stored thresholds were
-        # fitted at +10 and over-fire at +1. F1-optimal @+1 fit on val via
-        # `train.py --eval-only`. New checkpoints store +1-fitted thresholds.
-        cfg.button_state_thresholds = (0.714, 0.775, 0.900, 0.789)
     RUNTIME_CFG = cfg
 
     model = DrivingVideoPolicy(cfg).to(device)
     model.load_state_dict(model_state)
-    command_idx = max(0, min(int(cfg.command_horizon) - 1, int(cfg.prediction_horizon) - 1))
     print(
         "Model:",
         f"size={cfg.model_size}",
-        f"horizon={cfg.prediction_horizon}",
-        f"command_horizon={cfg.command_horizon}",
-        f"command_offset=+{int(cfg.prediction_horizon_offsets[command_idx])}",
+        f"prediction_offset=+{int(cfg.prediction_horizon_offsets[0])}",
         f"d_model={cfg.d_model}",
         "temporal=convgru",
-        "input=masked_full_frame+last_action",
+        "input=masked_rgb+motion" + ("+last_action" if cfg.last_action_conditioning else ""),
     )
     print(
         "Button thresholds:",
@@ -535,8 +523,8 @@ def main() -> None:
                             temporal_state,
                             prev_action=prev_action,
                         )
-                        button_logits = output.horizon_button_logits
-                    button_probs = torch.sigmoid(button_logits[0, command_idx])
+                        button_logits = output.button_logits
+                    button_probs = torch.sigmoid(button_logits[0])
                     predicted_buttons = (button_probs >= thresholds).to(dtype=button_logits.dtype)
 
                     applied_buttons = controller.apply(
