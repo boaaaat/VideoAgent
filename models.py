@@ -15,14 +15,15 @@ from action_space import (
 )
 
 
-SPATIAL_FEATURE_CHANNELS = 128
-TEMPORAL_HIDDEN_CHANNELS = 128
 POLICY_INPUT_CHANNELS = 6
-TEMPORAL_RNN_LAYERS = 1
-KEYPOINT_HEATMAP_CHANNELS = 32
-FPN_FUSION_CHANNELS = 128
-GRU_MEMORY_MIN_FRAMES = 2.0
-GRU_MEMORY_MAX_FRAMES = 40.0
+STEM_CHANNELS = 32
+STAGE64_CHANNELS = 48
+STAGE32_CHANNELS = 96
+POLICY_FEATURE_CHANNELS = 96
+POLICY_HEAD_HIDDEN = 128
+POLICY_HEAD_FEATURES = 64
+TEMPORAL_STATE_LAYERS = 3
+PACKED_STATE_CHANNELS = POLICY_FEATURE_CHANNELS
 LAST_ACTION_EMBEDDING_DROPOUT = 0.25
 DEFAULT_PREDICTION_OFFSET = 1
 
@@ -168,118 +169,173 @@ class TemporalState:
     prev_frame: Optional[torch.Tensor] = None
 
 
-class ResidualBlock(nn.Module):
-    """2D residual block used by the policy encoder."""
+def make_norm(channels: int, groups: int = 8) -> nn.Module:
+    """GroupNorm is stable for the small video batches used here."""
+    group_count = min(int(groups), int(channels))
+    while channels % group_count != 0 and group_count > 1:
+        group_count -= 1
+    return nn.GroupNorm(group_count, channels)
 
-    def __init__(self, channels: int, dropout: float = 0.0):
+
+class ConvNormAct(nn.Module):
+    def __init__(
+        self,
+        in_ch: int,
+        out_ch: int,
+        kernel_size: int = 3,
+        stride: int = 1,
+        padding: Optional[int] = None,
+        dilation: int = 1,
+        act: bool = True,
+        bias: bool = False,
+    ) -> None:
         super().__init__()
-        layers: List[nn.Module] = [
-            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(8, channels),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(8, channels),
-        ]
-        if dropout > 0.0:
-            layers.append(nn.Dropout2d(dropout))
-        self.conv = nn.Sequential(*layers)
-        self.act = nn.SiLU(inplace=True)
+        if padding is None:
+            padding = ((kernel_size - 1) // 2) * dilation
+        self.conv = nn.Conv2d(
+            in_ch,
+            out_ch,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            bias=bias,
+        )
+        self.norm = make_norm(out_ch)
+        self.act = nn.SiLU(inplace=True) if act else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.act(x + self.conv(x))
+        return self.act(self.norm(self.conv(x)))
 
 
-class CustomSpatialEncoder(nn.Module):
-    """
-    GroupNorm residual CNN encoder with a compact FPN-style fusion neck.
-    It keeps H/4, H/8, and H/16 feature stages, then fuses them into an H/8
-    grid so lane and curb geometry is not forced through a 16x16 bottleneck.
-    GroupNorm keeps statistics batch-independent (training runs at batch_size=1).
-    """
-    def __init__(self, in_channels: int = 3, dropout: float = 0.2):
-        super().__init__()
-        self.stem = nn.Sequential(
-            nn.Conv2d(in_channels, 32, kernel_size=3, stride=2, padding=1, bias=False),   # /2
-            nn.GroupNorm(8, 32),
-            nn.SiLU(inplace=True),
-        )
-        self.stage1 = nn.Sequential(
-            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1, bias=False),            # /4
-            nn.GroupNorm(8, 64),
-            nn.SiLU(inplace=True),
-            ResidualBlock(64, dropout),
-            ResidualBlock(64, dropout),
-        )
-        self.stage2 = nn.Sequential(
-            nn.Conv2d(64, 96, kernel_size=3, stride=2, padding=1, bias=False),            # /8
-            nn.GroupNorm(8, 96),
-            nn.SiLU(inplace=True),
-            ResidualBlock(96, dropout),
-            ResidualBlock(96, dropout),
-            ResidualBlock(96, dropout),
-        )
-        self.stage3 = nn.Sequential(
-            nn.Conv2d(96, SPATIAL_FEATURE_CHANNELS, kernel_size=3, stride=2, padding=1, bias=False),  # /16
-            nn.GroupNorm(8, SPATIAL_FEATURE_CHANNELS),
-            nn.SiLU(inplace=True),
-            ResidualBlock(SPATIAL_FEATURE_CHANNELS, dropout),
-            ResidualBlock(SPATIAL_FEATURE_CHANNELS, dropout),
-        )
-        self.fpn_64_to_32 = nn.Sequential(
-            nn.Conv2d(64, FPN_FUSION_CHANNELS, kernel_size=3, stride=2, padding=1, bias=False),
-            nn.GroupNorm(8, FPN_FUSION_CHANNELS),
-            nn.SiLU(inplace=True),
-        )
-        self.fpn_32 = nn.Sequential(
-            nn.Conv2d(96, FPN_FUSION_CHANNELS, kernel_size=1, bias=False),
-            nn.GroupNorm(8, FPN_FUSION_CHANNELS),
-            nn.SiLU(inplace=True),
-            ResidualBlock(FPN_FUSION_CHANNELS, dropout),
-            ResidualBlock(FPN_FUSION_CHANNELS, dropout),
-        )
-        self.fpn_16 = nn.Sequential(
-            nn.Conv2d(SPATIAL_FEATURE_CHANNELS, FPN_FUSION_CHANNELS, kernel_size=1, bias=False),
-            nn.GroupNorm(8, FPN_FUSION_CHANNELS),
-            nn.SiLU(inplace=True),
-        )
-        self.fpn_refine = nn.Sequential(
-            nn.Conv2d(FPN_FUSION_CHANNELS * 3, FPN_FUSION_CHANNELS, kernel_size=1, bias=False),
-            nn.GroupNorm(8, FPN_FUSION_CHANNELS),
-            nn.SiLU(inplace=True),
-            ResidualBlock(FPN_FUSION_CHANNELS, dropout),
-            ResidualBlock(FPN_FUSION_CHANNELS, dropout),
-        )
+class BasicResBlock(nn.Module):
+    """Two 3x3 convolutions with a projection skip when shape changes."""
 
-    def _fuse_stages(
+    def __init__(
         self,
-        stage1: torch.Tensor,
-        stage2: torch.Tensor,
-        stage3: torch.Tensor,
-    ) -> torch.Tensor:
-        stage1_32 = self.fpn_64_to_32(stage1)
-        stage2_32 = self.fpn_32(stage2)
-        stage3_32 = F.interpolate(
-            self.fpn_16(stage3),
-            size=stage2_32.shape[-2:],
-            mode="bilinear",
-            align_corners=False,
+        in_ch: int,
+        out_ch: int,
+        stride: int = 1,
+        dilation: int = 1,
+    ) -> None:
+        super().__init__()
+        self.conv1 = ConvNormAct(in_ch, out_ch, kernel_size=3, stride=stride, dilation=dilation, act=True)
+        self.conv2 = ConvNormAct(out_ch, out_ch, kernel_size=3, stride=1, dilation=dilation, act=False)
+        self.proj = None
+        if stride != 1 or in_ch != out_ch:
+            self.proj = ConvNormAct(in_ch, out_ch, kernel_size=1, stride=stride, padding=0, act=False)
+        self.out_act = nn.SiLU(inplace=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        identity = x if self.proj is None else self.proj(x)
+        x = self.conv1(x)
+        x = self.conv2(x)
+        return self.out_act(x + identity)
+
+
+class ConvGRUCell(nn.Module):
+    """ConvGRU cell with 3x3 spatial transitions."""
+
+    def __init__(self, input_ch: int, hidden_ch: int, kernel_size: int = 3) -> None:
+        super().__init__()
+        if kernel_size % 2 != 1:
+            raise ValueError("Use odd kernel sizes for same-shape ConvGRU.")
+        self.input_ch = int(input_ch)
+        self.hidden_ch = int(hidden_ch)
+        padding = kernel_size // 2
+
+        self.gates = nn.Conv2d(
+            input_ch + hidden_ch,
+            2 * hidden_ch,
+            kernel_size=kernel_size,
+            padding=padding,
+            bias=True,
         )
-        return self.fpn_refine(torch.cat([stage1_32, stage2_32, stage3_32], dim=1))
+        self.candidate = nn.Conv2d(
+            input_ch + hidden_ch,
+            hidden_ch,
+            kernel_size=kernel_size,
+            padding=padding,
+            bias=True,
+        )
+
+        with torch.no_grad():
+            self.gates.bias[:hidden_ch].fill_(1.0)
+
+    def forward(self, x: torch.Tensor, h_prev: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if h_prev is None:
+            h_prev = torch.zeros(
+                x.shape[0],
+                self.hidden_ch,
+                x.shape[2],
+                x.shape[3],
+                device=x.device,
+                dtype=x.dtype,
+            )
+
+        combined = torch.cat([x, h_prev], dim=1)
+        z_r = self.gates(combined)
+        z_gate, r_gate = torch.split(z_r, self.hidden_ch, dim=1)
+        z_gate = torch.sigmoid(z_gate)
+        r_gate = torch.sigmoid(r_gate)
+
+        candidate = torch.tanh(self.candidate(torch.cat([x, r_gate * h_prev], dim=1)))
+        return (1.0 - z_gate) * h_prev + z_gate * candidate
+
+
+class SpatialAttentionPool(nn.Module):
+    """Parameter-efficient spatial pooling over a recurrent feature map."""
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.pre = ConvNormAct(channels, channels, kernel_size=3, stride=1)
+        self.logits = nn.Conv2d(channels, 1, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        feat = self.pre(x)
+        b, c, h, w = feat.shape
+        scores = self.logits(feat).reshape(b, 1, h * w)
+        attn = torch.softmax(scores.float(), dim=-1).to(dtype=feat.dtype)
+        feat_flat = feat.reshape(b, c, h * w)
+        pooled = torch.bmm(feat_flat, attn.transpose(1, 2)).squeeze(-1)
+        return pooled, attn.reshape(b, 1, h, w)
+
+
+class SharedEncoder(nn.Module):
+    """
+    Shared per-frame encoder.
+
+    At the default 256x256 input size this produces 64x64 and 32x32 feature
+    maps, matching the reference model's recurrent streams.
+    """
+
+    def __init__(self, in_channels: int = POLICY_INPUT_CHANNELS) -> None:
+        super().__init__()
+        self.stem = ConvNormAct(in_channels, STEM_CHANNELS, kernel_size=3, stride=2)
+        self.stem_block = BasicResBlock(STEM_CHANNELS, STEM_CHANNELS, stride=1, dilation=1)
+
+        self.stage64_down = BasicResBlock(STEM_CHANNELS, STAGE64_CHANNELS, stride=2, dilation=1)
+        self.stage64_block = BasicResBlock(STAGE64_CHANNELS, STAGE64_CHANNELS, stride=1, dilation=1)
+
+        self.stage32_down = BasicResBlock(STAGE64_CHANNELS, STAGE32_CHANNELS, stride=2, dilation=1)
+        self.stage32_block = BasicResBlock(STAGE32_CHANNELS, STAGE32_CHANNELS, stride=1, dilation=2)
 
     def feature_stages(self, x: torch.Tensor) -> List[torch.Tensor]:
-        stem = self.stem(x)
-        stage1 = self.stage1(stem)
-        stage2 = self.stage2(stage1)
-        stage3 = self.stage3(stage2)
-        fused = self._fuse_stages(stage1, stage2, stage3)
-        return [stage1, stage2, stage3, fused]
+        stem = self.stem_block(self.stem(x))
+        s64 = self.stage64_block(self.stage64_down(stem))
+        s32 = self.stage32_block(self.stage32_down(s64))
+        return [stem, s64, s32]
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        _, s64, s32 = self.feature_stages(x)
+        return s64, s32
+
+
+class ZeroSpatialFusion(nn.Module):
+    """Compatibility module for callers that add a spatial residual before pooling."""
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        stem = self.stem(x)
-        stage1 = self.stage1(stem)
-        stage2 = self.stage2(stage1)
-        stage3 = self.stage3(stage2)
-        return self._fuse_stages(stage1, stage2, stage3)
+        return torch.zeros_like(x)
 
 
 def apply_static_masks(frames: torch.Tensor) -> torch.Tensor:
@@ -287,16 +343,13 @@ def apply_static_masks(frames: torch.Tensor) -> torch.Tensor:
     h, w = frames.shape[-2:]
     masked_frames = frames.clone()
 
-    # 1. Mask the Bottom Left HUD (Speedometer)
     hud_y1 = int(h * 0.96)
     masked_frames[..., hud_y1:, :] = 0.0
 
-    # 2. Mask the Minimap (Mid-Right)
     map_y1, map_y2 = int(h * 0.05), int(h * 0.2)
     map_x1 = int(w * 0.75)
     masked_frames[..., map_y1:map_y2, map_x1:] = 0.0
 
-    # 3. Top Left Roblox UI
     roblox_ui_y2 = int(h * 0.1)
     roblox_ui_x2 = int(w * 0.1)
     masked_frames[..., :roblox_ui_y2, :roblox_ui_x2] = 0.0
@@ -304,108 +357,27 @@ def apply_static_masks(frames: torch.Tensor) -> torch.Tensor:
     return masked_frames
 
 
-class ConvGRUCell(nn.Module):
-    """
-    A GRU cell that replaces standard Linear matrix multiplications with Conv2d,
-    preserving structural 2D coordinates across time.
-    """
-    def __init__(self, input_dim: int, hidden_dim: int, kernel_size: int = 3, zoneout: float = 0.0):
-        super().__init__()
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        self.zoneout = _require_float_range("zoneout", zoneout, 0.0, 0.9)
-        padding = kernel_size // 2
-
-        self.gates_conv = nn.Conv2d(
-            in_channels=input_dim + hidden_dim,
-            out_channels=2 * hidden_dim,
-            kernel_size=kernel_size,
-            padding=padding,
-            bias=True,
-        )
-        self.candidate_conv = nn.Conv2d(
-            in_channels=input_dim + hidden_dim,
-            out_channels=hidden_dim,
-            kernel_size=kernel_size,
-            padding=padding,
-            bias=True,
-        )
-        self.reset_parameters()
-
-    def reset_parameters(self) -> None:
-        if self.gates_conv.bias is not None:
-            nn.init.zeros_(self.gates_conv.bias)
-            # Per-channel memory timescales log-spaced over 2-40 frames:
-            # update-gate bias -log(T-1) gives z = sigmoid(b) = 1/T, i.e. a
-            # ~T-frame memory. Log spacing keeps most channels fast (median
-            # ~9 frames, healthy z(1-z) gate gradients) while the tail reaches
-            # 40 frames; a uniform slow init (chrono-style) starved the cell
-            # of input and froze the gates.
-            with torch.no_grad():
-                log_timescales = torch.linspace(
-                    math.log(GRU_MEMORY_MIN_FRAMES), math.log(GRU_MEMORY_MAX_FRAMES), self.hidden_dim
-                )
-                self.gates_conv.bias[self.hidden_dim:] = -torch.log(torch.exp(log_timescales) - 1.0)
-        if self.candidate_conv.bias is not None:
-            nn.init.zeros_(self.candidate_conv.bias)
-
-    def forward(self, x: torch.Tensor, h_prev: torch.Tensor) -> torch.Tensor:
-        combined = torch.cat([x, h_prev], dim=1)
-        gates = self.gates_conv(combined)
-        r_gate, z_gate = torch.chunk(gates, 2, dim=1)
-
-        r_gate = torch.sigmoid(r_gate)
-        z_gate = torch.sigmoid(z_gate)
-
-        combined_candidate = torch.cat([x, r_gate * h_prev], dim=1)
-        candidate = torch.tanh(self.candidate_conv(combined_candidate))
-
-        h_next = (1.0 - z_gate) * h_prev + z_gate * candidate
-        if self.zoneout <= 0.0:
-            return h_next
-        if self.training:
-            keep_previous = torch.rand_like(h_next) < self.zoneout
-            return torch.where(keep_previous, h_prev, h_next)
-        return (1.0 - self.zoneout) * h_next + self.zoneout * h_prev
-
-
 class DrivingVideoPolicy(nn.Module):
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.cfg = cfg
 
-        self.spatial_encoder = CustomSpatialEncoder(in_channels=POLICY_INPUT_CHANNELS, dropout=cfg.spatial_dropout)
+        self.spatial_encoder = SharedEncoder(in_channels=POLICY_INPUT_CHANNELS)
 
-        # ConvGRU tracking state
-        self.spatial_feat_channels = SPATIAL_FEATURE_CHANNELS
-        self.feat_channels = TEMPORAL_HIDDEN_CHANNELS
-        self.temporal_rnns = nn.ModuleList(
-            [
-                ConvGRUCell(
-                    input_dim=self.spatial_feat_channels if layer_idx == 0 else self.feat_channels,
-                    hidden_dim=self.feat_channels,
-                    kernel_size=3,
-                    zoneout=cfg.zoneout,
-                )
-                for layer_idx in range(TEMPORAL_RNN_LAYERS)
-            ]
-        )
-        self.temporal_spatial_fusion = (
-            nn.Identity()
-            if self.spatial_feat_channels == self.feat_channels
-            else nn.Conv2d(self.spatial_feat_channels, self.feat_channels, kernel_size=1, bias=False)
-        )
-        self.fused_norm = nn.GroupNorm(8, self.feat_channels)
+        self.gru64 = ConvGRUCell(input_ch=STAGE64_CHANNELS, hidden_ch=STAGE64_CHANNELS, kernel_size=3)
+        self.down64_to_32 = ConvNormAct(STAGE64_CHANNELS, STAGE64_CHANNELS, kernel_size=3, stride=2)
+        self.fuse32 = ConvNormAct(STAGE32_CHANNELS + STAGE64_CHANNELS, POLICY_FEATURE_CHANNELS, kernel_size=1, stride=1, padding=0)
+        self.gru32_1 = ConvGRUCell(input_ch=POLICY_FEATURE_CHANNELS, hidden_ch=POLICY_FEATURE_CHANNELS, kernel_size=3)
+        self.gru32_2 = ConvGRUCell(input_ch=POLICY_FEATURE_CHANNELS, hidden_ch=POLICY_FEATURE_CHANNELS, kernel_size=3)
 
-        # Spatial-softmax keypoint pooling: each heatmap channel reduces to its
-        # expected (x, y), preserving precise lane/object positions for steering.
-        self.keypoint_heatmaps = nn.Conv2d(self.feat_channels, KEYPOINT_HEATMAP_CHANNELS, kernel_size=1)
-        pooled_dim = self.feat_channels + 2 * KEYPOINT_HEATMAP_CHANNELS
-        self.fc_features = nn.Sequential(
-            nn.Linear(pooled_dim, self.cfg.d_model),
-            nn.SiLU(inplace=True),
-            nn.Dropout(cfg.head_dropout),
-        )
+        self.spatial_feat_channels = STAGE32_CHANNELS
+        self.feat_channels = POLICY_FEATURE_CHANNELS
+        self.temporal_spatial_fusion = ZeroSpatialFusion()
+
+        self.attention_pool = SpatialAttentionPool(POLICY_FEATURE_CHANNELS)
+        self.fc1 = nn.Linear(POLICY_FEATURE_CHANNELS, POLICY_HEAD_HIDDEN)
+        self.fc2 = nn.Linear(POLICY_HEAD_HIDDEN, POLICY_HEAD_FEATURES)
+        self.head_dropout = nn.Dropout(0.10)
 
         if cfg.last_action_conditioning:
             action_hidden = max(4, min(32, cfg.num_bin * 2, self.cfg.d_model // 4))
@@ -422,24 +394,18 @@ class DrivingVideoPolicy(nn.Module):
         else:
             self.last_action_encoder = None
 
-        fusion_in = self.cfg.d_model * 2 if cfg.last_action_conditioning else self.cfg.d_model
-        self.head_fusion = nn.Sequential(
-            nn.LayerNorm(fusion_in),
-            nn.Linear(fusion_in, self.cfg.d_model),
-            nn.ELU(inplace=True),
+        fusion_in = POLICY_HEAD_FEATURES + self.cfg.d_model if cfg.last_action_conditioning else POLICY_HEAD_FEATURES
+        self.head_fusion = (
+            nn.Sequential(
+                nn.LayerNorm(fusion_in),
+                nn.Linear(fusion_in, POLICY_HEAD_FEATURES),
+                nn.ELU(inplace=True),
+            )
+            if cfg.last_action_conditioning
+            else nn.Identity()
         )
-
-        head_hidden = max(128, self.cfg.d_model)
-        self.button_head = nn.Sequential(
-            nn.LayerNorm(self.cfg.d_model),
-            nn.Linear(self.cfg.d_model, head_hidden),
-            nn.SiLU(inplace=True),
-            nn.Dropout(cfg.head_dropout * 0.5),
-            nn.Linear(head_hidden, self.cfg.num_bin),
-        )
-        output_layer = self.button_head[-1]
-        if isinstance(output_layer, nn.Linear):
-            nn.init.constant_(output_layer.bias, -1.0)
+        self.button_head = nn.Linear(POLICY_HEAD_FEATURES, self.cfg.num_bin)
+        nn.init.constant_(self.button_head.bias, -1.0)
 
     def _initial_temporal_state(
         self,
@@ -449,13 +415,17 @@ class DrivingVideoPolicy(nn.Module):
         *,
         device: torch.device,
         dtype: torch.dtype,
+        high_height: Optional[int] = None,
+        high_width: Optional[int] = None,
     ) -> torch.Tensor:
+        high_height = int(high_height) if high_height is not None else int(height) * 2
+        high_width = int(high_width) if high_width is not None else int(width) * 2
         return torch.zeros(
-            len(self.temporal_rnns),
+            TEMPORAL_STATE_LAYERS,
             batch_size,
-            self.feat_channels,
-            height,
-            width,
+            PACKED_STATE_CHANNELS,
+            high_height,
+            high_width,
             device=device,
             dtype=dtype,
         )
@@ -469,55 +439,171 @@ class DrivingVideoPolicy(nn.Module):
         *,
         device: torch.device,
         dtype: torch.dtype,
+        high_height: Optional[int] = None,
+        high_width: Optional[int] = None,
     ) -> torch.Tensor:
+        high_height = int(high_height) if high_height is not None else int(height) * 2
+        high_width = int(high_width) if high_width is not None else int(width) * 2
         if state is None or state.hidden_state is None:
-            return self._initial_temporal_state(batch_size, height, width, device=device, dtype=dtype)
+            return self._initial_temporal_state(
+                batch_size,
+                height,
+                width,
+                device=device,
+                dtype=dtype,
+                high_height=high_height,
+                high_width=high_width,
+            )
 
         hidden = state.hidden_state.to(device=device, dtype=dtype)
-        expected_single = (batch_size, self.feat_channels, height, width)
-        if hidden.dim() == 4:
-            if tuple(hidden.shape) != expected_single:
-                raise ValueError(
-                    f"Expected temporal hidden state {expected_single}, got {tuple(hidden.shape)}."
-                )
-            first = hidden
-            remaining = self._initial_temporal_state(batch_size, height, width, device=device, dtype=dtype)[1:]
-            return torch.cat([first.unsqueeze(0), remaining], dim=0)
+        if hidden.dim() == 4 and hidden.size(0) == TEMPORAL_STATE_LAYERS and batch_size == 1:
+            hidden = hidden.unsqueeze(1)
+        if hidden.dim() == 4 and hidden.size(0) == batch_size:
+            return self._pack_legacy_feature_state(
+                hidden,
+                batch_size,
+                int(height),
+                int(width),
+                high_height,
+                high_width,
+                device=device,
+                dtype=dtype,
+            )
         if hidden.dim() != 5:
             raise ValueError(f"Expected temporal hidden state [L,B,C,H,W], got {tuple(hidden.shape)}.")
-        if hidden.size(0) != len(self.temporal_rnns):
-            raise ValueError(f"Expected {len(self.temporal_rnns)} temporal layers, got {hidden.size(0)}.")
-        expected_stacked = (len(self.temporal_rnns), *expected_single)
-        if tuple(hidden.shape) != expected_stacked:
+        if hidden.size(0) != TEMPORAL_STATE_LAYERS:
+            raise ValueError(f"Expected {TEMPORAL_STATE_LAYERS} temporal layers, got {hidden.size(0)}.")
+        if hidden.size(1) != batch_size:
+            raise ValueError(f"Expected temporal hidden batch size {batch_size}, got {hidden.size(1)}.")
+        if hidden.size(2) != PACKED_STATE_CHANNELS:
             raise ValueError(
-                f"Expected temporal hidden state {expected_stacked}, got {tuple(hidden.shape)}."
+                f"Expected packed temporal state channels {PACKED_STATE_CHANNELS}, got {hidden.size(2)}."
             )
+        if hidden.size(3) < high_height or hidden.size(4) < high_width:
+            raise ValueError(
+                "Packed temporal state is too small for the current feature maps: "
+                f"state={tuple(hidden.shape)} required_spatial=({high_height}, {high_width})."
+            )
+        if hidden.size(3) != high_height or hidden.size(4) != high_width:
+            hidden = hidden[:, :, :, :high_height, :high_width].contiguous()
         return hidden
 
-    def _temporal_step(self, x_t: torch.Tensor, hidden_state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        next_states = []
-        for layer_idx, rnn in enumerate(self.temporal_rnns):
-            x_t = rnn(x_t, hidden_state[layer_idx])
-            next_states.append(x_t)
-        return x_t, torch.stack(next_states, dim=0)
+    def _pack_legacy_feature_state(
+        self,
+        hidden: torch.Tensor,
+        batch_size: int,
+        height: int,
+        width: int,
+        high_height: int,
+        high_width: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        packed = self._initial_temporal_state(
+            batch_size,
+            height,
+            width,
+            device=device,
+            dtype=dtype,
+            high_height=high_height,
+            high_width=high_width,
+        )
+        if tuple(hidden.shape[1:]) == (POLICY_FEATURE_CHANNELS, height, width):
+            packed[1, :, :, :height, :width] = hidden
+            packed[2, :, :, :height, :width] = hidden
+            return packed
+        if tuple(hidden.shape[1:]) == (STAGE64_CHANNELS, high_height, high_width):
+            packed[0, :, :STAGE64_CHANNELS, :high_height, :high_width] = hidden
+            return packed
+        raise ValueError(
+            "Expected legacy temporal hidden state shape "
+            f"{(batch_size, POLICY_FEATURE_CHANNELS, height, width)} or "
+            f"{(batch_size, STAGE64_CHANNELS, high_height, high_width)}, got {tuple(hidden.shape)}."
+        )
+
+    def _pack_temporal_state(
+        self,
+        h64: torch.Tensor,
+        h32_1: torch.Tensor,
+        h32_2: torch.Tensor,
+    ) -> torch.Tensor:
+        b, _, h64_h, h64_w = h64.shape
+        _, _, h32_h, h32_w = h32_1.shape
+        packed = h64.new_zeros(TEMPORAL_STATE_LAYERS, b, PACKED_STATE_CHANNELS, h64_h, h64_w)
+        packed[0, :, :STAGE64_CHANNELS, :h64_h, :h64_w] = h64
+        packed[1, :, :POLICY_FEATURE_CHANNELS, :h32_h, :h32_w] = h32_1
+        packed[2, :, :POLICY_FEATURE_CHANNELS, :h32_h, :h32_w] = h32_2
+        return packed
+
+    def _unpack_temporal_state(
+        self,
+        hidden_state: torch.Tensor,
+        batch_size: int,
+        high_height: int,
+        high_width: int,
+        height: int,
+        width: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        hidden = hidden_state
+        if hidden.dim() != 5:
+            raise ValueError(f"Expected temporal hidden state [L,B,C,H,W], got {tuple(hidden.shape)}.")
+        if (
+            hidden.size(0) != TEMPORAL_STATE_LAYERS
+            or hidden.size(1) != batch_size
+            or hidden.size(2) != PACKED_STATE_CHANNELS
+            or hidden.size(3) < high_height
+            or hidden.size(4) < high_width
+        ):
+            raise ValueError(
+                "Unexpected packed temporal hidden state shape "
+                f"{tuple(hidden.shape)} for batch={batch_size}, high=({high_height}, {high_width})."
+            )
+        h64 = hidden[0, :, :STAGE64_CHANNELS, :high_height, :high_width]
+        h32_1 = hidden[1, :, :POLICY_FEATURE_CHANNELS, :height, :width]
+        h32_2 = hidden[2, :, :POLICY_FEATURE_CHANNELS, :height, :width]
+        return h64.contiguous(), h32_1.contiguous(), h32_2.contiguous()
+
+    def _temporal_step(
+        self,
+        spatial_step: torch.Tensor,
+        hidden_state: torch.Tensor,
+        s64_t: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        b, _, h32, w32 = spatial_step.shape
+        if s64_t is None:
+            high_height = int(hidden_state.size(-2)) if hidden_state.dim() == 5 else h32 * 2
+            high_width = int(hidden_state.size(-1)) if hidden_state.dim() == 5 else w32 * 2
+            s64_t = spatial_step.new_zeros(b, STAGE64_CHANNELS, high_height, high_width)
+        else:
+            high_height, high_width = s64_t.shape[-2:]
+
+        h64_prev, h32_1_prev, h32_2_prev = self._unpack_temporal_state(
+            hidden_state,
+            b,
+            int(high_height),
+            int(high_width),
+            int(h32),
+            int(w32),
+        )
+        h64 = self.gru64(s64_t, h64_prev)
+        h64_down = self.down64_to_32(h64)
+        if h64_down.shape[-2:] != spatial_step.shape[-2:]:
+            h64_down = F.interpolate(h64_down, size=spatial_step.shape[-2:], mode="bilinear", align_corners=False)
+        fused32 = self.fuse32(torch.cat([spatial_step, h64_down], dim=1))
+        h32_1 = self.gru32_1(fused32, h32_1_prev)
+        h32_2 = self.gru32_2(h32_1, h32_2_prev)
+        return h32_2, self._pack_temporal_state(h64, h32_1, h32_2)
 
     def _pool_features(self, fused: torch.Tensor) -> torch.Tensor:
-        fused = self.fused_norm(fused)
-        heatmaps = self.keypoint_heatmaps(fused)
-        b, k, h, w = heatmaps.shape
-        attention = torch.softmax(heatmaps.reshape(b, k, h * w).float(), dim=-1)
-        ys = torch.linspace(-1.0, 1.0, h, device=fused.device, dtype=attention.dtype)
-        xs = torch.linspace(-1.0, 1.0, w, device=fused.device, dtype=attention.dtype)
-        grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
-        expected_x = (attention * grid_x.reshape(1, 1, h * w)).sum(dim=-1)
-        expected_y = (attention * grid_y.reshape(1, 1, h * w)).sum(dim=-1)
-        keypoints = torch.cat([expected_x, expected_y], dim=1).to(dtype=fused.dtype)
-        context = fused.mean(dim=(-2, -1))
-        return self.fc_features(torch.cat([keypoints, context], dim=1))
+        pooled, _ = self.attention_pool(fused)
+        z = F.silu(self.fc1(pooled))
+        z = self.head_dropout(z)
+        return F.silu(self.fc2(z))
 
     def _button_logits(self, features: torch.Tensor) -> torch.Tensor:
-        if features.size(-1) != self.cfg.d_model:
-            raise ValueError(f"Expected final feature dim {self.cfg.d_model}, got {features.size(-1)}.")
+        if features.size(-1) != POLICY_HEAD_FEATURES:
+            raise ValueError(f"Expected final feature dim {POLICY_HEAD_FEATURES}, got {features.size(-1)}.")
         return self.button_head(features)
 
     def _normalize_frames(self, frames: torch.Tensor) -> torch.Tensor:
@@ -536,6 +622,8 @@ class DrivingVideoPolicy(nn.Module):
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor:
+        if self.last_action_encoder is None:
+            raise RuntimeError("last_action_conditioning is disabled for this policy.")
         if prev_action is None:
             action_values = torch.zeros((batch_size, time_steps, self.cfg.num_bin), device=device, dtype=dtype)
         else:
@@ -546,7 +634,11 @@ class DrivingVideoPolicy(nn.Module):
                         f"Expected prev_action shape {(batch_size, self.cfg.num_bin)} or "
                         f"{(batch_size, time_steps, self.cfg.num_bin)}, got {tuple(action_values.shape)}."
                     )
-                action_values = action_values.view(batch_size, 1, self.cfg.num_bin).expand(batch_size, time_steps, self.cfg.num_bin)
+                action_values = action_values.view(batch_size, 1, self.cfg.num_bin).expand(
+                    batch_size,
+                    time_steps,
+                    self.cfg.num_bin,
+                )
             elif action_values.dim() == 3:
                 if tuple(action_values.shape) != (batch_size, time_steps, self.cfg.num_bin):
                     raise ValueError(
@@ -613,6 +705,29 @@ class DrivingVideoPolicy(nn.Module):
         motion = frame - previous
         return torch.cat([frame, motion], dim=1)
 
+    def encode_sequence(self, model_input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        b, t, c, h, w = model_input.shape
+        frames = model_input.reshape(b * t, c, h, w)
+        if frames.is_cuda:
+            frames = frames.contiguous(memory_format=torch.channels_last)
+        s64, s32 = self.spatial_encoder(frames)
+        s64 = s64.reshape(b, t, STAGE64_CHANNELS, s64.shape[-2], s64.shape[-1])
+        s32 = s32.reshape(b, t, POLICY_FEATURE_CHANNELS, s32.shape[-2], s32.shape[-1])
+        return s64, s32
+
+    def _features_to_logits(
+        self,
+        features: torch.Tensor,
+        prev_action: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        b, t, _ = features.shape
+        if self.last_action_encoder is not None:
+            action_feat = self._last_action_features(prev_action, b, t, device=features.device, dtype=features.dtype)
+            features = self.head_fusion(torch.cat([features, action_feat], dim=-1))
+        else:
+            features = self.head_fusion(features)
+        return self._button_logits(features)
+
     def forward(
         self,
         frames: torch.Tensor,
@@ -622,51 +737,33 @@ class DrivingVideoPolicy(nn.Module):
     ):
         if frames.dim() != 5:
             raise ValueError(f"Expected RGB frames with shape [B,T,3,H,W], got {tuple(frames.shape)}.")
-        b, t, c, h, w = frames.shape
+        b, t, c, _, _ = frames.shape
         if c != 3:
             raise ValueError(f"Expected RGB frames with shape [B,T,3,H,W], got {tuple(frames.shape)}.")
 
         frames = self._normalize_frames(frames)
         frames = self._apply_masks(frames)
         model_input = self._frames_with_motion(frames, state)
+        s64_seq, s32_seq = self.encode_sequence(model_input)
 
-        # 1. Spatial Processing
-        x = model_input.reshape(b * t, POLICY_INPUT_CHANNELS, h, w)
-        if x.is_cuda:
-            x = x.contiguous(memory_format=torch.channels_last)
-        spatial_feats = self.spatial_encoder(x)
-        _, spatial_channels, hf, wf = spatial_feats.shape
-        spatial_feats = spatial_feats.reshape(b, t, spatial_channels, hf, wf)
-
-        # 2. Temporal ConvGRU Rollout Loop
         h_t = self._prepare_temporal_state(
             state,
             b,
-            hf,
-            wf,
+            s32_seq.shape[-2],
+            s32_seq.shape[-1],
             device=frames.device,
-            dtype=spatial_feats.dtype,
+            dtype=s32_seq.dtype,
+            high_height=s64_seq.shape[-2],
+            high_width=s64_seq.shape[-1],
         )
 
         visual_steps = []
         for step in range(t):
-            spatial_step = spatial_feats[:, step]
-            temporal_feat, h_t = self._temporal_step(spatial_step, h_t)
-            fused = temporal_feat + self.temporal_spatial_fusion(spatial_step)
-            visual_steps.append(self._pool_features(fused))
+            temporal_feat, h_t = self._temporal_step(s32_seq[:, step], h_t, s64_t=s64_seq[:, step])
+            visual_steps.append(self._pool_features(temporal_feat))
 
-        # 3. Fuse pooled visual features with last-action context (when enabled)
         visual_feat = torch.stack(visual_steps, dim=1)
-        if self.last_action_encoder is not None:
-            action_feat = self._last_action_features(prev_action, b, t, device=frames.device, dtype=visual_feat.dtype)
-            fc_out = self.head_fusion(torch.cat([visual_feat, action_feat], dim=-1))
-        else:
-            fc_out = self.head_fusion(visual_feat)
-
-        # 4. Action Mapping Prediction
-        output = PolicyOutput(
-            button_logits=self._button_logits(fc_out),
-        )
+        output = PolicyOutput(button_logits=self._features_to_logits(visual_feat, prev_action))
         if return_aux:
             return output, TemporalState(hidden_state=h_t.detach(), prev_frame=frames[:, -1].detach())
         return output
@@ -681,47 +778,25 @@ class DrivingVideoPolicy(nn.Module):
             raise ValueError(f"Expected RGB frame with shape [B,3,H,W], got {tuple(frame.shape)}.")
         b = frame.shape[0]
 
-        # 1. Normalize and mask out the car layout exactly once
         frame_norm = self._normalize_frames(frame)
         masked_frame = self._apply_masks(frame_norm)
         model_input = self._frame_with_motion(masked_frame, state)
+        if model_input.is_cuda:
+            model_input = model_input.contiguous(memory_format=torch.channels_last)
 
-        # 2. Extract spatial primitives
-        x = model_input
-        if x.is_cuda:
-            x = x.contiguous(memory_format=torch.channels_last)
-        spatial_feat = self.spatial_encoder(x)
-        _, hf, wf = spatial_feat.shape[1:]
-
-        # 3. Evaluate a single temporal rollout transition step
+        s64_t, s32_t = self.spatial_encoder(model_input)
         h_t = self._prepare_temporal_state(
             state,
             b,
-            hf,
-            wf,
+            s32_t.shape[-2],
+            s32_t.shape[-1],
             device=frame.device,
-            dtype=spatial_feat.dtype,
+            dtype=s32_t.dtype,
+            high_height=s64_t.shape[-2],
+            high_width=s64_t.shape[-1],
         )
-
-        temporal_feat, new_hidden = self._temporal_step(spatial_feat, h_t)
-        fused = temporal_feat + self.temporal_spatial_fusion(spatial_feat)
-
-        # 4. Pool the fused features and add last-action context (when enabled)
-        visual_feat = self._pool_features(fused)
-        if self.last_action_encoder is not None:
-            action_feat = self._last_action_features(prev_action, b, 1, device=frame.device, dtype=visual_feat.dtype).reshape(
-                b,
-                self.cfg.d_model,
-            )
-            fc_out = self.head_fusion(torch.cat([visual_feat, action_feat], dim=-1))
-        else:
-            fc_out = self.head_fusion(visual_feat)
-
-        # 5. Project to action space values
-        squeezed = PolicyOutput(
-            button_logits=self._button_logits(fc_out),
-        )
-
-        # 6. Detach hidden state to prevent backpropagation graph memory leaks
+        temporal_feat, new_hidden = self._temporal_step(s32_t, h_t, s64_t=s64_t)
+        visual_feat = self._pool_features(temporal_feat).reshape(b, 1, POLICY_HEAD_FEATURES)
+        squeezed = PolicyOutput(button_logits=self._features_to_logits(visual_feat, prev_action).reshape(b, self.cfg.num_bin))
         new_state = TemporalState(hidden_state=new_hidden.detach(), prev_frame=masked_frame.detach())
         return squeezed, new_state
