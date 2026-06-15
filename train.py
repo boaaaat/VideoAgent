@@ -181,7 +181,7 @@ class TrainConfig(ModelConfig):
 
     resume: bool = True
     resume_path: Optional[str] = None
-    ckpt_dir: str = "./checkpoints_rt_1h"
+    ckpt_dir: str = "./checkpoints_rt"
     save_every: int = 1
     print_every: int = 20
     max_train_batches: Optional[int] = None

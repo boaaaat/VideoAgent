@@ -1176,7 +1176,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--ckpt-dir",
-        default="./checkpoints_rt_1h",
+        default="./checkpoints_rt",
         help="Checkpoint directory used when --ckpt-path is omitted.",
     )
     parser.add_argument(

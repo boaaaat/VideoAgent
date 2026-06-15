@@ -47,7 +47,7 @@ def disable_high_resolution_timer():
 
 @dataclass
 class RuntimeConfig(ModelConfig):
-    ckpt_dir: str = "./checkpoints_rt_1h"
+    ckpt_dir: str = "./checkpoints_rt"
     ckpt_path: Optional[str] = None
     pos_weight_power: float = 0.5
     pos_weight_clamp: float = 8.0
