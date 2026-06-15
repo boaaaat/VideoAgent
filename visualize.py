@@ -328,22 +328,14 @@ def _activation_stages(net: torch.nn.Sequential, x: torch.Tensor) -> List[torch.
 def _policy_encoder_input(
     model: DrivingVideoPolicy,
     frame_rgb: torch.Tensor,
-    previous_frame_rgb: Optional[torch.Tensor],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if frame_rgb.dim() != 4 or frame_rgb.size(1) != 3:
         raise ValueError(f"Expected current frame [B,3,H,W], got {tuple(frame_rgb.shape)}.")
     frame_rgb = model._normalize_frames(frame_rgb)
     masked_frame = model._apply_masks(frame_rgb)
-    if previous_frame_rgb is None:
-        previous = masked_frame
-    else:
-        previous = model._normalize_frames(previous_frame_rgb.to(device=frame_rgb.device, dtype=frame_rgb.dtype))
-        previous = model._apply_masks(previous)
-    motion = masked_frame - previous
-    x = torch.cat([masked_frame, motion], dim=1)
-    if x.is_cuda:
-        x = x.contiguous(memory_format=torch.channels_last)
-    return x, frame_rgb.detach()
+    if masked_frame.is_cuda:
+        masked_frame = masked_frame.contiguous(memory_format=torch.channels_last)
+    return masked_frame, frame_rgb.detach()
 
 
 def _inverse_encoder_input(
@@ -374,9 +366,9 @@ def _compute_feature_map(
     policy_state: Optional[TemporalState] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[TemporalState]]:
     if isinstance(model, DrivingVideoPolicy):
-        x, current = _policy_encoder_input(model, frame_rgb, previous_frame_rgb)
+        x, current = _policy_encoder_input(model, frame_rgb)
         if layer == "motion":
-            return x[:, 3:6].abs(), current, policy_state
+            raise ValueError("Policy checkpoints are RGB-only; the motion layer is only available for inverse checkpoints.")
         if hasattr(model.spatial_encoder, "feature_stages"):
             stages = model.spatial_encoder.feature_stages(x)
         else:
@@ -399,12 +391,11 @@ def _compute_feature_map(
                     wf,
                     device=spatial_feat.device,
                     dtype=spatial_feat.dtype,
+                    high_height=stages[-2].shape[-2],
+                    high_width=stages[-2].shape[-1],
                 )
-                hidden, new_state = model._temporal_step(spatial_feat, h_t)
-                return hidden, current, TemporalState(
-                    hidden_state=new_state.detach(),
-                    prev_frame=model._apply_masks(current).detach(),
-                )
+                hidden, new_state = model._temporal_step(spatial_feat, h_t, s64_t=stages[-2])
+                return hidden, current, TemporalState(hidden_state=new_state.detach())
             if policy_state is not None and policy_state.hidden_state is not None:
                 h_t = policy_state.hidden_state.to(device=spatial_feat.device, dtype=spatial_feat.dtype)
             else:
@@ -417,10 +408,7 @@ def _compute_feature_map(
                     dtype=spatial_feat.dtype,
                 )
             hidden = model.temporal_rnn(spatial_feat, h_t)
-            return hidden, current, TemporalState(
-                hidden_state=hidden.detach(),
-                prev_frame=model._apply_masks(current).detach(),
-            )
+            return hidden, current, TemporalState(hidden_state=hidden.detach())
         raise ValueError(f"Unknown policy ConvGRU layer {layer!r}.")
 
     x, current = _inverse_encoder_input(frame_rgb, previous_frame_rgb)
@@ -645,18 +633,17 @@ def _policy_visuals_for_frame(
         with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_autocast and x.is_cuda):
             frame_rgb = model._normalize_frames(x)
             masked_frame = model._apply_masks(frame_rgb)
-            model_input = model._frame_with_motion(masked_frame, state)
-            if model_input.is_cuda:
-                model_input = model_input.contiguous(memory_format=torch.channels_last)
+            if masked_frame.is_cuda:
+                masked_frame = masked_frame.contiguous(memory_format=torch.channels_last)
 
             stages: Optional[List[torch.Tensor]] = None
             if layer == "motion":
-                feat = model_input[:, 3:6].abs()
+                raise ValueError("Policy checkpoints are RGB-only; the motion layer is only available for inverse checkpoints.")
             else:
                 if hasattr(model.spatial_encoder, "feature_stages"):
-                    stages = model.spatial_encoder.feature_stages(model_input)
+                    stages = model.spatial_encoder.feature_stages(masked_frame)
                 else:
-                    stages = _activation_stages(model.spatial_encoder.net, model_input)
+                    stages = _activation_stages(model.spatial_encoder.net, masked_frame)
 
                 if layer.startswith("stage"):
                     stage_idx = int(layer.removeprefix("stage")) - 1
@@ -674,9 +661,9 @@ def _policy_visuals_for_frame(
             if needs_temporal:
                 if stages is None:
                     if hasattr(model.spatial_encoder, "feature_stages"):
-                        stages = model.spatial_encoder.feature_stages(model_input)
+                        stages = model.spatial_encoder.feature_stages(masked_frame)
                     else:
-                        stages = _activation_stages(model.spatial_encoder.net, model_input)
+                        stages = _activation_stages(model.spatial_encoder.net, masked_frame)
                 spatial_feat = stages[-1]
                 b, _, hf, wf = spatial_feat.shape
                 h_t = model._prepare_temporal_state(
@@ -686,9 +673,11 @@ def _policy_visuals_for_frame(
                     wf,
                     device=spatial_feat.device,
                     dtype=spatial_feat.dtype,
+                    high_height=stages[-2].shape[-2],
+                    high_width=stages[-2].shape[-1],
                 )
-                temporal_feat, new_hidden = model._temporal_step(spatial_feat, h_t)
-                state = TemporalState(hidden_state=new_hidden.detach(), prev_frame=masked_frame.detach())
+                temporal_feat, new_hidden = model._temporal_step(spatial_feat, h_t, s64_t=stages[-2])
+                state = TemporalState(hidden_state=new_hidden.detach())
                 if layer == "tokens":
                     feat = temporal_feat
 
@@ -721,9 +710,7 @@ def _policy_visuals_for_frame(
                         torch.sigmoid(logits) >= thresholds
                     ).to(dtype=visual_feat.dtype).reshape(1, int(cfg.num_bin)).detach()
             elif state is None:
-                state = TemporalState(prev_frame=masked_frame.detach())
-            else:
-                state = TemporalState(hidden_state=state.hidden_state, prev_frame=masked_frame.detach())
+                state = TemporalState()
 
             if feat is None:
                 raise RuntimeError(f"Policy layer {layer!r} did not produce a feature map.")
@@ -1176,17 +1163,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--ckpt-dir",
-        default="./checkpoints_rt_1h",
+        default="./checkpoints_rt",
         help="Checkpoint directory used when --ckpt-path is omitted.",
     )
     parser.add_argument(
         "--layer",
         choices=["motion", "stage1", "stage2", "stage3", "stage4", "spatial", "tokens"],
-        default="stage3",
+        default="stage2",
         help=(
-            "CNN signal to visualize. Policy checkpoints use masked RGB input for motion, stage1-stage4 for "
-            "the spatial encoder blocks, final spatial features for spatial, and ConvGRU hidden features for tokens. "
-            "Inverse checkpoints support "
+            "CNN signal to visualize. Policy checkpoints use masked RGB for stage1-stage4, final spatial "
+            "features for spatial, and ConvGRU hidden features for tokens. Inverse checkpoints support "
             "motion and stage1-stage4."
         ),
     )

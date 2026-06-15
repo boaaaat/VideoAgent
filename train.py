@@ -181,7 +181,7 @@ class TrainConfig(ModelConfig):
 
     resume: bool = True
     resume_path: Optional[str] = None
-    ckpt_dir: str = "./checkpoints_rt_1h"
+    ckpt_dir: str = "./checkpoints_rt"
     save_every: int = 1
     print_every: int = 20
     max_train_batches: Optional[int] = None
@@ -1293,7 +1293,6 @@ def _streaming_initial_state(
     reset_indices = reset_indices or set()
     sample_states: List[Optional[TemporalState]] = []
     template_hidden: Optional[torch.Tensor] = None
-    template_frame: Optional[torch.Tensor] = None
     for label_idx in indices:
         video_path, start, _ = targets.meta[label_idx]
         video_cache = cache.get(video_path, {})
@@ -1303,8 +1302,6 @@ def _streaming_initial_state(
         sample_states.append(cached)
         if cached is not None and cached.hidden_state is not None and template_hidden is None:
             template_hidden = cached.hidden_state
-        if cached is not None and cached.prev_frame is not None and template_frame is None:
-            template_frame = cached.prev_frame
 
     carried_flags = [cached is not None and cached.hidden_state is not None for cached in sample_states]
     if template_hidden is None:
@@ -1319,18 +1316,7 @@ def _streaming_initial_state(
         ],
         dim=1,
     )
-    stacked_frame = None
-    if template_frame is not None:
-        stacked_frame = torch.stack(
-            [
-                cached.prev_frame
-                if cached is not None and cached.prev_frame is not None
-                else torch.zeros_like(template_frame)
-                for cached in sample_states
-            ],
-            dim=0,
-        )
-    return TemporalState(hidden_state=stacked_hidden, prev_frame=stacked_frame), carried_flags
+    return TemporalState(hidden_state=stacked_hidden), carried_flags
 
 
 def _update_streaming_cache(
@@ -1344,14 +1330,12 @@ def _update_streaming_cache(
         return
 
     hidden = state.hidden_state.detach()
-    prev_frame = state.prev_frame.detach() if state.prev_frame is not None else None
     max_pending = max(2, int(math.ceil(float(cfg.seq_len) / float(cfg.train_seq_stride))) + 2)
     for batch_idx, label_idx in enumerate(_labels_to_indices(labels)):
         video_path, _, end = targets.meta[label_idx]
         video_cache = cache.setdefault(video_path, {})
         video_cache[int(end)] = TemporalState(
             hidden_state=hidden[:, batch_idx].detach(),
-            prev_frame=None if prev_frame is None else prev_frame[batch_idx].detach(),
         )
         while len(video_cache) > max_pending:
             # Evict the oldest-inserted entry (stale leftovers from out-of-order

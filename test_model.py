@@ -641,7 +641,7 @@ def print_final_stats(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Overlay policy predictions vs CSV ground truth on a dataset video.")
     parser.add_argument("--checkpoint", default=None, help="Path to policy checkpoint. Defaults to ckpt dir best/latest.")
-    parser.add_argument("--ckpt-dir", default="./checkpoints_rt_1h", help="Checkpoint directory used when --checkpoint is omitted.")
+    parser.add_argument("--ckpt-dir", default="./checkpoints_rt", help="Checkpoint directory used when --checkpoint is omitted.")
     parser.add_argument("--video", default=r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\data\greenville\run_20260521_182038.mp4', help="Input dataset video. Defaults to the first run_*.mp4 in --data-root.")
     parser.add_argument("--labels", default=None, help="Ground-truth CSV. Defaults to the video path with .csv extension.")
     parser.add_argument("--data-root", default="./data/greenville", help="Dataset root used when --video is omitted.")

@@ -47,7 +47,7 @@ def disable_high_resolution_timer():
 
 @dataclass
 class RuntimeConfig(ModelConfig):
-    ckpt_dir: str = "./checkpoints_rt_1h"
+    ckpt_dir: str = "./checkpoints_rt"
     ckpt_path: Optional[str] = None
     pos_weight_power: float = 0.5
     pos_weight_clamp: float = 8.0
@@ -459,7 +459,7 @@ def main() -> None:
         f"prediction_offset=+{int(cfg.prediction_horizon_offsets[0])}",
         f"d_model={cfg.d_model}",
         "temporal=convgru",
-        "input=masked_rgb+motion" + ("+last_action" if cfg.last_action_conditioning else ""),
+        "input=masked_rgb" + ("+last_action" if cfg.last_action_conditioning else ""),
     )
     print(
         "Button thresholds:",

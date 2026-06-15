@@ -15,7 +15,7 @@ from action_space import (
 )
 
 
-POLICY_INPUT_CHANNELS = 6
+POLICY_INPUT_CHANNELS = 3
 STEM_CHANNELS = 32
 STAGE64_CHANNELS = 48
 STAGE32_CHANNELS = 96
@@ -166,7 +166,6 @@ class PolicyOutput:
 @dataclass
 class TemporalState:
     hidden_state: Optional[torch.Tensor] = None
-    prev_frame: Optional[torch.Tensor] = None
 
 
 def make_norm(channels: int, groups: int = 8) -> nn.Module:
@@ -655,56 +654,6 @@ class DrivingVideoPolicy(nn.Module):
     def _apply_masks(self, frames: torch.Tensor) -> torch.Tensor:
         return apply_static_masks(frames)
 
-    def _previous_frame_from_state(
-        self,
-        state: Optional[TemporalState],
-        expected_shape: Tuple[int, int, int, int],
-        *,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> Optional[torch.Tensor]:
-        if state is None or state.prev_frame is None:
-            return None
-        previous = state.prev_frame.to(device=device, dtype=dtype)
-        if tuple(previous.shape) != expected_shape:
-            raise ValueError(f"Expected previous frame shape {expected_shape}, got {tuple(previous.shape)}.")
-        return previous
-
-    def _frames_with_motion(
-        self,
-        frames: torch.Tensor,
-        state: Optional[TemporalState],
-    ) -> torch.Tensor:
-        b, t, c, h, w = frames.shape
-        previous_first = self._previous_frame_from_state(
-            state,
-            (b, c, h, w),
-            device=frames.device,
-            dtype=frames.dtype,
-        )
-        if previous_first is None:
-            previous_first = frames[:, 0]
-        previous_first = previous_first.unsqueeze(1)
-        previous = previous_first if t == 1 else torch.cat([previous_first, frames[:, :-1]], dim=1)
-        motion = frames - previous
-        return torch.cat([frames, motion], dim=2)
-
-    def _frame_with_motion(
-        self,
-        frame: torch.Tensor,
-        state: Optional[TemporalState],
-    ) -> torch.Tensor:
-        previous = self._previous_frame_from_state(
-            state,
-            tuple(frame.shape),
-            device=frame.device,
-            dtype=frame.dtype,
-        )
-        if previous is None:
-            previous = frame
-        motion = frame - previous
-        return torch.cat([frame, motion], dim=1)
-
     def encode_sequence(self, model_input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         b, t, c, h, w = model_input.shape
         frames = model_input.reshape(b * t, c, h, w)
@@ -743,8 +692,7 @@ class DrivingVideoPolicy(nn.Module):
 
         frames = self._normalize_frames(frames)
         frames = self._apply_masks(frames)
-        model_input = self._frames_with_motion(frames, state)
-        s64_seq, s32_seq = self.encode_sequence(model_input)
+        s64_seq, s32_seq = self.encode_sequence(frames)
 
         h_t = self._prepare_temporal_state(
             state,
@@ -765,7 +713,7 @@ class DrivingVideoPolicy(nn.Module):
         visual_feat = torch.stack(visual_steps, dim=1)
         output = PolicyOutput(button_logits=self._features_to_logits(visual_feat, prev_action))
         if return_aux:
-            return output, TemporalState(hidden_state=h_t.detach(), prev_frame=frames[:, -1].detach())
+            return output, TemporalState(hidden_state=h_t.detach())
         return output
 
     def forward_step(
@@ -780,11 +728,10 @@ class DrivingVideoPolicy(nn.Module):
 
         frame_norm = self._normalize_frames(frame)
         masked_frame = self._apply_masks(frame_norm)
-        model_input = self._frame_with_motion(masked_frame, state)
-        if model_input.is_cuda:
-            model_input = model_input.contiguous(memory_format=torch.channels_last)
+        if masked_frame.is_cuda:
+            masked_frame = masked_frame.contiguous(memory_format=torch.channels_last)
 
-        s64_t, s32_t = self.spatial_encoder(model_input)
+        s64_t, s32_t = self.spatial_encoder(masked_frame)
         h_t = self._prepare_temporal_state(
             state,
             b,
@@ -798,5 +745,5 @@ class DrivingVideoPolicy(nn.Module):
         temporal_feat, new_hidden = self._temporal_step(s32_t, h_t, s64_t=s64_t)
         visual_feat = self._pool_features(temporal_feat).reshape(b, 1, POLICY_HEAD_FEATURES)
         squeezed = PolicyOutput(button_logits=self._features_to_logits(visual_feat, prev_action).reshape(b, self.cfg.num_bin))
-        new_state = TemporalState(hidden_state=new_hidden.detach(), prev_frame=masked_frame.detach())
+        new_state = TemporalState(hidden_state=new_hidden.detach())
         return squeezed, new_state
