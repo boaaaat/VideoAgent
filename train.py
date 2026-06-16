@@ -149,7 +149,7 @@ class TrainConfig(ModelConfig):
     button_label_smoothing: float = 0.05
     # Extra BCE weight on frames where a key changes state. Transitions are
     # ~5% of labels but are all that matters for control.
-    transition_loss_weight: float = 10.0
+    transition_loss_weight: float = 8.0
 
     aug_brightness: float = 0.15
     aug_contrast: float = 0.20
