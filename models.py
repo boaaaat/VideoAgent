@@ -677,16 +677,14 @@ class DrivingVideoPolicy(nn.Module):
             features = self.head_fusion(features)
         return self._button_logits(features)
 
-    def forward(
+    def _sequence_visual_features(
         self,
         frames: torch.Tensor,
-        state: Optional[TemporalState] = None,
-        return_aux: bool = False,
-        prev_action: Optional[torch.Tensor] = None,
-    ):
+        state: Optional[TemporalState],
+    ) -> Tuple[torch.Tensor, TemporalState]:
         if frames.dim() != 5:
             raise ValueError(f"Expected RGB frames with shape [B,T,3,H,W], got {tuple(frames.shape)}.")
-        b, t, c, _, _ = frames.shape
+        b, _, c, _, _ = frames.shape
         if c != 3:
             raise ValueError(f"Expected RGB frames with shape [B,T,3,H,W], got {tuple(frames.shape)}.")
 
@@ -706,14 +704,129 @@ class DrivingVideoPolicy(nn.Module):
         )
 
         visual_steps = []
-        for step in range(t):
+        for step in range(s32_seq.size(1)):
             temporal_feat, h_t = self._temporal_step(s32_seq[:, step], h_t, s64_t=s64_seq[:, step])
             visual_steps.append(self._pool_features(temporal_feat))
 
-        visual_feat = torch.stack(visual_steps, dim=1)
+        return torch.stack(visual_steps, dim=1), TemporalState(hidden_state=h_t.detach())
+
+    def _teacher_action_sequence(
+        self,
+        prev_action: Optional[torch.Tensor],
+        batch_size: int,
+        time_steps: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if prev_action is None:
+            return torch.zeros((batch_size, time_steps, self.cfg.num_bin), device=device, dtype=dtype)
+
+        action_values = prev_action.to(device=device, dtype=dtype)
+        if action_values.dim() == 2:
+            if tuple(action_values.shape) != (batch_size, self.cfg.num_bin):
+                raise ValueError(
+                    f"Expected prev_action shape {(batch_size, self.cfg.num_bin)} or "
+                    f"{(batch_size, time_steps, self.cfg.num_bin)}, got {tuple(action_values.shape)}."
+                )
+            return action_values.view(batch_size, 1, self.cfg.num_bin).expand(batch_size, time_steps, self.cfg.num_bin)
+
+        if action_values.dim() == 3:
+            if tuple(action_values.shape) != (batch_size, time_steps, self.cfg.num_bin):
+                raise ValueError(
+                    f"Expected prev_action shape {(batch_size, time_steps, self.cfg.num_bin)}, "
+                    f"got {tuple(action_values.shape)}."
+                )
+            return action_values
+
+        raise ValueError(f"Expected prev_action with 2 or 3 dims, got {tuple(action_values.shape)}.")
+
+    def _prediction_as_prev_action(
+        self,
+        logits: torch.Tensor,
+        thresholds: Optional[torch.Tensor],
+        *,
+        soft_feedback: bool,
+    ) -> torch.Tensor:
+        probs = torch.sigmoid(logits.float()).to(dtype=logits.dtype)
+        if soft_feedback:
+            return probs.detach()
+        if thresholds is None:
+            threshold_values = torch.full(
+                (1, self.cfg.num_bin),
+                float(self.cfg.button_state_threshold),
+                device=logits.device,
+                dtype=probs.dtype,
+            )
+        else:
+            threshold_values = thresholds.to(device=logits.device, dtype=probs.dtype).view(1, self.cfg.num_bin)
+        return (probs >= threshold_values).to(dtype=logits.dtype).detach()
+
+    def forward_with_action_feedback(
+        self,
+        frames: torch.Tensor,
+        state: Optional[TemporalState] = None,
+        return_aux: bool = False,
+        prev_action: Optional[torch.Tensor] = None,
+        feedback_mask: Optional[torch.Tensor] = None,
+        feedback_thresholds: Optional[torch.Tensor] = None,
+        soft_feedback: bool = False,
+    ):
+        visual_feat, next_state = self._sequence_visual_features(frames, state)
+        if self.last_action_encoder is None or feedback_mask is None:
+            output = PolicyOutput(button_logits=self._features_to_logits(visual_feat, prev_action))
+            if return_aux:
+                return output, next_state
+            return output
+
+        b, t, _ = visual_feat.shape
+        teacher = self._teacher_action_sequence(
+            prev_action,
+            b,
+            t,
+            device=visual_feat.device,
+            dtype=visual_feat.dtype,
+        )
+        mask = feedback_mask.to(device=visual_feat.device, dtype=torch.bool)
+        if mask.dim() == 2:
+            mask = mask.unsqueeze(-1)
+        if mask.dim() != 3 or tuple(mask.shape[:2]) != (b, t) or mask.size(-1) not in (1, self.cfg.num_bin):
+            raise ValueError(
+                "feedback_mask must have shape [B,T], [B,T,1], or [B,T,num_bin], "
+                f"got {tuple(mask.shape)}."
+            )
+
+        logits_steps = []
+        feedback_action = teacher[:, 0]
+        for step in range(t):
+            if step == 0:
+                action_input = teacher[:, step]
+            else:
+                action_input = torch.where(mask[:, step], feedback_action, teacher[:, step])
+            logits = self._features_to_logits(visual_feat[:, step : step + 1], action_input).reshape(b, self.cfg.num_bin)
+            logits_steps.append(logits)
+            feedback_action = self._prediction_as_prev_action(
+                logits,
+                feedback_thresholds,
+                soft_feedback=bool(soft_feedback),
+            )
+
+        output = PolicyOutput(button_logits=torch.stack(logits_steps, dim=1))
+        if return_aux:
+            return output, next_state
+        return output
+
+    def forward(
+        self,
+        frames: torch.Tensor,
+        state: Optional[TemporalState] = None,
+        return_aux: bool = False,
+        prev_action: Optional[torch.Tensor] = None,
+    ):
+        visual_feat, next_state = self._sequence_visual_features(frames, state)
         output = PolicyOutput(button_logits=self._features_to_logits(visual_feat, prev_action))
         if return_aux:
-            return output, TemporalState(hidden_state=h_t.detach())
+            return output, next_state
         return output
 
     def forward_step(

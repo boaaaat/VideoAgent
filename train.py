@@ -135,18 +135,21 @@ class TrainConfig(ModelConfig):
     streaming_state_validation: bool = True
     streaming_segment_min_chunks: int = 2
     streaming_segment_max_chunks: int = 20
-    action_label_offset: int = 1
-    # New runs train WITHOUT last-action input: with it, the +1 head collapses
-    # into copying prev_action (causal confusion) and never learns transitions.
+    action_label_offset: int = -1
+    # Last-action conditioning is useful, but teacher-forced ground truth can
+    # hide runtime latching. Scheduled feedback below trains recovery from the
+    # model's own previous predictions while keeping ground-truth labels.
     last_action_conditioning: bool = True
-    last_action_sequence_dropout: float = 0.05
-    last_action_key_dropout: float = 0.4
-    last_action_corruption_prob: float = 0.0
+    last_action_feedback_train_prob: float = 0.80
+    last_action_feedback_warmup_epochs: int = 1
+    last_action_feedback_ramp_epochs: int = 5
+    last_action_feedback_validation: bool = True
+    last_action_feedback_soft: bool = False
     skipped_key_names: Optional[Sequence[str]] = ("e", "q", "c", "z")
     button_label_smoothing: float = 0.05
     # Extra BCE weight on frames where a key changes state. Transitions are
     # ~5% of labels but are all that matters for control.
-    transition_loss_weight: float = 4.0
+    transition_loss_weight: float = 10.0
 
     aug_brightness: float = 0.15
     aug_contrast: float = 0.20
@@ -282,24 +285,27 @@ class TrainConfig(ModelConfig):
             )
         self.grad_clip = _require_float_at_least("grad_clip", self.grad_clip, 0.0)
         self.action_label_offset = _require_int("action_label_offset", self.action_label_offset)
-        self.last_action_sequence_dropout = _require_float_range(
-            "last_action_sequence_dropout",
-            self.last_action_sequence_dropout,
+        self.last_action_feedback_train_prob = _require_float_range(
+            "last_action_feedback_train_prob",
+            self.last_action_feedback_train_prob,
             0.0,
             1.0,
         )
-        self.last_action_key_dropout = _require_float_range(
-            "last_action_key_dropout",
-            self.last_action_key_dropout,
-            0.0,
-            1.0,
+        self.last_action_feedback_warmup_epochs = _require_int_at_least(
+            "last_action_feedback_warmup_epochs",
+            self.last_action_feedback_warmup_epochs,
+            0,
         )
-        self.last_action_corruption_prob = _require_float_range(
-            "last_action_corruption_prob",
-            self.last_action_corruption_prob,
-            0.0,
-            1.0,
+        self.last_action_feedback_ramp_epochs = _require_int_at_least(
+            "last_action_feedback_ramp_epochs",
+            self.last_action_feedback_ramp_epochs,
+            1,
         )
+        self.last_action_feedback_validation = _require_bool(
+            "last_action_feedback_validation",
+            self.last_action_feedback_validation,
+        )
+        self.last_action_feedback_soft = _require_bool("last_action_feedback_soft", self.last_action_feedback_soft)
         self.button_label_smoothing = _require_float_range("button_label_smoothing", self.button_label_smoothing, 0.0, 0.2)
         self.aug_brightness = _require_float_range("aug_brightness", self.aug_brightness, 0.0, 0.5)
         self.aug_contrast = _require_float_range("aug_contrast", self.aug_contrast, 0.0, 0.5)
@@ -1083,35 +1089,74 @@ def compute_losses(
     }
 
 
-def regularize_last_action_context(last_action: torch.Tensor, cfg: TrainConfig) -> torch.Tensor:
+def prepare_last_action_context(last_action: torch.Tensor) -> torch.Tensor:
     prev_action = last_action.float()
     if prev_action.dim() != 3:
         raise ValueError(f"Expected last_action [B,T,C], got {tuple(prev_action.shape)}.")
-
-    batch_size = int(prev_action.size(0))
-    if batch_size > 1 and float(cfg.last_action_corruption_prob) > 0.0:
-        replace = (
-            torch.rand((batch_size, 1, 1), device=prev_action.device)
-            < float(cfg.last_action_corruption_prob)
-        )
-        permuted = prev_action[torch.randperm(batch_size, device=prev_action.device)]
-        prev_action = torch.where(replace, permuted, prev_action)
-
-    if float(cfg.last_action_sequence_dropout) > 0.0:
-        keep_sequence = (
-            torch.rand((batch_size, 1, 1), device=prev_action.device)
-            >= float(cfg.last_action_sequence_dropout)
-        ).to(dtype=prev_action.dtype)
-        prev_action = prev_action * keep_sequence
-
-    if float(cfg.last_action_key_dropout) > 0.0:
-        keep_key = (
-            torch.rand((batch_size, 1, int(prev_action.size(-1))), device=prev_action.device)
-            >= float(cfg.last_action_key_dropout)
-        ).to(dtype=prev_action.dtype)
-        prev_action = prev_action * keep_key
-
     return prev_action
+
+
+def scheduled_last_action_feedback_prob(cfg: TrainConfig, epoch_index: int) -> float:
+    if not bool(cfg.last_action_conditioning):
+        return 0.0
+    max_prob = float(cfg.last_action_feedback_train_prob)
+    if max_prob <= 0.0:
+        return 0.0
+    warmup = int(cfg.last_action_feedback_warmup_epochs)
+    if int(epoch_index) < warmup:
+        return 0.0
+    ramp = max(1, int(cfg.last_action_feedback_ramp_epochs))
+    progress = min(1.0, max(0.0, (int(epoch_index) - warmup + 1) / float(ramp)))
+    return float(max_prob) * progress
+
+
+def make_last_action_feedback_mask(prev_action: torch.Tensor, feedback_prob: float) -> Optional[torch.Tensor]:
+    prob = float(feedback_prob)
+    if prob <= 0.0:
+        return None
+    if prev_action.dim() != 3:
+        raise ValueError(f"Expected prev_action [B,T,C], got {tuple(prev_action.shape)}.")
+    batch_size, time_steps, _ = prev_action.shape
+    mask_shape = (int(batch_size), int(time_steps), 1)
+    if prob >= 1.0:
+        mask = torch.ones(mask_shape, device=prev_action.device, dtype=torch.bool)
+    else:
+        mask = torch.rand(mask_shape, device=prev_action.device) < prob
+    if time_steps > 0:
+        mask[:, 0] = False
+    return mask
+
+
+def forward_policy(
+    model: torch.nn.Module,
+    frames: torch.Tensor,
+    *,
+    cfg: TrainConfig,
+    state: Optional[TemporalState],
+    return_aux: bool,
+    prev_action: torch.Tensor,
+    feedback_mask: Optional[torch.Tensor],
+) -> PolicyOutput | Tuple[PolicyOutput, TemporalState]:
+    if feedback_mask is None or not bool(cfg.last_action_conditioning):
+        return model(
+            frames,
+            state=state,
+            return_aux=return_aux,
+            prev_action=prev_action,
+        )
+
+    policy_model = getattr(model, "_orig_mod", model)
+    if not hasattr(policy_model, "forward_with_action_feedback"):
+        raise RuntimeError("Model does not support last-action feedback training.")
+    return policy_model.forward_with_action_feedback(
+        frames,
+        state=state,
+        return_aux=return_aux,
+        prev_action=prev_action,
+        feedback_mask=feedback_mask,
+        feedback_thresholds=button_threshold_tensor(cfg, device=prev_action.device, dtype=torch.float32),
+        soft_feedback=bool(cfg.last_action_feedback_soft),
+    )
 
 
 @torch.no_grad()
@@ -1361,6 +1406,7 @@ def run_epoch(
     global_step: int = 0,
     streaming_reset_indices: Optional[set[int]] = None,
     ema: Optional[ModelEMA] = None,
+    last_action_feedback_prob: float = 0.0,
 ) -> Tuple[Dict[str, float], int]:
     is_train = optimizer is not None
     model.train(is_train)
@@ -1383,6 +1429,8 @@ def run_epoch(
     )
     stream_carried = 0
     stream_total = 0
+    feedback_selected = torch.zeros((), device=device)
+    feedback_total = 0
 
     iterator_it = iter(iterator)
     pbar = tqdm(range(int(batches)), desc=desc, dynamic_ncols=True)
@@ -1427,21 +1475,32 @@ def run_epoch(
 
         with torch.set_grad_enabled(is_train):
             with torch.amp.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_autocast):
-                prev_action = (
-                    regularize_last_action_context(batch_targets.last_action, cfg)
-                    if is_train
-                    else batch_targets.last_action
-                )
+                prev_action = prepare_last_action_context(batch_targets.last_action)
+                feedback_mask = make_last_action_feedback_mask(prev_action, last_action_feedback_prob)
+                if feedback_mask is not None:
+                    feedback_selected += feedback_mask.sum().to(dtype=feedback_selected.dtype)
+                    feedback_total += int(feedback_mask[:, 1:].numel())
                 if use_streaming_state:
-                    output, next_state = model(
+                    output, next_state = forward_policy(
+                        model,
                         frames,
+                        cfg=cfg,
                         state=initial_state,
                         return_aux=True,
                         prev_action=prev_action,
+                        feedback_mask=feedback_mask,
                     )
                     _update_streaming_cache(labels, targets, next_state, streaming_cache, cfg)
                 else:
-                    output = model(frames, prev_action=prev_action)
+                    output = forward_policy(
+                        model,
+                        frames,
+                        cfg=cfg,
+                        state=None,
+                        return_aux=False,
+                        prev_action=prev_action,
+                        feedback_mask=feedback_mask,
+                    )
                 loss, details = compute_losses(
                     output,
                     batch_targets,
@@ -1496,6 +1555,8 @@ def run_epoch(
             }
             if use_streaming_state:
                 postfix["carry"] = float(stream_carried / max(1, stream_total))
+            if feedback_total > 0:
+                postfix["fb"] = float((feedback_selected / max(1, feedback_total)).item())
             pbar.set_postfix(postfix)
     iterator.reset()
 
@@ -1513,6 +1574,8 @@ def run_epoch(
     }
     if use_streaming_state:
         metrics["stream_state_carry_rate"] = float(stream_carried / max(1, stream_total))
+    if feedback_total > 0:
+        metrics["last_action_feedback_rate"] = float((feedback_selected / max(1, feedback_total)).item())
     if threshold_fitter is not None:
         fitted_thresholds, fitted_f1 = threshold_fitter.fit(cfg.button_threshold_min, cfg.button_threshold_max)
         metrics["fitted_button_thresholds"] = fitted_thresholds
@@ -1640,9 +1703,13 @@ def parse_args() -> TrainConfig:
     add("--last-action-conditioning", dest="last_action_conditioning", action="store_true", default=None)
     add("--no-last-action-conditioning", dest="last_action_conditioning", action="store_false")
     add("--transition-loss-weight", type=float, default=None, help="Extra BCE weight on key state changes; 1 disables.")
-    add("--last-action-sequence-dropout", type=float, default=None)
-    add("--last-action-key-dropout", type=float, default=None)
-    add("--last-action-corruption-prob", type=float, default=None)
+    add("--last-action-feedback-train-prob", type=float, default=None, help="Max probability of feeding detached model predictions back as prev_action during training.")
+    add("--last-action-feedback-warmup-epochs", type=int, default=None)
+    add("--last-action-feedback-ramp-epochs", type=int, default=None)
+    add("--last-action-feedback-validation", dest="last_action_feedback_validation", action="store_true", default=None)
+    add("--no-last-action-feedback-validation", dest="last_action_feedback_validation", action="store_false")
+    add("--last-action-feedback-soft", dest="last_action_feedback_soft", action="store_true", default=None)
+    add("--last-action-feedback-hard", dest="last_action_feedback_soft", action="store_false")
     add("--skip-key-names", default=None, help="Comma-separated key names to exclude from training labels.")
     add("--train-all-keys", action="store_true", help="Disable the default Greenville test filter for e,q,c,z.")
     add("--button-label-smoothing", type=float, default=None)
@@ -1736,9 +1803,11 @@ def parse_args() -> TrainConfig:
         "action_label_offset",
         "last_action_conditioning",
         "transition_loss_weight",
-        "last_action_sequence_dropout",
-        "last_action_key_dropout",
-        "last_action_corruption_prob",
+        "last_action_feedback_train_prob",
+        "last_action_feedback_warmup_epochs",
+        "last_action_feedback_ramp_epochs",
+        "last_action_feedback_validation",
+        "last_action_feedback_soft",
         "button_label_smoothing",
         "aug_brightness",
         "aug_contrast",
@@ -1854,9 +1923,15 @@ def train() -> None:
     print(
         "Last action conditioning:",
         f"enabled={bool(cfg.last_action_conditioning)}",
-        f"seq_drop={cfg.last_action_sequence_dropout:.2f}",
-        f"key_drop={cfg.last_action_key_dropout:.2f}",
-        f"corrupt={cfg.last_action_corruption_prob:.2f}",
+        "dropout=disabled",
+    )
+    print(
+        "Last action feedback:",
+        f"train_max={cfg.last_action_feedback_train_prob:.2f}",
+        f"warmup_epochs={int(cfg.last_action_feedback_warmup_epochs)}",
+        f"ramp_epochs={int(cfg.last_action_feedback_ramp_epochs)}",
+        f"val_closed_loop={bool(cfg.last_action_feedback_validation)}",
+        f"mode={'soft' if cfg.last_action_feedback_soft else 'hard'}",
     )
     train_persist = persistence_baseline_metrics(train_targets, cfg)
     print(f"Persistence baseline: train_f1@+{prediction_offset}={train_persist['macro_f1']:.4f}")
@@ -1990,6 +2065,7 @@ def train() -> None:
                 amp_dtype=amp_dtype,
                 use_autocast=use_autocast,
                 button_pos_weight=button_pos_weight,
+                last_action_feedback_prob=1.0 if bool(cfg.last_action_feedback_validation) else 0.0,
             )
         print(
             f"Eval: va_loss={val_metrics['loss']:.4f}"
@@ -2039,6 +2115,7 @@ def train() -> None:
             )
         if epoch_train_iter is None:
             raise RuntimeError("Training iterator was not initialized.")
+        train_feedback_prob = scheduled_last_action_feedback_prob(cfg, epoch)
         train_metrics, global_step = run_epoch(
             desc=f"Epoch {epoch + 1}/{cfg.num_epochs} [train]",
             model=model,
@@ -2055,12 +2132,14 @@ def train() -> None:
             global_step=global_step,
             streaming_reset_indices=streaming_reset_indices,
             ema=ema,
+            last_action_feedback_prob=train_feedback_prob,
         )
 
         val_metrics = None
         score = driving_score(train_metrics, cfg)
         if val_iter is not None and val_targets is not None and val_batches > 0:
             ema_context = ema.swap() if ema is not None else nullcontext()
+            val_feedback_prob = 1.0 if bool(cfg.last_action_feedback_validation) else 0.0
             with ema_context, torch.inference_mode():
                 val_metrics, _ = run_epoch(
                     desc=f"Epoch {epoch + 1}/{cfg.num_epochs} [val]",
@@ -2073,6 +2152,7 @@ def train() -> None:
                     amp_dtype=amp_dtype,
                     use_autocast=use_autocast,
                     button_pos_weight=button_pos_weight,
+                    last_action_feedback_prob=val_feedback_prob,
                 )
             score = driving_score(val_metrics, cfg)
             fitted_thresholds = val_metrics.get("fitted_button_thresholds")
@@ -2141,6 +2221,8 @@ def train() -> None:
         ]
         if "stream_state_carry_rate" in train_metrics:
             parts.append(f"tr_carry={train_metrics['stream_state_carry_rate']:.3f}")
+        if "last_action_feedback_rate" in train_metrics:
+            parts.append(f"tr_fb={train_metrics['last_action_feedback_rate']:.3f}")
         if val_metrics is not None:
             parts.extend(
                 [
@@ -2149,6 +2231,11 @@ def train() -> None:
                     (
                         f"va_carry={val_metrics['stream_state_carry_rate']:.3f}"
                         if "stream_state_carry_rate" in val_metrics
+                        else ""
+                    ),
+                    (
+                        f"va_fb={val_metrics['last_action_feedback_rate']:.3f}"
+                        if "last_action_feedback_rate" in val_metrics
                         else ""
                     ),
                     f"best={best_score:.4f}",
