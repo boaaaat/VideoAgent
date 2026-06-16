@@ -140,9 +140,9 @@ class TrainConfig(ModelConfig):
     # hide runtime latching. Scheduled feedback below trains recovery from the
     # model's own previous predictions while keeping ground-truth labels.
     last_action_conditioning: bool = True
-    last_action_feedback_train_prob: float = 0.80
+    last_action_feedback_train_prob: float = 0.90
     last_action_feedback_warmup_epochs: int = 1
-    last_action_feedback_ramp_epochs: int = 5
+    last_action_feedback_ramp_epochs: int = 6
     last_action_feedback_validation: bool = True
     last_action_feedback_soft: bool = False
     skipped_key_names: Optional[Sequence[str]] = ("e", "q", "c", "z")
@@ -1117,11 +1117,12 @@ def make_last_action_feedback_mask(prev_action: torch.Tensor, feedback_prob: flo
     if prev_action.dim() != 3:
         raise ValueError(f"Expected prev_action [B,T,C], got {tuple(prev_action.shape)}.")
     batch_size, time_steps, _ = prev_action.shape
+    # Sample feedback at the chunk level so chunks not selected for closed-loop
+    # training keep the fast vectorized action-head path.
+    if prob < 1.0 and random.random() >= prob:
+        return None
     mask_shape = (int(batch_size), int(time_steps), 1)
-    if prob >= 1.0:
-        mask = torch.ones(mask_shape, device=prev_action.device, dtype=torch.bool)
-    else:
-        mask = torch.rand(mask_shape, device=prev_action.device) < prob
+    mask = torch.ones(mask_shape, device=prev_action.device, dtype=torch.bool)
     if time_steps > 0:
         mask[:, 0] = False
     return mask
@@ -1145,10 +1146,7 @@ def forward_policy(
             prev_action=prev_action,
         )
 
-    policy_model = getattr(model, "_orig_mod", model)
-    if not hasattr(policy_model, "forward_with_action_feedback"):
-        raise RuntimeError("Model does not support last-action feedback training.")
-    return policy_model.forward_with_action_feedback(
+    return model(
         frames,
         state=state,
         return_aux=return_aux,
@@ -1477,9 +1475,10 @@ def run_epoch(
             with torch.amp.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_autocast):
                 prev_action = prepare_last_action_context(batch_targets.last_action)
                 feedback_mask = make_last_action_feedback_mask(prev_action, last_action_feedback_prob)
+                if float(last_action_feedback_prob) > 0.0:
+                    feedback_total += int(prev_action[:, 1:].numel())
                 if feedback_mask is not None:
                     feedback_selected += feedback_mask.sum().to(dtype=feedback_selected.dtype)
-                    feedback_total += int(feedback_mask[:, 1:].numel())
                 if use_streaming_state:
                     output, next_state = forward_policy(
                         model,

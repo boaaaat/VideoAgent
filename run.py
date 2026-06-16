@@ -66,7 +66,7 @@ class RuntimeConfig(ModelConfig):
     # Feeding applied model outputs back as last_action can latch keys when the
     # checkpoint learned a persistence shortcut. Keep this off for deployment
     # diagnostics; the model still receives a zero last-action vector.
-    prev_action_feedback: bool = False
+    prev_action_feedback: bool = True
     gru_memory_frames: int = 80
     # data.py records at 512x512 INTER_LINEAR before DALI linear-resizes to
     # model_size; runtime capture must mirror that two-stage path.

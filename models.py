@@ -773,12 +773,29 @@ class DrivingVideoPolicy(nn.Module):
         soft_feedback: bool = False,
     ):
         visual_feat, next_state = self._sequence_visual_features(frames, state)
-        if self.last_action_encoder is None or feedback_mask is None:
-            output = PolicyOutput(button_logits=self._features_to_logits(visual_feat, prev_action))
-            if return_aux:
-                return output, next_state
-            return output
+        logits = self._features_to_logits_with_feedback(
+            visual_feat,
+            prev_action,
+            feedback_mask,
+            feedback_thresholds,
+            soft_feedback=soft_feedback,
+        )
+        output = PolicyOutput(button_logits=logits)
+        if return_aux:
+            return output, next_state
+        return output
 
+    def _features_to_logits_with_feedback(
+        self,
+        visual_feat: torch.Tensor,
+        prev_action: Optional[torch.Tensor],
+        feedback_mask: Optional[torch.Tensor],
+        feedback_thresholds: Optional[torch.Tensor],
+        *,
+        soft_feedback: bool,
+    ) -> torch.Tensor:
+        if self.last_action_encoder is None or feedback_mask is None:
+            return self._features_to_logits(visual_feat, prev_action)
         b, t, _ = visual_feat.shape
         teacher = self._teacher_action_sequence(
             prev_action,
@@ -811,10 +828,7 @@ class DrivingVideoPolicy(nn.Module):
                 soft_feedback=bool(soft_feedback),
             )
 
-        output = PolicyOutput(button_logits=torch.stack(logits_steps, dim=1))
-        if return_aux:
-            return output, next_state
-        return output
+        return torch.stack(logits_steps, dim=1)
 
     def forward(
         self,
@@ -822,9 +836,19 @@ class DrivingVideoPolicy(nn.Module):
         state: Optional[TemporalState] = None,
         return_aux: bool = False,
         prev_action: Optional[torch.Tensor] = None,
+        feedback_mask: Optional[torch.Tensor] = None,
+        feedback_thresholds: Optional[torch.Tensor] = None,
+        soft_feedback: bool = False,
     ):
         visual_feat, next_state = self._sequence_visual_features(frames, state)
-        output = PolicyOutput(button_logits=self._features_to_logits(visual_feat, prev_action))
+        logits = self._features_to_logits_with_feedback(
+            visual_feat,
+            prev_action,
+            feedback_mask,
+            feedback_thresholds,
+            soft_feedback=soft_feedback,
+        )
+        output = PolicyOutput(button_logits=logits)
         if return_aux:
             return output, next_state
         return output

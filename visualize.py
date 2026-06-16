@@ -1174,7 +1174,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--layer",
         choices=["motion", "stage1", "stage2", "stage3", "stage4", "spatial", "tokens"],
-        default="stage3",
+        default="stage2",
         help=(
             "CNN signal to visualize. Policy checkpoints use masked RGB for stage1-stage4, final spatial "
             "features for spatial, and ConvGRU hidden features for tokens. Inverse checkpoints support "
