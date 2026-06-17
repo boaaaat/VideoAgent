@@ -20,10 +20,11 @@ STEM_CHANNELS = 32
 STAGE64_CHANNELS = 48
 STAGE32_CHANNELS = 96
 POLICY_FEATURE_CHANNELS = 96
-SPATIAL_ATTENTION_HEADS = 4
-POLICY_POOLED_FEATURES = POLICY_FEATURE_CHANNELS * SPATIAL_ATTENTION_HEADS
-POLICY_HEAD_HIDDEN = 128
-POLICY_HEAD_FEATURES = 64
+SPATIAL_GRID_SIZE = 8
+SPATIAL_GRID_COORD_CHANNELS = 2
+POLICY_POOLED_FEATURES = (POLICY_FEATURE_CHANNELS + SPATIAL_GRID_COORD_CHANNELS) * SPATIAL_GRID_SIZE * SPATIAL_GRID_SIZE
+POLICY_HEAD_HIDDEN = 256
+POLICY_HEAD_FEATURES = 128
 TEMPORAL_STATE_LAYERS = 3
 PACKED_STATE_CHANNELS = POLICY_FEATURE_CHANNELS
 LAST_ACTION_EMBEDDING_DROPOUT = 0.25
@@ -93,10 +94,9 @@ class ModelConfig:
     spatial_dropout: float = 0.10
     head_dropout: float = 0.20
     zoneout: float = 0.0
-    # Feed the previous action into the heads. Default True so legacy
-    # checkpoints (which have last_action_encoder weights) keep loading;
-    # TrainConfig overrides this to False for new runs because the copy
-    # shortcut it creates dominates the +1 head (causal confusion).
+    # Feed the previous action into the heads. Training can replace teacher
+    # actions with detached model outputs, so this remains enabled for current
+    # runs while legacy checkpoints with last_action_encoder weights still load.
     last_action_conditioning: bool = True
 
     button_state_threshold: float = 0.5
@@ -284,24 +284,42 @@ class ConvGRUCell(nn.Module):
         return (1.0 - z_gate) * h_prev + z_gate * candidate
 
 
-class SpatialAttentionPool(nn.Module):
-    """Multi-head spatial pooling over a recurrent feature map."""
+class SpatialContextBlock(nn.Module):
+    """Dilated residual context at 32x32 before spatial pooling."""
 
-    def __init__(self, channels: int, heads: int = SPATIAL_ATTENTION_HEADS) -> None:
+    def __init__(self, channels: int = POLICY_FEATURE_CHANNELS) -> None:
+        super().__init__()
+        self.blocks = nn.Sequential(
+            BasicResBlock(channels, channels, stride=1, dilation=1),
+            BasicResBlock(channels, channels, stride=1, dilation=2),
+            BasicResBlock(channels, channels, stride=1, dilation=4),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.blocks(x)
+
+
+class SpatialGridPool(nn.Module):
+    """Coordinate-aware grid pooling that preserves coarse scene layout."""
+
+    def __init__(self, channels: int, grid_size: int = SPATIAL_GRID_SIZE) -> None:
         super().__init__()
         self.channels = int(channels)
-        self.heads = _require_int_at_least("heads", heads, 1)
+        self.grid_size = _require_int_at_least("grid_size", grid_size, 1)
         self.pre = ConvNormAct(channels, channels, kernel_size=3, stride=1)
-        self.logits = nn.Conv2d(channels, self.heads, kernel_size=1)
+        coords = torch.linspace(-1.0, 1.0, self.grid_size, dtype=torch.float32)
+        yy, xx = torch.meshgrid(coords, coords, indexing="ij")
+        self.register_buffer("_coord_template", torch.stack((xx, yy), dim=0).unsqueeze(0), persistent=False)
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _coord_grid(self, batch_size: int, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        grid = self._coord_template.to(device=device, dtype=dtype)
+        return grid.expand(batch_size, -1, -1, -1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         feat = self.pre(x)
-        b, c, h, w = feat.shape
-        scores = self.logits(feat).reshape(b, self.heads, h * w)
-        attn = torch.softmax(scores.float(), dim=-1).to(dtype=feat.dtype)
-        feat_flat = feat.reshape(b, c, h * w)
-        pooled = torch.einsum("bcn,bhn->bhc", feat_flat, attn).reshape(b, self.heads * c)
-        return pooled, attn.reshape(b, self.heads, h, w)
+        pooled = F.adaptive_avg_pool2d(feat, (self.grid_size, self.grid_size))
+        coords = self._coord_grid(pooled.size(0), device=pooled.device, dtype=pooled.dtype)
+        return torch.cat([pooled, coords], dim=1).flatten(1)
 
 
 class SharedEncoder(nn.Module):
@@ -341,10 +359,10 @@ class ZeroSpatialFusion(nn.Module):
         return torch.zeros_like(x)
 
 
-def apply_static_masks(frames: torch.Tensor) -> torch.Tensor:
+def apply_static_masks(frames: torch.Tensor, *, clone: bool = True) -> torch.Tensor:
     """Zero out the HUD, minimap, and Roblox UI regions (relative coords)."""
     h, w = frames.shape[-2:]
-    masked_frames = frames.clone()
+    masked_frames = frames.clone() if clone else frames
 
     hud_y1 = int(h * 0.96)
     masked_frames[..., hud_y1:, :] = 0.0
@@ -375,14 +393,16 @@ class DrivingVideoPolicy(nn.Module):
 
         self.spatial_feat_channels = STAGE32_CHANNELS
         self.feat_channels = POLICY_FEATURE_CHANNELS
-        self.attention_heads = SPATIAL_ATTENTION_HEADS
+        self.spatial_grid_size = SPATIAL_GRID_SIZE
         self.pooled_feat_channels = POLICY_POOLED_FEATURES
         self.temporal_spatial_fusion = ZeroSpatialFusion()
 
-        self.attention_pool = SpatialAttentionPool(POLICY_FEATURE_CHANNELS, heads=SPATIAL_ATTENTION_HEADS)
+        self.spatial_context = SpatialContextBlock(POLICY_FEATURE_CHANNELS)
+        self.spatial_dropout = nn.Dropout2d(float(cfg.spatial_dropout))
+        self.grid_pool = SpatialGridPool(POLICY_FEATURE_CHANNELS, grid_size=SPATIAL_GRID_SIZE)
         self.fc1 = nn.Linear(POLICY_POOLED_FEATURES, POLICY_HEAD_HIDDEN)
         self.fc2 = nn.Linear(POLICY_HEAD_HIDDEN, POLICY_HEAD_FEATURES)
-        self.head_dropout = nn.Dropout(0.10)
+        self.head_dropout = nn.Dropout(float(cfg.head_dropout))
 
         if cfg.last_action_conditioning:
             action_hidden = max(4, min(32, cfg.num_bin * 2, self.cfg.d_model // 4))
@@ -569,6 +589,32 @@ class DrivingVideoPolicy(nn.Module):
         h32_2 = hidden[2, :, :POLICY_FEATURE_CHANNELS, :height, :width]
         return h64.contiguous(), h32_1.contiguous(), h32_2.contiguous()
 
+    def _recurrent_step(
+        self,
+        spatial_step: torch.Tensor,
+        h64_prev: torch.Tensor,
+        h32_1_prev: torch.Tensor,
+        h32_2_prev: torch.Tensor,
+        s64_t: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        b = int(spatial_step.shape[0])
+        if s64_t is None:
+            high_height = int(h64_prev.size(-2))
+            high_width = int(h64_prev.size(-1))
+            s64_t = spatial_step.new_zeros(b, STAGE64_CHANNELS, high_height, high_width)
+
+        h64 = self.gru64(s64_t, h64_prev)
+        h64_down = self.down64_to_32(h64)
+        if h64_down.shape[-2:] != spatial_step.shape[-2:]:
+            h64_down = F.interpolate(h64_down, size=spatial_step.shape[-2:], mode="bilinear", align_corners=False)
+        fused32 = self.fuse32(torch.cat([spatial_step, h64_down], dim=1))
+        h32_1 = self.gru32_1(fused32, h32_1_prev)
+        h32_2 = self.gru32_2(h32_1, h32_2_prev)
+        return h64, h32_1, h32_2
+
+    def _context_features(self, h32_2: torch.Tensor) -> torch.Tensor:
+        return self.spatial_dropout(self.spatial_context(h32_2))
+
     def _temporal_step(
         self,
         spatial_step: torch.Tensor,
@@ -579,10 +625,8 @@ class DrivingVideoPolicy(nn.Module):
         if s64_t is None:
             high_height = int(hidden_state.size(-2)) if hidden_state.dim() == 5 else h32 * 2
             high_width = int(hidden_state.size(-1)) if hidden_state.dim() == 5 else w32 * 2
-            s64_t = spatial_step.new_zeros(b, STAGE64_CHANNELS, high_height, high_width)
         else:
             high_height, high_width = s64_t.shape[-2:]
-
         h64_prev, h32_1_prev, h32_2_prev = self._unpack_temporal_state(
             hidden_state,
             b,
@@ -591,17 +635,18 @@ class DrivingVideoPolicy(nn.Module):
             int(h32),
             int(w32),
         )
-        h64 = self.gru64(s64_t, h64_prev)
-        h64_down = self.down64_to_32(h64)
-        if h64_down.shape[-2:] != spatial_step.shape[-2:]:
-            h64_down = F.interpolate(h64_down, size=spatial_step.shape[-2:], mode="bilinear", align_corners=False)
-        fused32 = self.fuse32(torch.cat([spatial_step, h64_down], dim=1))
-        h32_1 = self.gru32_1(fused32, h32_1_prev)
-        h32_2 = self.gru32_2(h32_1, h32_2_prev)
-        return h32_2, self._pack_temporal_state(h64, h32_1, h32_2)
+        h64, h32_1, h32_2 = self._recurrent_step(
+            spatial_step,
+            h64_prev,
+            h32_1_prev,
+            h32_2_prev,
+            s64_t=s64_t,
+        )
+        context = self._context_features(h32_2)
+        return context, self._pack_temporal_state(h64, h32_1, h32_2)
 
     def _pool_features(self, fused: torch.Tensor) -> torch.Tensor:
-        pooled, _ = self.attention_pool(fused)
+        pooled = self.grid_pool(fused)
         z = F.silu(self.fc1(pooled))
         z = self.head_dropout(z)
         return F.silu(self.fc2(z))
@@ -657,8 +702,8 @@ class DrivingVideoPolicy(nn.Module):
         features = self.last_action_encoder(action_values).reshape(batch_size, time_steps, self.cfg.d_model)
         return features.to(dtype=dtype)
 
-    def _apply_masks(self, frames: torch.Tensor) -> torch.Tensor:
-        return apply_static_masks(frames)
+    def _apply_masks(self, frames: torch.Tensor, *, clone: bool = True) -> torch.Tensor:
+        return apply_static_masks(frames, clone=clone)
 
     def encode_sequence(self, model_input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         b, t, c, h, w = model_input.shape
@@ -695,26 +740,56 @@ class DrivingVideoPolicy(nn.Module):
             raise ValueError(f"Expected RGB frames with shape [B,T,3,H,W], got {tuple(frames.shape)}.")
 
         frames = self._normalize_frames(frames)
-        frames = self._apply_masks(frames)
+        frames = self._apply_masks(frames, clone=bool(frames.requires_grad))
         s64_seq, s32_seq = self.encode_sequence(frames)
 
+        high_height = int(s64_seq.shape[-2])
+        high_width = int(s64_seq.shape[-1])
+        low_height = int(s32_seq.shape[-2])
+        low_width = int(s32_seq.shape[-1])
         h_t = self._prepare_temporal_state(
             state,
             b,
-            s32_seq.shape[-2],
-            s32_seq.shape[-1],
+            low_height,
+            low_width,
             device=frames.device,
             dtype=s32_seq.dtype,
-            high_height=s64_seq.shape[-2],
-            high_width=s64_seq.shape[-1],
+            high_height=high_height,
+            high_width=high_width,
+        )
+        h64_t, h32_1_t, h32_2_t = self._unpack_temporal_state(
+            h_t,
+            b,
+            high_height,
+            high_width,
+            low_height,
+            low_width,
         )
 
-        visual_steps = []
+        recurrent_steps = []
         for step in range(s32_seq.size(1)):
-            temporal_feat, h_t = self._temporal_step(s32_seq[:, step], h_t, s64_t=s64_seq[:, step])
-            visual_steps.append(self._pool_features(temporal_feat))
+            h64_t, h32_1_t, h32_2_t = self._recurrent_step(
+                s32_seq[:, step],
+                h64_t,
+                h32_1_t,
+                h32_2_t,
+                s64_t=s64_seq[:, step],
+            )
+            recurrent_steps.append(h32_2_t)
 
-        return torch.stack(visual_steps, dim=1), TemporalState(hidden_state=h_t.detach())
+        temporal_seq = torch.stack(recurrent_steps, dim=1)
+        t_steps = int(temporal_seq.size(1))
+        flat_temporal = temporal_seq.reshape(
+            b * t_steps,
+            POLICY_FEATURE_CHANNELS,
+            temporal_seq.size(-2),
+            temporal_seq.size(-1),
+        )
+        flat_context = self._context_features(flat_temporal)
+        visual_flat = self._pool_features(flat_context)
+        visual_feat = visual_flat.reshape(b, t_steps, POLICY_HEAD_FEATURES)
+        next_hidden = self._pack_temporal_state(h64_t, h32_1_t, h32_2_t)
+        return visual_feat, TemporalState(hidden_state=next_hidden.detach())
 
     def _teacher_action_sequence(
         self,
@@ -870,7 +945,7 @@ class DrivingVideoPolicy(nn.Module):
         b = frame.shape[0]
 
         frame_norm = self._normalize_frames(frame)
-        masked_frame = self._apply_masks(frame_norm)
+        masked_frame = self._apply_masks(frame_norm, clone=bool(frame_norm.requires_grad))
         if masked_frame.is_cuda:
             masked_frame = masked_frame.contiguous(memory_format=torch.channels_last)
 

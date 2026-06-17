@@ -4,7 +4,6 @@ import glob
 import math
 import os
 import random
-from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -119,10 +118,9 @@ class TrainConfig(ModelConfig):
     split_seed: int = 1337
     pos_weight_power: float = 0.65
     pos_weight_clamp: float = 25
-    ema_decay: float = 0.999
     button_threshold_from_pos_weight: bool = True
     button_threshold_min: float = 0.2
-    button_threshold_max: float = 0.9
+    button_threshold_max: float = 0.85
     fit_thresholds_from_val: bool = True
     eval_only: bool = False
     eval_ckpt: Optional[str] = None
@@ -142,14 +140,13 @@ class TrainConfig(ModelConfig):
     last_action_conditioning: bool = True
     last_action_feedback_train_prob: float = 0.90
     last_action_feedback_warmup_epochs: int = 1
-    last_action_feedback_ramp_epochs: int = 6
+    last_action_feedback_ramp_epochs: int = 4
     last_action_feedback_validation: bool = True
     last_action_feedback_soft: bool = False
     skipped_key_names: Optional[Sequence[str]] = ("e", "q", "c", "z")
-    button_label_smoothing: float = 0.05
     # Extra BCE weight on frames where a key changes state. Transitions are
     # ~5% of labels but are all that matters for control.
-    transition_loss_weight: float = 8.0
+    transition_loss_weight: float = 4.0
 
     aug_brightness: float = 0.15
     aug_contrast: float = 0.20
@@ -182,7 +179,7 @@ class TrainConfig(ModelConfig):
     dataset_sync_delete_stale: Optional[bool] = None
     dataset_sync_hash_same_size: bool = True
 
-    resume: bool = True
+    resume: bool = False
     resume_path: Optional[str] = None
     ckpt_dir: str = "./checkpoints_rt"
     save_every: int = 1
@@ -243,7 +240,6 @@ class TrainConfig(ModelConfig):
         self.dali_shuffle_seed = _require_int("dali_shuffle_seed", self.dali_shuffle_seed)
         self.pos_weight_power = _require_float_at_least("pos_weight_power", self.pos_weight_power, 0.0)
         self.pos_weight_clamp = _require_float_at_least("pos_weight_clamp", self.pos_weight_clamp, 1.0)
-        self.ema_decay = _require_float_range("ema_decay", self.ema_decay, 0.0, 0.99999)
         self.button_threshold_from_pos_weight = _require_bool(
             "button_threshold_from_pos_weight",
             self.button_threshold_from_pos_weight,
@@ -306,7 +302,6 @@ class TrainConfig(ModelConfig):
             self.last_action_feedback_validation,
         )
         self.last_action_feedback_soft = _require_bool("last_action_feedback_soft", self.last_action_feedback_soft)
-        self.button_label_smoothing = _require_float_range("button_label_smoothing", self.button_label_smoothing, 0.0, 0.2)
         self.aug_brightness = _require_float_range("aug_brightness", self.aug_brightness, 0.0, 0.5)
         self.aug_contrast = _require_float_range("aug_contrast", self.aug_contrast, 0.0, 0.5)
         self.aug_noise_std = _require_float_range("aug_noise_std", self.aug_noise_std, 0.0, 0.1)
@@ -505,55 +500,6 @@ class ThresholdFitter:
             for threshold, count in zip(thresholds.tolist(), support.tolist())
         ]
         return fitted, [float(x) for x in best_f1.tolist()]
-
-
-class ModelEMA:
-    """Exponential moving average of model weights.
-
-    Validation and the best checkpoint use the averaged weights, which are
-    less noisy and generalize better than the raw weights on small datasets.
-    """
-
-    def __init__(self, model: torch.nn.Module, decay: float = 0.999):
-        self.decay = float(decay)
-        self._model = model
-        self.shadow = {
-            key: value.detach().clone().float()
-            for key, value in model.state_dict().items()
-            if value.dtype.is_floating_point
-        }
-
-    @torch.no_grad()
-    def update(self) -> None:
-        for key, value in self._model.state_dict().items():
-            shadow = self.shadow.get(key)
-            if shadow is not None:
-                shadow.lerp_(value.detach().float(), 1.0 - self.decay)
-
-    def state_dict(self) -> Dict[str, torch.Tensor]:
-        return {key: value.clone() for key, value in self.shadow.items()}
-
-    @torch.no_grad()
-    def load_state_dict(self, state: Dict[str, torch.Tensor]) -> None:
-        for key, value in state.items():
-            if key in self.shadow:
-                self.shadow[key].copy_(value.float())
-
-    @contextmanager
-    def swap(self):
-        """Temporarily load the averaged weights into the live model."""
-        live = self._model.state_dict()
-        backup = {key: live[key].detach().clone() for key in self.shadow}
-        with torch.no_grad():
-            for key, value in self.shadow.items():
-                live[key].copy_(value.to(dtype=live[key].dtype))
-        try:
-            yield
-        finally:
-            live_after = self._model.state_dict()
-            with torch.no_grad():
-                for key, value in backup.items():
-                    live_after[key].copy_(value)
 
 
 def find_runs(data_root: str, video_ext: str, csv_ext: str) -> List[Tuple[str, str]]:
@@ -1052,9 +998,6 @@ def compute_losses(
     valid = warmup_masked_valid(targets.target_valid, fresh_state_mask).float()
     valid_weight = valid.unsqueeze(-1)
     button_target = targets.button_target.float()
-    if float(cfg.button_label_smoothing) > 0.0:
-        eps = float(cfg.button_label_smoothing)
-        button_target = button_target * (1.0 - eps) + 0.5 * eps
     button_logits = output.button_logits.float()
     button_loss_raw = F.binary_cross_entropy_with_logits(
         button_logits,
@@ -1287,7 +1230,14 @@ def make_dali_iterator(
     )
 
 
-def load_batch(iterator, targets: WindowTargets, device: torch.device, cfg: TrainConfig) -> Tuple[torch.Tensor, WindowTargets, torch.Tensor]:
+def load_batch(
+    iterator,
+    targets: WindowTargets,
+    device: torch.device,
+    cfg: TrainConfig,
+    *,
+    need_label_indices: bool = False,
+) -> Tuple[torch.Tensor, WindowTargets, Optional[List[int]]]:
     batch = next(iterator)[0]
     if "frames" not in batch or "labels" not in batch:
         raise RuntimeError(f"DALI batch must contain 'frames' and 'labels', got keys={sorted(batch)}.")
@@ -1299,44 +1249,49 @@ def load_batch(iterator, targets: WindowTargets, device: torch.device, cfg: Trai
         frames = frames.to(dtype=torch.bfloat16)
     elif amp_name in {"fp32", "float32", "none"} and frames.dtype != torch.float32:
         frames = frames.float()
-    labels = normalize_dali_labels(batch["labels"]).to(device, non_blocking=True)
+    labels = normalize_dali_labels(batch["labels"])
     if labels.numel() == 0:
         raise RuntimeError("DALI batch returned no labels.")
     target_count = int(targets.button_target.size(0))
-    if bool(((labels < 0) | (labels >= target_count)).any().item()):
-        bad = labels[((labels < 0) | (labels >= target_count))][:8].detach().cpu().tolist()
+    label_indices = (
+        [int(item) for item in labels.detach().cpu().reshape(-1).tolist()]
+        if need_label_indices
+        else None
+    )
+    if label_indices is not None:
+        bad = [idx for idx in label_indices if idx < 0 or idx >= target_count][:8]
+    else:
+        bad_mask = (labels < 0) | (labels >= target_count)
+        bad = labels[bad_mask][:8].detach().cpu().tolist() if bool(bad_mask.any().item()) else []
+    if bad:
         raise RuntimeError(f"DALI labels out of range for {target_count} windows: {bad}.")
+    labels_for_index = labels.to(device, non_blocking=True)
     target = WindowTargets(
-        button_target=targets.button_target[labels],
-        target_valid=targets.target_valid[labels],
-        last_action=targets.last_action[labels],
+        button_target=targets.button_target[labels_for_index],
+        target_valid=targets.target_valid[labels_for_index],
+        last_action=targets.last_action[labels_for_index],
         button_transition=(
-            None if targets.button_transition is None else targets.button_transition[labels]
+            None if targets.button_transition is None else targets.button_transition[labels_for_index]
         ),
         meta=None,
     )
-    return frames, target, labels
-
-
-def _labels_to_indices(labels: torch.Tensor) -> List[int]:
-    return [int(item) for item in labels.detach().cpu().reshape(-1).tolist()]
+    return frames, target, label_indices
 
 
 def _streaming_initial_state(
-    labels: torch.Tensor,
+    label_indices: Sequence[int],
     targets: WindowTargets,
     cache: StreamingStateCache,
     reset_indices: Optional[set[int]] = None,
 ) -> Tuple[Optional[TemporalState], List[bool]]:
     """Return the initial temporal state plus a per-sample carried flag."""
-    indices = _labels_to_indices(labels)
     if targets.meta is None or not cache:
-        return None, [False] * len(indices)
+        return None, [False] * len(label_indices)
 
     reset_indices = reset_indices or set()
     sample_states: List[Optional[TemporalState]] = []
     template_hidden: Optional[torch.Tensor] = None
-    for label_idx in indices:
+    for label_idx in label_indices:
         video_path, start, _ = targets.meta[label_idx]
         video_cache = cache.get(video_path, {})
         cached = video_cache.pop(int(start), None)
@@ -1363,7 +1318,7 @@ def _streaming_initial_state(
 
 
 def _update_streaming_cache(
-    labels: torch.Tensor,
+    label_indices: Sequence[int],
     targets: WindowTargets,
     state: Optional[TemporalState],
     cache: StreamingStateCache,
@@ -1374,7 +1329,7 @@ def _update_streaming_cache(
 
     hidden = state.hidden_state.detach()
     max_pending = max(2, int(math.ceil(float(cfg.seq_len) / float(cfg.train_seq_stride))) + 2)
-    for batch_idx, label_idx in enumerate(_labels_to_indices(labels)):
+    for batch_idx, label_idx in enumerate(label_indices):
         video_path, _, end = targets.meta[label_idx]
         video_cache = cache.setdefault(video_path, {})
         video_cache[int(end)] = TemporalState(
@@ -1403,7 +1358,6 @@ def run_epoch(
     total_steps: int = 1,
     global_step: int = 0,
     streaming_reset_indices: Optional[set[int]] = None,
-    ema: Optional[ModelEMA] = None,
     last_action_feedback_prob: float = 0.0,
 ) -> Tuple[Dict[str, float], int]:
     is_train = optimizer is not None
@@ -1425,6 +1379,9 @@ def run_epoch(
     use_streaming_state = bool(
         cfg.streaming_state_training and (is_train or cfg.streaming_state_validation)
     )
+    pre_mask_before_augmentation = bool(
+        float(cfg.aug_translate_frac) > 0.0 or float(cfg.aug_scale_frac) > 0.0
+    )
     stream_carried = 0
     stream_total = 0
     feedback_selected = torch.zeros((), device=device)
@@ -1433,14 +1390,22 @@ def run_epoch(
     iterator_it = iter(iterator)
     pbar = tqdm(range(int(batches)), desc=desc, dynamic_ncols=True)
     for batch_idx in pbar:
-        frames, batch_targets, labels = load_batch(iterator_it, targets, device, cfg)
+        frames, batch_targets, label_indices = load_batch(
+            iterator_it,
+            targets,
+            device,
+            cfg,
+            need_label_indices=use_streaming_state,
+        )
 
         initial_state: Optional[TemporalState] = None
         fresh_state_mask: Optional[torch.Tensor] = None
         carried_flags: List[bool] = []
         if use_streaming_state:
+            if label_indices is None:
+                raise RuntimeError("Streaming state training requires DALI label indices.")
             initial_state, carried_flags = _streaming_initial_state(
-                labels,
+                label_indices,
                 targets,
                 streaming_cache,
                 streaming_reset_indices if is_train else None,
@@ -1457,14 +1422,17 @@ def run_epoch(
             # Pre-mask so geometric augmentation cannot shift HUD/minimap
             # pixels out from under the model's fixed masks (train-only
             # leakage the model could learn to read).
-            frames = apply_static_masks(frames)
+            if pre_mask_before_augmentation:
+                frames = apply_static_masks(frames, clone=False)
             aug_generator: Optional[torch.Generator] = None
             if use_streaming_state and targets.meta is not None and len(carried_flags) == 1:
                 # One transform per streaming segment: re-seeding the generator
                 # with the segment's seed makes every chunk draw identical
                 # augmentation params, so the carried ConvGRU state never sees
                 # the scene appearance jump mid-episode.
-                video_path = targets.meta[_labels_to_indices(labels)[0]][0]
+                if label_indices is None:
+                    raise RuntimeError("Streaming augmentation requires DALI label indices.")
+                video_path = targets.meta[label_indices[0]][0]
                 if not carried_flags[0] or video_path not in segment_aug_seeds:
                     segment_aug_seeds[video_path] = random.getrandbits(63)
                 aug_generator = torch.Generator(device=frames.device)
@@ -1489,7 +1457,9 @@ def run_epoch(
                         prev_action=prev_action,
                         feedback_mask=feedback_mask,
                     )
-                    _update_streaming_cache(labels, targets, next_state, streaming_cache, cfg)
+                    if label_indices is None:
+                        raise RuntimeError("Streaming state cache update requires DALI label indices.")
+                    _update_streaming_cache(label_indices, targets, next_state, streaming_cache, cfg)
                 else:
                     output = forward_policy(
                         model,
@@ -1526,9 +1496,6 @@ def run_epoch(
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
                     global_step += 1
-                    if ema is not None:
-                        ema.update()
-
         update_metrics(
             output,
             batch_targets,
@@ -1598,7 +1565,6 @@ def save_checkpoint(
     epoch: int,
     global_step: int,
     best_score: float,
-    ema: Optional[ModelEMA] = None,
 ) -> None:
     payload = {
         "model_state": model.state_dict(),
@@ -1608,8 +1574,6 @@ def save_checkpoint(
         "global_step": int(global_step),
         "best_score": float(best_score),
     }
-    if ema is not None:
-        payload["ema_state"] = ema.state_dict()
     torch.save(payload, path)
 
 
@@ -1618,15 +1582,15 @@ def maybe_resume(
     optimizer: torch.optim.Optimizer,
     cfg: TrainConfig,
     device: torch.device,
-) -> Tuple[int, int, float, Optional[Dict[str, torch.Tensor]]]:
+) -> Tuple[int, int, float]:
     if not cfg.resume:
-        return 0, 0, -1e9, None
+        return 0, 0, -1e9
     if cfg.resume_path is not None:
         ckpt_path = cfg.resume_path
     else:
         ckpt_path = latest_checkpoint(cfg.ckpt_dir)
     if not ckpt_path:
-        return 0, 0, -1e9, None
+        return 0, 0, -1e9
     print(f"Resuming from {ckpt_path}")
     state = torch.load(ckpt_path, map_location=device)
     if not isinstance(state, dict):
@@ -1651,7 +1615,7 @@ def maybe_resume(
             "the current optimizer/model parameters. Start a fresh run with --no-resume "
             "or choose a compatible --resume-path."
         ) from exc
-    return int(state["epoch"]), int(state["global_step"]), float(state["best_score"]), state.get("ema_state")
+    return int(state["epoch"]), int(state["global_step"]), float(state["best_score"])
 
 
 def parse_args() -> TrainConfig:
@@ -1682,7 +1646,6 @@ def parse_args() -> TrainConfig:
     add("--train-split", type=float, default=None)
     add("--pos-weight-power", type=float, default=None)
     add("--pos-weight-clamp", type=float, default=None)
-    add("--ema-decay", type=float, default=None, help="EMA decay for eval/best weights; 0 disables.")
     add("--button-threshold-from-pos-weight", dest="button_threshold_from_pos_weight", action="store_true", default=None)
     add("--flat-button-threshold", dest="button_threshold_from_pos_weight", action="store_false", default=None)
     add("--button-threshold-min", type=float, default=None)
@@ -1711,7 +1674,6 @@ def parse_args() -> TrainConfig:
     add("--last-action-feedback-hard", dest="last_action_feedback_soft", action="store_false")
     add("--skip-key-names", default=None, help="Comma-separated key names to exclude from training labels.")
     add("--train-all-keys", action="store_true", help="Disable the default Greenville test filter for e,q,c,z.")
-    add("--button-label-smoothing", type=float, default=None)
     add("--aug-brightness", type=float, default=None)
     add("--aug-contrast", type=float, default=None)
     add("--aug-noise-std", type=float, default=None)
@@ -1787,7 +1749,6 @@ def parse_args() -> TrainConfig:
         "train_split",
         "pos_weight_power",
         "pos_weight_clamp",
-        "ema_decay",
         "button_threshold_from_pos_weight",
         "button_threshold_min",
         "button_threshold_max",
@@ -1807,7 +1768,6 @@ def parse_args() -> TrainConfig:
         "last_action_feedback_ramp_epochs",
         "last_action_feedback_validation",
         "last_action_feedback_soft",
-        "button_label_smoothing",
         "aug_brightness",
         "aug_contrast",
         "aug_noise_std",
@@ -2031,14 +1991,9 @@ def train() -> None:
             f" best_score={eval_state.get('best_score')}"
             f" last_action_conditioning={bool(cfg.last_action_conditioning)})"
         )
-        start_epoch, global_step, best_score, resumed_ema_state = 0, 0, float("-inf"), None
-        ema = None
+        start_epoch, global_step, best_score = 0, 0, float("-inf")
     else:
-        start_epoch, global_step, best_score, resumed_ema_state = maybe_resume(base_model, optimizer, cfg, device)
-        ema = ModelEMA(base_model, decay=cfg.ema_decay) if float(cfg.ema_decay) > 0.0 else None
-        if ema is not None and resumed_ema_state:
-            ema.load_state_dict(resumed_ema_state)
-        print(f"Weight EMA: {'decay=%.4f (val + best checkpoint use averaged weights)' % cfg.ema_decay if ema else 'disabled'}")
+        start_epoch, global_step, best_score = maybe_resume(base_model, optimizer, cfg, device)
 
     if cfg.compile_model:
         compile_kwargs = {"fullgraph": False, "dynamic": False}
@@ -2130,16 +2085,14 @@ def train() -> None:
             total_steps=total_steps,
             global_step=global_step,
             streaming_reset_indices=streaming_reset_indices,
-            ema=ema,
             last_action_feedback_prob=train_feedback_prob,
         )
 
         val_metrics = None
         score = driving_score(train_metrics, cfg)
         if val_iter is not None and val_targets is not None and val_batches > 0:
-            ema_context = ema.swap() if ema is not None else nullcontext()
             val_feedback_prob = 1.0 if bool(cfg.last_action_feedback_validation) else 0.0
-            with ema_context, torch.inference_mode():
+            with torch.inference_mode():
                 val_metrics, _ = run_epoch(
                     desc=f"Epoch {epoch + 1}/{cfg.num_epochs} [val]",
                     model=model,
@@ -2174,20 +2127,15 @@ def train() -> None:
         if improved:
             best_score = score
             epochs_without_improvement = 0
-            # model_best holds the EMA weights (the ones validation measured),
-            # so run.py / test_model.py deploy exactly what was selected.
-            best_context = ema.swap() if ema is not None else nullcontext()
-            with best_context:
-                save_checkpoint(
-                    os.path.join(cfg.ckpt_dir, "model_best.pt"),
-                    model=base_model,
-                    optimizer=optimizer,
-                    cfg=cfg,
-                    epoch=epoch + 1,
-                    global_step=global_step,
-                    best_score=best_score,
-                    ema=ema,
-                )
+            save_checkpoint(
+                os.path.join(cfg.ckpt_dir, "model_best.pt"),
+                model=base_model,
+                optimizer=optimizer,
+                cfg=cfg,
+                epoch=epoch + 1,
+                global_step=global_step,
+                best_score=best_score,
+            )
         else:
             epochs_without_improvement += 1
 
@@ -2199,7 +2147,6 @@ def train() -> None:
             epoch=epoch + 1,
             global_step=global_step,
             best_score=best_score,
-            ema=ema,
         )
         if (epoch + 1) % cfg.save_every == 0:
             save_checkpoint(
@@ -2210,7 +2157,6 @@ def train() -> None:
                 epoch=epoch + 1,
                 global_step=global_step,
                 best_score=best_score,
-                ema=ema,
             )
 
         parts = [

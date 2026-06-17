@@ -512,7 +512,6 @@ def loss_breakdown(
     valid: np.ndarray,
     pos_weight: torch.Tensor,
     *,
-    label_smoothing: float,
     transition_weight: float,
     conflict_weight: float,
     names: Sequence[str],
@@ -523,9 +522,6 @@ def loss_breakdown(
     logits_t = torch.from_numpy(logits[valid]).float()
     labels_t = torch.from_numpy(labels[valid]).float()
     transitions_t = torch.from_numpy(transitions[valid]).float()
-    eps = float(label_smoothing)
-    if eps > 0.0:
-        labels_t = labels_t * (1.0 - eps) + 0.5 * eps
 
     plain_bce = F.binary_cross_entropy_with_logits(logits_t, labels_t, reduction="none")
     weighted_bce = F.binary_cross_entropy_with_logits(
@@ -848,7 +844,6 @@ def run_loss_viewer(args, model, cfg, raw_config, pairs, device, thresholds, dty
         transitions,
         valid,
         pos_weight,
-        label_smoothing=float(raw_config.get("button_label_smoothing", 0.05)),
         transition_weight=float(raw_config.get("transition_loss_weight", 4.0)),
         conflict_weight=float(raw_config.get("conflicting_button_loss_weight", 0.20)),
         names=names,
