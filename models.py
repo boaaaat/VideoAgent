@@ -20,6 +20,8 @@ STEM_CHANNELS = 32
 STAGE64_CHANNELS = 48
 STAGE32_CHANNELS = 96
 POLICY_FEATURE_CHANNELS = 96
+SPATIAL_ATTENTION_HEADS = 4
+POLICY_POOLED_FEATURES = POLICY_FEATURE_CHANNELS * SPATIAL_ATTENTION_HEADS
 POLICY_HEAD_HIDDEN = 128
 POLICY_HEAD_FEATURES = 64
 TEMPORAL_STATE_LAYERS = 3
@@ -283,21 +285,23 @@ class ConvGRUCell(nn.Module):
 
 
 class SpatialAttentionPool(nn.Module):
-    """Parameter-efficient spatial pooling over a recurrent feature map."""
+    """Multi-head spatial pooling over a recurrent feature map."""
 
-    def __init__(self, channels: int) -> None:
+    def __init__(self, channels: int, heads: int = SPATIAL_ATTENTION_HEADS) -> None:
         super().__init__()
+        self.channels = int(channels)
+        self.heads = _require_int_at_least("heads", heads, 1)
         self.pre = ConvNormAct(channels, channels, kernel_size=3, stride=1)
-        self.logits = nn.Conv2d(channels, 1, kernel_size=1)
+        self.logits = nn.Conv2d(channels, self.heads, kernel_size=1)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         feat = self.pre(x)
         b, c, h, w = feat.shape
-        scores = self.logits(feat).reshape(b, 1, h * w)
+        scores = self.logits(feat).reshape(b, self.heads, h * w)
         attn = torch.softmax(scores.float(), dim=-1).to(dtype=feat.dtype)
         feat_flat = feat.reshape(b, c, h * w)
-        pooled = torch.bmm(feat_flat, attn.transpose(1, 2)).squeeze(-1)
-        return pooled, attn.reshape(b, 1, h, w)
+        pooled = torch.einsum("bcn,bhn->bhc", feat_flat, attn).reshape(b, self.heads * c)
+        return pooled, attn.reshape(b, self.heads, h, w)
 
 
 class SharedEncoder(nn.Module):
@@ -371,10 +375,12 @@ class DrivingVideoPolicy(nn.Module):
 
         self.spatial_feat_channels = STAGE32_CHANNELS
         self.feat_channels = POLICY_FEATURE_CHANNELS
+        self.attention_heads = SPATIAL_ATTENTION_HEADS
+        self.pooled_feat_channels = POLICY_POOLED_FEATURES
         self.temporal_spatial_fusion = ZeroSpatialFusion()
 
-        self.attention_pool = SpatialAttentionPool(POLICY_FEATURE_CHANNELS)
-        self.fc1 = nn.Linear(POLICY_FEATURE_CHANNELS, POLICY_HEAD_HIDDEN)
+        self.attention_pool = SpatialAttentionPool(POLICY_FEATURE_CHANNELS, heads=SPATIAL_ATTENTION_HEADS)
+        self.fc1 = nn.Linear(POLICY_POOLED_FEATURES, POLICY_HEAD_HIDDEN)
         self.fc2 = nn.Linear(POLICY_HEAD_HIDDEN, POLICY_HEAD_FEATURES)
         self.head_dropout = nn.Dropout(0.10)
 
