@@ -133,7 +133,7 @@ class TrainConfig(ModelConfig):
     streaming_state_validation: bool = True
     streaming_segment_min_chunks: int = 2
     streaming_segment_max_chunks: int = 20
-    action_label_offset: int = -1
+    action_label_offset: int = 0
     # Last-action conditioning is useful, but teacher-forced ground truth can
     # hide runtime latching. Scheduled feedback below trains recovery from the
     # model's own previous predictions while keeping ground-truth labels.
@@ -179,7 +179,7 @@ class TrainConfig(ModelConfig):
     dataset_sync_delete_stale: Optional[bool] = None
     dataset_sync_hash_same_size: bool = True
 
-    resume: bool = False
+    resume: bool = True
     resume_path: Optional[str] = None
     ckpt_dir: str = "./checkpoints_rt"
     save_every: int = 1
