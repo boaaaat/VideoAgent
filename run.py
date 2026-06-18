@@ -236,6 +236,9 @@ def _coerce_config_types(cfg: RuntimeConfig) -> RuntimeConfig:
             raise ValueError(f"Single-horizon checkpoints must provide exactly one prediction offset, got {cfg.prediction_horizon_offsets}.")
     cfg.command_horizon = 1
     cfg.d_model = int(cfg.d_model)
+    cfg.action_decoder = str(getattr(cfg, "action_decoder", "mlp")).strip().lower()
+    cfg.action_query_heads = int(getattr(cfg, "action_query_heads", 4))
+    cfg.action_query_layers = int(getattr(cfg, "action_query_layers", 2))
     cfg.mouse_buttons_enabled = bool(cfg.mouse_buttons_enabled)
     cfg.gru_memory_frames = max(1, int(getattr(cfg, "gru_memory_frames", 80)))
     cfg.num_bin = len(cfg.key_names) + len(cfg.mouse_button_names)
@@ -326,6 +329,29 @@ def _apply_checkpoint_config(cfg: RuntimeConfig, overrides: Dict) -> RuntimeConf
     return cfg
 
 
+def _uses_removed_vector_gru(checkpoint_config: Dict, model_state: Dict) -> bool:
+    if str(checkpoint_config.get("temporal_architecture", "")).strip().lower() == "vector_gru":
+        return True
+    vector_prefixes = (
+        "vector_pool.",
+        "frame_fc1.",
+        "frame_fc2.",
+        "temporal_rnn.",
+        "temporal_fusion.",
+    )
+    return any(str(key).startswith(vector_prefixes) for key in model_state)
+
+
+def _raise_incompatible_checkpoint(ckpt_path: str, checkpoint_config: Dict, model_state: Dict) -> None:
+    if _uses_removed_vector_gru(checkpoint_config, model_state):
+        raise RuntimeError(
+            f"Checkpoint {ckpt_path!r} was trained with the removed vector_gru architecture. "
+            "It cannot be loaded by the restored spatial ConvGRU/action-query model. "
+            "Train a fresh checkpoint with the current train.py, or point RuntimeConfig.ckpt_path "
+            "at a compatible spatial ConvGRU checkpoint."
+        )
+
+
 def _checkpoint_path(cfg: RuntimeConfig) -> str:
     if cfg.ckpt_path is not None:
         if not os.path.exists(cfg.ckpt_path):
@@ -353,6 +379,7 @@ def load_checkpoint(
 
     checkpoint_config = dict(state["config"])
     model_state = state["model_state"]
+    _raise_incompatible_checkpoint(ckpt_path, checkpoint_config, model_state)
 
     cfg = _apply_checkpoint_config(cfg, checkpoint_config)
     cfg = _coerce_config_types(cfg)
@@ -461,13 +488,20 @@ def main() -> None:
     RUNTIME_CFG = cfg
 
     model = DrivingVideoPolicy(cfg).to(device)
-    model.load_state_dict(model_state)
+    try:
+        model.load_state_dict(model_state)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"Checkpoint {cfg.ckpt_path!r} is not compatible with the current model "
+            f"(decoder={cfg.action_decoder}). Train a fresh checkpoint or choose a compatible one."
+        ) from exc
     print(
         "Model:",
         f"size={cfg.model_size}",
         f"prediction_offset=+{int(cfg.prediction_horizon_offsets[0])}",
         f"d_model={cfg.d_model}",
         "temporal=convgru",
+        f"decoder={cfg.action_decoder}",
         "input=masked_rgb" + ("+last_action" if cfg.last_action_conditioning else ""),
     )
     print(

@@ -684,26 +684,19 @@ def _policy_visuals_for_frame(
                 if bool(need_trajectory):
                     fused = temporal_feat + model.temporal_spatial_fusion(spatial_feat)
                     visual_feat = model._pool_features(fused)
-                    if model.last_action_encoder is not None:
-                        if prev_action is None:
-                            prev_for_head = torch.zeros(
-                                (b, int(cfg.num_bin)),
-                                device=visual_feat.device,
-                                dtype=visual_feat.dtype,
-                            )
-                        else:
-                            prev_for_head = prev_action.to(device=visual_feat.device, dtype=visual_feat.dtype)
-                        action_feat = model._last_action_features(
-                            prev_for_head,
-                            b,
-                            1,
+                    if visual_feat.dim() == 3:
+                        visual_for_head = visual_feat.reshape(b, 1, visual_feat.size(1), visual_feat.size(2))
+                    else:
+                        visual_for_head = visual_feat.reshape(b, 1, visual_feat.size(1))
+                    if prev_action is None:
+                        prev_for_head = torch.zeros(
+                            (b, int(cfg.num_bin)),
                             device=visual_feat.device,
                             dtype=visual_feat.dtype,
-                        ).reshape(b, cfg.d_model)
-                        fc_out = model.head_fusion(torch.cat([visual_feat, action_feat], dim=-1))
+                        )
                     else:
-                        fc_out = model.head_fusion(visual_feat)
-                    logits = model._button_logits(fc_out)[0].detach().float()
+                        prev_for_head = prev_action.to(device=visual_feat.device, dtype=visual_feat.dtype)
+                    logits = model._features_to_logits(visual_for_head, prev_for_head)[0, 0].detach().float()
                     trajectory_probs = torch.sigmoid(logits).reshape(1, -1).detach().cpu().numpy().astype(np.float32)
                     thresholds = _button_thresholds(cfg, device=logits.device, dtype=logits.dtype)
                     next_action = (

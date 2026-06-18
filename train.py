@@ -27,7 +27,11 @@ from action_space import game_data_root
 from augmentations import augment_frames
 from dataset_wsl_sync import sync_dataset_for_training
 from models import (
+    ACTION_DECODER_ACTION_QUERY,
+    ACTION_DECODER_MLP,
+    ACTION_DECODERS,
     DrivingVideoPolicy,
+    LAST_ACTION_EMBEDDING_DROPOUT,
     ModelConfig,
     PolicyOutput,
     TemporalState,
@@ -99,10 +103,13 @@ def _require_float_range(name: str, value: object, minimum: float, maximum: floa
 
 @dataclass
 class TrainConfig(ModelConfig):
+    action_decoder: str = ACTION_DECODER_ACTION_QUERY
+    zoneout: float = 0.05
+
     batch_size: int = 1
     target_effective_batch: int = 8
     grad_accum: int = field(init=False)
-    num_epochs: int = 25
+    num_epochs: int = 50
 
     lr: float = 2e-4
     min_lr: float = 1e-5
@@ -138,11 +145,11 @@ class TrainConfig(ModelConfig):
     # hide runtime latching. Scheduled feedback below trains recovery from the
     # model's own previous predictions while keeping ground-truth labels.
     last_action_conditioning: bool = True
-    last_action_feedback_train_prob: float = 0.90
-    last_action_feedback_warmup_epochs: int = 1
-    last_action_feedback_ramp_epochs: int = 4
+    last_action_feedback_train_prob: float = 0.25
+    last_action_feedback_warmup_epochs: int = 4
+    last_action_feedback_ramp_epochs: int = 8
     last_action_feedback_validation: bool = True
-    last_action_feedback_soft: bool = False
+    last_action_feedback_soft: bool = True
     skipped_key_names: Optional[Sequence[str]] = ("e", "q", "c", "z")
     # Extra BCE weight on frames where a key changes state. Transitions are
     # ~5% of labels but are all that matters for control.
@@ -1444,7 +1451,7 @@ def run_epoch(
                 prev_action = prepare_last_action_context(batch_targets.last_action)
                 feedback_mask = make_last_action_feedback_mask(prev_action, last_action_feedback_prob)
                 if float(last_action_feedback_prob) > 0.0:
-                    feedback_total += int(prev_action[:, 1:].numel())
+                    feedback_total += int(prev_action[:, 1:, :1].numel())
                 if feedback_mask is not None:
                     feedback_selected += feedback_mask.sum().to(dtype=feedback_selected.dtype)
                 if use_streaming_state:
@@ -1556,6 +1563,22 @@ def latest_checkpoint(ckpt_dir: str) -> Optional[str]:
     return None
 
 
+def uses_removed_vector_gru(checkpoint_config: object, model_state: object) -> bool:
+    if isinstance(checkpoint_config, dict):
+        if str(checkpoint_config.get("temporal_architecture", "")).strip().lower() == "vector_gru":
+            return True
+    if isinstance(model_state, dict):
+        vector_prefixes = (
+            "vector_pool.",
+            "frame_fc1.",
+            "frame_fc2.",
+            "temporal_rnn.",
+            "temporal_fusion.",
+        )
+        return any(str(key).startswith(vector_prefixes) for key in model_state)
+    return False
+
+
 def save_checkpoint(
     path: str,
     *,
@@ -1598,6 +1621,26 @@ def maybe_resume(
     missing_keys = [key for key in ("model_state", "optimizer_state", "epoch", "global_step", "best_score") if key not in state]
     if missing_keys:
         raise RuntimeError(f"Cannot resume checkpoint {ckpt_path}: missing keys {missing_keys}.")
+    ckpt_config = state.get("config") if isinstance(state, dict) else None
+    if uses_removed_vector_gru(ckpt_config, state.get("model_state")):
+        message = "checkpoint was trained with the removed vector_gru architecture"
+        if cfg.resume_path is not None:
+            raise RuntimeError(f"Cannot resume checkpoint {ckpt_path}: {message}.")
+        print(f"Skipping incompatible checkpoint {ckpt_path}: {message}. Starting a fresh run.")
+        return 0, 0, -1e9
+    ckpt_decoder = ACTION_DECODER_MLP
+    if isinstance(ckpt_config, dict):
+        ckpt_decoder = str(ckpt_config.get("action_decoder", ACTION_DECODER_MLP)).strip().lower()
+    current_decoder = str(cfg.action_decoder).strip().lower()
+    if ckpt_decoder != current_decoder:
+        message = (
+            f"Checkpoint decoder {ckpt_decoder!r} does not match current decoder "
+            f"{current_decoder!r}."
+        )
+        if cfg.resume_path is not None:
+            raise RuntimeError(f"Cannot resume checkpoint {ckpt_path}: {message}")
+        print(f"Skipping incompatible checkpoint {ckpt_path}: {message} Starting a fresh run.")
+        return 0, 0, -1e9
     try:
         model.load_state_dict(state["model_state"])
     except RuntimeError as exc:
@@ -1633,6 +1676,9 @@ def parse_args() -> TrainConfig:
     add("--prediction-horizon-offsets", default=None, help="Single future frame offset, e.g. 1.")
     add("--model-size", type=int, default=None)
     add("--d-model", type=int, default=None)
+    add("--action-decoder", choices=list(ACTION_DECODERS), default=None)
+    add("--action-query-heads", type=int, default=None)
+    add("--action-query-layers", type=int, default=None)
     add("--spatial-dropout", type=float, default=None)
     add("--head-dropout", type=float, default=None)
     add("--zoneout", type=float, default=None)
@@ -1736,6 +1782,9 @@ def parse_args() -> TrainConfig:
         "prediction_horizon_offsets",
         "model_size",
         "d_model",
+        "action_decoder",
+        "action_query_heads",
+        "action_query_layers",
         "spatial_dropout",
         "head_dropout",
         "zoneout",
@@ -1870,6 +1919,17 @@ def train() -> None:
         f"conflict_weight={float(cfg.conflicting_button_loss_weight):.4f}",
         f"transition_weight={float(cfg.transition_loss_weight):.1f}",
     )
+    decoder_parts = ["Policy decoder:", f"type={cfg.action_decoder}"]
+    if cfg.action_decoder == ACTION_DECODER_ACTION_QUERY:
+        decoder_parts.extend(
+            [
+                f"queries={int(cfg.num_bin)}",
+                f"heads={int(cfg.action_query_heads)}",
+                f"layers={int(cfg.action_query_layers)}",
+            ]
+        )
+    print(" ".join(decoder_parts))
+    print("Temporal regularization:", f"zoneout={float(cfg.zoneout):.2f}")
     print(
         "Streaming state training:",
         f"enabled={bool(cfg.streaming_state_training)}",
@@ -1882,7 +1942,7 @@ def train() -> None:
     print(
         "Last action conditioning:",
         f"enabled={bool(cfg.last_action_conditioning)}",
-        "dropout=disabled",
+        f"embedding_dropout={LAST_ACTION_EMBEDDING_DROPOUT:.2f}",
     )
     print(
         "Last action feedback:",
@@ -1977,7 +2037,15 @@ def train() -> None:
         if isinstance(ckpt_config, dict):
             # architecture-affecting flag must match the checkpoint under eval
             # (legacy checkpoints predate the flag and were trained with it on)
+            if uses_removed_vector_gru(ckpt_config, eval_state.get("model_state")):
+                raise RuntimeError(
+                    f"Cannot eval checkpoint {eval_ckpt_path}: it was trained with the removed "
+                    "vector_gru architecture."
+                )
             cfg.last_action_conditioning = bool(ckpt_config.get("last_action_conditioning", True))
+            cfg.action_decoder = str(ckpt_config.get("action_decoder", ACTION_DECODER_MLP)).strip().lower()
+            cfg.action_query_heads = int(ckpt_config.get("action_query_heads", cfg.action_query_heads))
+            cfg.action_query_layers = int(ckpt_config.get("action_query_layers", cfg.action_query_layers))
 
     base_model: torch.nn.Module = DrivingVideoPolicy(cfg).to(device)
     base_model = base_model.to(memory_format=torch.channels_last)

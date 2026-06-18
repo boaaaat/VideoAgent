@@ -25,10 +25,15 @@ SPATIAL_GRID_COORD_CHANNELS = 2
 POLICY_POOLED_FEATURES = (POLICY_FEATURE_CHANNELS + SPATIAL_GRID_COORD_CHANNELS) * SPATIAL_GRID_SIZE * SPATIAL_GRID_SIZE
 POLICY_HEAD_HIDDEN = 256
 POLICY_HEAD_FEATURES = 128
+ACTION_QUERY_DECODER_HEADS = 4
+ACTION_QUERY_DECODER_LAYERS = 2
 TEMPORAL_STATE_LAYERS = 3
 PACKED_STATE_CHANNELS = POLICY_FEATURE_CHANNELS
 LAST_ACTION_EMBEDDING_DROPOUT = 0.25
 DEFAULT_PREDICTION_OFFSET = 1
+ACTION_DECODER_MLP = "mlp"
+ACTION_DECODER_ACTION_QUERY = "action_query"
+ACTION_DECODERS = (ACTION_DECODER_MLP, ACTION_DECODER_ACTION_QUERY)
 
 
 def _require_int_at_least(name: str, value: object, minimum: int) -> int:
@@ -94,6 +99,9 @@ class ModelConfig:
     spatial_dropout: float = 0.10
     head_dropout: float = 0.20
     zoneout: float = 0.0
+    action_decoder: str = ACTION_DECODER_MLP
+    action_query_heads: int = ACTION_QUERY_DECODER_HEADS
+    action_query_layers: int = ACTION_QUERY_DECODER_LAYERS
     # Feed the previous action into the heads. Training can replace teacher
     # actions with detached model outputs, so this remains enabled for current
     # runs while legacy checkpoints with last_action_encoder weights still load.
@@ -125,6 +133,15 @@ class ModelConfig:
         self.spatial_dropout = _require_float_range("spatial_dropout", self.spatial_dropout, 0.0, 0.9)
         self.head_dropout = _require_float_range("head_dropout", self.head_dropout, 0.0, 0.9)
         self.zoneout = _require_float_range("zoneout", self.zoneout, 0.0, 0.9)
+        self.action_decoder = str(self.action_decoder).strip().lower()
+        if self.action_decoder not in ACTION_DECODERS:
+            raise ValueError(f"action_decoder must be one of {ACTION_DECODERS}, got {self.action_decoder!r}.")
+        self.action_query_heads = _require_int_at_least("action_query_heads", self.action_query_heads, 1)
+        if POLICY_HEAD_FEATURES % self.action_query_heads != 0:
+            raise ValueError(
+                f"action_query_heads must divide {POLICY_HEAD_FEATURES}, got {self.action_query_heads}."
+            )
+        self.action_query_layers = _require_int_at_least("action_query_layers", self.action_query_layers, 1)
         self.last_action_conditioning = bool(self.last_action_conditioning)
 
         if self.key_names is None:
@@ -322,6 +339,93 @@ class SpatialGridPool(nn.Module):
         return torch.cat([pooled, coords], dim=1).flatten(1)
 
 
+class ActionQueryDecoderLayer(nn.Module):
+    def __init__(self, features: int, heads: int, dropout: float) -> None:
+        super().__init__()
+        self.query_norm = nn.LayerNorm(features)
+        self.token_norm = nn.LayerNorm(features)
+        self.cross_attn = nn.MultiheadAttention(
+            features,
+            int(heads),
+            dropout=float(dropout),
+            batch_first=True,
+        )
+        self.ffn_norm = nn.LayerNorm(features)
+        hidden = max(features * 2, POLICY_HEAD_HIDDEN)
+        self.ffn = nn.Sequential(
+            nn.Linear(features, hidden),
+            nn.SiLU(inplace=True),
+            nn.Dropout(float(dropout)),
+            nn.Linear(hidden, features),
+        )
+
+    def forward(self, queries: torch.Tensor, tokens: torch.Tensor) -> torch.Tensor:
+        norm_tokens = self.token_norm(tokens)
+        attn_out, _ = self.cross_attn(
+            self.query_norm(queries),
+            norm_tokens,
+            norm_tokens,
+            need_weights=False,
+        )
+        queries = queries + attn_out
+        return queries + self.ffn(self.ffn_norm(queries))
+
+
+class ActionQueryDecoder(nn.Module):
+    """Per-action cross-attention over coordinate-aware spatial tokens."""
+
+    def __init__(
+        self,
+        channels: int,
+        num_actions: int,
+        *,
+        grid_size: int = SPATIAL_GRID_SIZE,
+        features: int = POLICY_HEAD_FEATURES,
+        heads: int = ACTION_QUERY_DECODER_HEADS,
+        layers: int = ACTION_QUERY_DECODER_LAYERS,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.channels = int(channels)
+        self.num_actions = _require_int_at_least("num_actions", num_actions, 1)
+        self.grid_size = _require_int_at_least("grid_size", grid_size, 1)
+        self.features = _require_int_at_least("features", features, 1)
+        self.heads = _require_int_at_least("heads", heads, 1)
+        self.layers_count = _require_int_at_least("layers", layers, 1)
+        if self.features % self.heads != 0:
+            raise ValueError(f"heads must divide features, got heads={self.heads} features={self.features}.")
+
+        self.pre = ConvNormAct(channels, channels, kernel_size=3, stride=1)
+        self.token_proj = nn.Linear(channels + SPATIAL_GRID_COORD_CHANNELS, self.features)
+        self.token_norm = nn.LayerNorm(self.features)
+        self.action_queries = nn.Parameter(torch.empty(self.num_actions, self.features))
+        self.layers = nn.ModuleList(
+            ActionQueryDecoderLayer(self.features, self.heads, float(dropout))
+            for _ in range(self.layers_count)
+        )
+        self.out_norm = nn.LayerNorm(self.features)
+        coords = torch.linspace(-1.0, 1.0, self.grid_size, dtype=torch.float32)
+        yy, xx = torch.meshgrid(coords, coords, indexing="ij")
+        self.register_buffer("_coord_template", torch.stack((xx, yy), dim=0).unsqueeze(0), persistent=False)
+        nn.init.normal_(self.action_queries, mean=0.0, std=0.02)
+
+    def _coord_grid(self, batch_size: int, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        grid = self._coord_template.to(device=device, dtype=dtype)
+        return grid.expand(batch_size, -1, -1, -1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        feat = self.pre(x)
+        pooled = F.adaptive_avg_pool2d(feat, (self.grid_size, self.grid_size))
+        coords = self._coord_grid(pooled.size(0), device=pooled.device, dtype=pooled.dtype)
+        tokens = torch.cat([pooled, coords], dim=1).flatten(2).transpose(1, 2)
+        tokens = self.token_norm(self.token_proj(tokens))
+        queries = self.action_queries.to(device=tokens.device, dtype=tokens.dtype)
+        queries = queries.unsqueeze(0).expand(tokens.size(0), -1, -1).contiguous()
+        for layer in self.layers:
+            queries = layer(queries, tokens)
+        return self.out_norm(queries)
+
+
 class SharedEncoder(nn.Module):
     """
     Shared per-frame encoder.
@@ -396,13 +500,26 @@ class DrivingVideoPolicy(nn.Module):
         self.spatial_grid_size = SPATIAL_GRID_SIZE
         self.pooled_feat_channels = POLICY_POOLED_FEATURES
         self.temporal_spatial_fusion = ZeroSpatialFusion()
+        self.action_decoder = str(cfg.action_decoder)
 
         self.spatial_context = SpatialContextBlock(POLICY_FEATURE_CHANNELS)
         self.spatial_dropout = nn.Dropout2d(float(cfg.spatial_dropout))
-        self.grid_pool = SpatialGridPool(POLICY_FEATURE_CHANNELS, grid_size=SPATIAL_GRID_SIZE)
-        self.fc1 = nn.Linear(POLICY_POOLED_FEATURES, POLICY_HEAD_HIDDEN)
-        self.fc2 = nn.Linear(POLICY_HEAD_HIDDEN, POLICY_HEAD_FEATURES)
         self.head_dropout = nn.Dropout(float(cfg.head_dropout))
+        if self.action_decoder == ACTION_DECODER_ACTION_QUERY:
+            self.action_query_decoder = ActionQueryDecoder(
+                POLICY_FEATURE_CHANNELS,
+                self.cfg.num_bin,
+                grid_size=SPATIAL_GRID_SIZE,
+                features=POLICY_HEAD_FEATURES,
+                heads=int(self.cfg.action_query_heads),
+                layers=int(self.cfg.action_query_layers),
+                dropout=float(cfg.head_dropout),
+            )
+            self.pooled_feat_channels = self.cfg.num_bin * POLICY_HEAD_FEATURES
+        else:
+            self.grid_pool = SpatialGridPool(POLICY_FEATURE_CHANNELS, grid_size=SPATIAL_GRID_SIZE)
+            self.fc1 = nn.Linear(POLICY_POOLED_FEATURES, POLICY_HEAD_HIDDEN)
+            self.fc2 = nn.Linear(POLICY_HEAD_HIDDEN, POLICY_HEAD_FEATURES)
 
         if cfg.last_action_conditioning:
             action_hidden = max(4, min(32, cfg.num_bin * 2, self.cfg.d_model // 4))
@@ -429,8 +546,12 @@ class DrivingVideoPolicy(nn.Module):
             if cfg.last_action_conditioning
             else nn.Identity()
         )
-        self.button_head = nn.Linear(POLICY_HEAD_FEATURES, self.cfg.num_bin)
-        nn.init.constant_(self.button_head.bias, -1.0)
+        if self.action_decoder == ACTION_DECODER_ACTION_QUERY:
+            self.action_query_head = nn.Linear(POLICY_HEAD_FEATURES, 1)
+            nn.init.constant_(self.action_query_head.bias, -1.0)
+        else:
+            self.button_head = nn.Linear(POLICY_HEAD_FEATURES, self.cfg.num_bin)
+            nn.init.constant_(self.button_head.bias, -1.0)
 
     def _initial_temporal_state(
         self,
@@ -454,6 +575,15 @@ class DrivingVideoPolicy(nn.Module):
             device=device,
             dtype=dtype,
         )
+
+    def _zoneout_state(self, candidate: torch.Tensor, previous: torch.Tensor) -> torch.Tensor:
+        prob = float(self.cfg.zoneout)
+        if prob <= 0.0 or not self.training:
+            return candidate
+        if candidate.shape != previous.shape:
+            return candidate
+        keep = torch.empty_like(candidate).bernoulli_(1.0 - prob)
+        return candidate * keep + previous * (1.0 - keep)
 
     def _prepare_temporal_state(
         self,
@@ -603,13 +733,13 @@ class DrivingVideoPolicy(nn.Module):
             high_width = int(h64_prev.size(-1))
             s64_t = spatial_step.new_zeros(b, STAGE64_CHANNELS, high_height, high_width)
 
-        h64 = self.gru64(s64_t, h64_prev)
+        h64 = self._zoneout_state(self.gru64(s64_t, h64_prev), h64_prev)
         h64_down = self.down64_to_32(h64)
         if h64_down.shape[-2:] != spatial_step.shape[-2:]:
             h64_down = F.interpolate(h64_down, size=spatial_step.shape[-2:], mode="bilinear", align_corners=False)
         fused32 = self.fuse32(torch.cat([spatial_step, h64_down], dim=1))
-        h32_1 = self.gru32_1(fused32, h32_1_prev)
-        h32_2 = self.gru32_2(h32_1, h32_2_prev)
+        h32_1 = self._zoneout_state(self.gru32_1(fused32, h32_1_prev), h32_1_prev)
+        h32_2 = self._zoneout_state(self.gru32_2(h32_1, h32_2_prev), h32_2_prev)
         return h64, h32_1, h32_2
 
     def _context_features(self, h32_2: torch.Tensor) -> torch.Tensor:
@@ -646,6 +776,8 @@ class DrivingVideoPolicy(nn.Module):
         return context, self._pack_temporal_state(h64, h32_1, h32_2)
 
     def _pool_features(self, fused: torch.Tensor) -> torch.Tensor:
+        if self.action_decoder == ACTION_DECODER_ACTION_QUERY:
+            return self.action_query_decoder(fused)
         pooled = self.grid_pool(fused)
         z = F.silu(self.fc1(pooled))
         z = self.head_dropout(z)
@@ -654,6 +786,12 @@ class DrivingVideoPolicy(nn.Module):
     def _button_logits(self, features: torch.Tensor) -> torch.Tensor:
         if features.size(-1) != POLICY_HEAD_FEATURES:
             raise ValueError(f"Expected final feature dim {POLICY_HEAD_FEATURES}, got {features.size(-1)}.")
+        if features.dim() == 4:
+            if features.size(2) != self.cfg.num_bin:
+                raise ValueError(f"Expected {self.cfg.num_bin} action features, got {features.size(2)}.")
+            return self.action_query_head(features).squeeze(-1)
+        if features.dim() != 3:
+            raise ValueError(f"Expected features with shape [B,T,F] or [B,T,A,F], got {tuple(features.shape)}.")
         return self.button_head(features)
 
     def _normalize_frames(self, frames: torch.Tensor) -> torch.Tensor:
@@ -720,9 +858,13 @@ class DrivingVideoPolicy(nn.Module):
         features: torch.Tensor,
         prev_action: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        b, t, _ = features.shape
+        if features.dim() not in (3, 4):
+            raise ValueError(f"Expected features with shape [B,T,F] or [B,T,A,F], got {tuple(features.shape)}.")
+        b, t = int(features.shape[0]), int(features.shape[1])
         if self.last_action_encoder is not None:
             action_feat = self._last_action_features(prev_action, b, t, device=features.device, dtype=features.dtype)
+            if features.dim() == 4:
+                action_feat = action_feat.unsqueeze(2).expand(b, t, features.size(2), self.cfg.d_model)
             features = self.head_fusion(torch.cat([features, action_feat], dim=-1))
         else:
             features = self.head_fusion(features)
@@ -787,7 +929,10 @@ class DrivingVideoPolicy(nn.Module):
         )
         flat_context = self._context_features(flat_temporal)
         visual_flat = self._pool_features(flat_context)
-        visual_feat = visual_flat.reshape(b, t_steps, POLICY_HEAD_FEATURES)
+        if self.action_decoder == ACTION_DECODER_ACTION_QUERY:
+            visual_feat = visual_flat.reshape(b, t_steps, self.cfg.num_bin, POLICY_HEAD_FEATURES)
+        else:
+            visual_feat = visual_flat.reshape(b, t_steps, POLICY_HEAD_FEATURES)
         next_hidden = self._pack_temporal_state(h64_t, h32_1_t, h32_2_t)
         return visual_feat, TemporalState(hidden_state=next_hidden.detach())
 
@@ -877,7 +1022,11 @@ class DrivingVideoPolicy(nn.Module):
     ) -> torch.Tensor:
         if self.last_action_encoder is None or feedback_mask is None:
             return self._features_to_logits(visual_feat, prev_action)
-        b, t, _ = visual_feat.shape
+        if visual_feat.dim() not in (3, 4):
+            raise ValueError(
+                f"Expected visual features with shape [B,T,F] or [B,T,A,F], got {tuple(visual_feat.shape)}."
+            )
+        b, t = int(visual_feat.shape[0]), int(visual_feat.shape[1])
         teacher = self._teacher_action_sequence(
             prev_action,
             b,
@@ -961,7 +1110,11 @@ class DrivingVideoPolicy(nn.Module):
             high_width=s64_t.shape[-1],
         )
         temporal_feat, new_hidden = self._temporal_step(s32_t, h_t, s64_t=s64_t)
-        visual_feat = self._pool_features(temporal_feat).reshape(b, 1, POLICY_HEAD_FEATURES)
+        visual_flat = self._pool_features(temporal_feat)
+        if self.action_decoder == ACTION_DECODER_ACTION_QUERY:
+            visual_feat = visual_flat.reshape(b, 1, self.cfg.num_bin, POLICY_HEAD_FEATURES)
+        else:
+            visual_feat = visual_flat.reshape(b, 1, POLICY_HEAD_FEATURES)
         squeezed = PolicyOutput(button_logits=self._features_to_logits(visual_feat, prev_action).reshape(b, self.cfg.num_bin))
         new_state = TemporalState(hidden_state=new_hidden.detach())
         return squeezed, new_state
