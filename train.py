@@ -159,14 +159,14 @@ class TrainConfig(ModelConfig):
     # model's own previous predictions while keeping ground-truth labels.
     last_action_conditioning: bool = True
     last_action_feedback_train_prob: float = 1.0
-    last_action_feedback_warmup_epochs: int = 4
-    last_action_feedback_ramp_epochs: int = 8
+    last_action_feedback_warmup_epochs: int = 3
+    last_action_feedback_ramp_epochs: int = 7
     last_action_feedback_validation: bool = True
     last_action_feedback_soft: bool = True
     skipped_key_names: Optional[Sequence[str]] = ("e", "q", "c", "z")
     # Extra BCE weight on frames where a key changes state. Transitions are
     # ~5% of labels but are all that matters for control.
-    transition_loss_weight: float = 5.0
+    transition_loss_weight: float = 4.0
 
     aug_brightness: float = 0.15
     aug_contrast: float = 0.20
