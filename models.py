@@ -999,7 +999,7 @@ class DrivingVideoPolicy(nn.Module):
                 h32_2_t,
                 s64_t=s64_seq[:, step],
             )
-            recurrent_steps.append(self._head_spatial_features(h32_2_t, s32_seq[:, step], s64_seq[:, step]))
+            recurrent_steps.append(h32_2_t)
 
         temporal_seq = torch.stack(recurrent_steps, dim=1)
         t_steps = int(temporal_seq.size(1))
@@ -1009,7 +1009,20 @@ class DrivingVideoPolicy(nn.Module):
             temporal_seq.size(-2),
             temporal_seq.size(-1),
         )
-        flat_context = self._context_features(flat_temporal)
+        flat_spatial = s32_seq.reshape(
+            b * t_steps,
+            POLICY_FEATURE_CHANNELS,
+            s32_seq.size(-2),
+            s32_seq.size(-1),
+        )
+        flat_high = s64_seq.reshape(
+            b * t_steps,
+            STAGE64_CHANNELS,
+            s64_seq.size(-2),
+            s64_seq.size(-1),
+        )
+        flat_head = self._head_spatial_features(flat_temporal, flat_spatial, flat_high)
+        flat_context = self._context_features(flat_head)
         visual_flat = self._pool_features(flat_context)
         if self.action_decoder == ACTION_DECODER_ACTION_QUERY:
             visual_feat = visual_flat.reshape(b, t_steps, self.cfg.num_bin, POLICY_HEAD_FEATURES)
