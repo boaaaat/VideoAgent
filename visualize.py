@@ -1140,12 +1140,12 @@ def process_video_cnn(
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Visualize feature-energy heatmaps from the current CNN encoders.")
-    # parser.add_argument("--input", default=r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\data\greenville\run_20260520_121714.mp4', help="Input video path. Defaults to the newest run in cfg.data_root.")
-    # parser.add_argument("--input", default=r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\data\greenville\run_20260520_214455.mp4', help="Input video path. Defaults to the newest run in cfg.data_root.")
-    # parser.add_argument("--input", default=r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\data\greenville\run_20260522_161244.mp4', help="Input video path. Defaults to the newest run in cfg.data_root.")
-    # parser.add_argument("--input", default=r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\data\greenville\run_20260526_174504.mp4', help="Input video path. Defaults to the newest run in cfg.data_root.")
-    # parser.add_argument("--input", default=r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\data\greenville\run_20260526_175335.mp4', help="Input video path. Defaults to the newest run in cfg.data_root.")
-    parser.add_argument("--input", default=r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\data\greenville\run_20260526_180131.mp4', help="Input video path. Defaults to the newest run in cfg.data_root.")
+    # parser.add_argument("--input", default=r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\data\greenville\train\run_20260520_121714.mp4', help="Input video path. Defaults to the newest run in cfg.data_root.")
+    # parser.add_argument("--input", default=r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\data\greenville\train\run_20260520_214455.mp4', help="Input video path. Defaults to the newest run in cfg.data_root.")
+    # parser.add_argument("--input", default=r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\data\greenville\train\run_20260522_161244.mp4', help="Input video path. Defaults to the newest run in cfg.data_root.")
+    # parser.add_argument("--input", default=r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\data\greenville\train\run_20260526_174504.mp4', help="Input video path. Defaults to the newest run in cfg.data_root.")
+    # parser.add_argument("--input", default=r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\data\greenville\train\run_20260526_175335.mp4', help="Input video path. Defaults to the newest run in cfg.data_root.")
+    parser.add_argument("--input", default=r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\data\greenville\train\run_20260526_180131.mp4', help="Input video path. Defaults to the newest run in cfg.data_root.")
     parser.add_argument("--output", default=None, help="Output video path (.mp4). Default auto-names next to input.")
     parser.add_argument("--csv", default=None, help="CSV labels for the input video. Default auto-detects next to --input.")
     parser.add_argument(
@@ -1167,7 +1167,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--layer",
         choices=["motion", "stage1", "stage2", "stage3", "stage4", "spatial", "tokens"],
-        default="stage2",
+        default="stage1",
         help=(
             "CNN signal to visualize. Policy checkpoints use masked RGB for stage1-stage4, final spatial "
             "features for spatial, and ConvGRU hidden features for tokens. Inverse checkpoints support "

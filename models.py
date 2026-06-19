@@ -15,13 +15,15 @@ from action_space import (
 )
 
 
-POLICY_INPUT_CHANNELS = 3
+RGB_INPUT_CHANNELS = 3
+POLICY_INPUT_CHANNELS = RGB_INPUT_CHANNELS
 STEM_CHANNELS = 32
 STAGE64_CHANNELS = 48
 STAGE32_CHANNELS = 96
 POLICY_FEATURE_CHANNELS = 96
-SPATIAL_GRID_SIZE = 8
+SPATIAL_GRID_SIZE = 16
 SPATIAL_GRID_COORD_CHANNELS = 2
+PERSPECTIVE_COORD_CHANNELS = 4
 POLICY_POOLED_FEATURES = (POLICY_FEATURE_CHANNELS + SPATIAL_GRID_COORD_CHANNELS) * SPATIAL_GRID_SIZE * SPATIAL_GRID_SIZE
 POLICY_HEAD_HIDDEN = 256
 POLICY_HEAD_FEATURES = 128
@@ -316,6 +318,55 @@ class SpatialContextBlock(nn.Module):
         return self.blocks(x)
 
 
+def perspective_coord_grid(
+    batch_size: int,
+    height: int,
+    width: int,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    y_coords = torch.linspace(-1.0, 1.0, int(height), device=device, dtype=dtype)
+    x_coords = torch.linspace(-1.0, 1.0, int(width), device=device, dtype=dtype)
+    yy, xx = torch.meshgrid(y_coords, x_coords, indexing="ij")
+    bottom_weight = (yy + 1.0) * 0.5
+    horizon_weight = torch.exp(-((yy + 0.15) / 0.35).square())
+    grid = torch.stack((xx, yy, bottom_weight, horizon_weight), dim=0).unsqueeze(0)
+    return grid.expand(int(batch_size), -1, -1, -1)
+
+
+class MultiScaleSpatialFusion(nn.Module):
+    def __init__(
+        self,
+        temporal_channels: int = POLICY_FEATURE_CHANNELS,
+        high_channels: int = STAGE64_CHANNELS,
+        out_channels: int = POLICY_FEATURE_CHANNELS,
+    ) -> None:
+        super().__init__()
+        self.high_to_low = ConvNormAct(high_channels, out_channels, kernel_size=3, stride=2)
+        self.global_proj = ConvNormAct(temporal_channels, out_channels, kernel_size=1, stride=1, padding=0)
+        fusion_channels = temporal_channels + out_channels + out_channels + PERSPECTIVE_COORD_CHANNELS
+        self.fuse = nn.Sequential(
+            ConvNormAct(fusion_channels, out_channels, kernel_size=1, stride=1, padding=0),
+            BasicResBlock(out_channels, out_channels, stride=1, dilation=1),
+        )
+
+    def forward(self, temporal_spatial: torch.Tensor, high_spatial: torch.Tensor) -> torch.Tensor:
+        high = self.high_to_low(high_spatial)
+        if high.shape[-2:] != temporal_spatial.shape[-2:]:
+            high = F.interpolate(high, size=temporal_spatial.shape[-2:], mode="bilinear", align_corners=False)
+        global_context = F.adaptive_avg_pool2d(temporal_spatial, 1)
+        global_context = self.global_proj(global_context).expand(-1, -1, temporal_spatial.size(-2), temporal_spatial.size(-1))
+        coords = perspective_coord_grid(
+            temporal_spatial.size(0),
+            temporal_spatial.size(-2),
+            temporal_spatial.size(-1),
+            device=temporal_spatial.device,
+            dtype=temporal_spatial.dtype,
+        )
+        return self.fuse(torch.cat([temporal_spatial, high, global_context, coords], dim=1))
+
+
 class SpatialGridPool(nn.Module):
     """Coordinate-aware grid pooling that preserves coarse scene layout."""
 
@@ -396,7 +447,12 @@ class ActionQueryDecoder(nn.Module):
             raise ValueError(f"heads must divide features, got heads={self.heads} features={self.features}.")
 
         self.pre = ConvNormAct(channels, channels, kernel_size=3, stride=1)
-        self.token_proj = nn.Linear(channels + SPATIAL_GRID_COORD_CHANNELS, self.features)
+        self.token_proj = nn.Linear(channels, self.features)
+        self.coord_proj = nn.Sequential(
+            nn.Linear(SPATIAL_GRID_COORD_CHANNELS, self.features),
+            nn.SiLU(inplace=True),
+            nn.Linear(self.features, self.features),
+        )
         self.token_norm = nn.LayerNorm(self.features)
         self.action_queries = nn.Parameter(torch.empty(self.num_actions, self.features))
         self.layers = nn.ModuleList(
@@ -417,8 +473,9 @@ class ActionQueryDecoder(nn.Module):
         feat = self.pre(x)
         pooled = F.adaptive_avg_pool2d(feat, (self.grid_size, self.grid_size))
         coords = self._coord_grid(pooled.size(0), device=pooled.device, dtype=pooled.dtype)
-        tokens = torch.cat([pooled, coords], dim=1).flatten(2).transpose(1, 2)
-        tokens = self.token_norm(self.token_proj(tokens))
+        feature_tokens = pooled.flatten(2).transpose(1, 2)
+        coord_tokens = coords.flatten(2).transpose(1, 2)
+        tokens = self.token_norm(self.token_proj(feature_tokens) + self.coord_proj(coord_tokens))
         queries = self.action_queries.to(device=tokens.device, dtype=tokens.dtype)
         queries = queries.unsqueeze(0).expand(tokens.size(0), -1, -1).contiguous()
         for layer in self.layers:
@@ -436,6 +493,7 @@ class SharedEncoder(nn.Module):
 
     def __init__(self, in_channels: int = POLICY_INPUT_CHANNELS) -> None:
         super().__init__()
+        self.in_channels = int(in_channels)
         self.stem = ConvNormAct(in_channels, STEM_CHANNELS, kernel_size=3, stride=2)
         self.stem_block = BasicResBlock(STEM_CHANNELS, STEM_CHANNELS, stride=1, dilation=1)
 
@@ -446,6 +504,8 @@ class SharedEncoder(nn.Module):
         self.stage32_block = BasicResBlock(STAGE32_CHANNELS, STAGE32_CHANNELS, stride=1, dilation=2)
 
     def feature_stages(self, x: torch.Tensor) -> List[torch.Tensor]:
+        if x.size(1) != self.in_channels:
+            raise ValueError(f"Expected {self.in_channels} input channels, got {x.size(1)}.")
         stem = self.stem_block(self.stem(x))
         s64 = self.stage64_block(self.stage64_down(stem))
         s32 = self.stage32_block(self.stage32_down(s64))
@@ -499,7 +559,16 @@ class DrivingVideoPolicy(nn.Module):
         self.feat_channels = POLICY_FEATURE_CHANNELS
         self.spatial_grid_size = SPATIAL_GRID_SIZE
         self.pooled_feat_channels = POLICY_POOLED_FEATURES
-        self.temporal_spatial_fusion = ZeroSpatialFusion()
+        self.temporal_spatial_fusion = (
+            nn.Identity()
+            if STAGE32_CHANNELS == POLICY_FEATURE_CHANNELS
+            else ConvNormAct(STAGE32_CHANNELS, POLICY_FEATURE_CHANNELS, kernel_size=1, stride=1, padding=0, act=False)
+        )
+        self.multi_scale_fusion = MultiScaleSpatialFusion(
+            temporal_channels=POLICY_FEATURE_CHANNELS,
+            high_channels=STAGE64_CHANNELS,
+            out_channels=POLICY_FEATURE_CHANNELS,
+        )
         self.action_decoder = str(cfg.action_decoder)
 
         self.spatial_context = SpatialContextBlock(POLICY_FEATURE_CHANNELS)
@@ -745,6 +814,17 @@ class DrivingVideoPolicy(nn.Module):
     def _context_features(self, h32_2: torch.Tensor) -> torch.Tensor:
         return self.spatial_dropout(self.spatial_context(h32_2))
 
+    def _fuse_current_spatial(self, temporal_feat: torch.Tensor, spatial_step: torch.Tensor) -> torch.Tensor:
+        return temporal_feat + self.temporal_spatial_fusion(spatial_step)
+
+    def _head_spatial_features(
+        self,
+        temporal_feat: torch.Tensor,
+        spatial_step: torch.Tensor,
+        s64_t: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.multi_scale_fusion(self._fuse_current_spatial(temporal_feat, spatial_step), s64_t)
+
     def _temporal_step(
         self,
         spatial_step: torch.Tensor,
@@ -755,8 +835,10 @@ class DrivingVideoPolicy(nn.Module):
         if s64_t is None:
             high_height = int(hidden_state.size(-2)) if hidden_state.dim() == 5 else h32 * 2
             high_width = int(hidden_state.size(-1)) if hidden_state.dim() == 5 else w32 * 2
+            s64_for_head = spatial_step.new_zeros(b, STAGE64_CHANNELS, high_height, high_width)
         else:
             high_height, high_width = s64_t.shape[-2:]
+            s64_for_head = s64_t
         h64_prev, h32_1_prev, h32_2_prev = self._unpack_temporal_state(
             hidden_state,
             b,
@@ -770,9 +852,9 @@ class DrivingVideoPolicy(nn.Module):
             h64_prev,
             h32_1_prev,
             h32_2_prev,
-            s64_t=s64_t,
+            s64_t=s64_for_head,
         )
-        context = self._context_features(h32_2)
+        context = self._context_features(self._head_spatial_features(h32_2, spatial_step, s64_for_head))
         return context, self._pack_temporal_state(h64, h32_1, h32_2)
 
     def _pool_features(self, fused: torch.Tensor) -> torch.Tensor:
@@ -876,10 +958,10 @@ class DrivingVideoPolicy(nn.Module):
         state: Optional[TemporalState],
     ) -> Tuple[torch.Tensor, TemporalState]:
         if frames.dim() != 5:
-            raise ValueError(f"Expected RGB frames with shape [B,T,3,H,W], got {tuple(frames.shape)}.")
+            raise ValueError(f"Expected RGB frames with shape [B,T,{RGB_INPUT_CHANNELS},H,W], got {tuple(frames.shape)}.")
         b, _, c, _, _ = frames.shape
-        if c != 3:
-            raise ValueError(f"Expected RGB frames with shape [B,T,3,H,W], got {tuple(frames.shape)}.")
+        if c != RGB_INPUT_CHANNELS:
+            raise ValueError(f"Expected RGB frames with shape [B,T,{RGB_INPUT_CHANNELS},H,W], got {tuple(frames.shape)}.")
 
         frames = self._normalize_frames(frames)
         frames = self._apply_masks(frames, clone=bool(frames.requires_grad))
@@ -917,7 +999,7 @@ class DrivingVideoPolicy(nn.Module):
                 h32_2_t,
                 s64_t=s64_seq[:, step],
             )
-            recurrent_steps.append(h32_2_t)
+            recurrent_steps.append(self._head_spatial_features(h32_2_t, s32_seq[:, step], s64_seq[:, step]))
 
         temporal_seq = torch.stack(recurrent_steps, dim=1)
         t_steps = int(temporal_seq.size(1))
@@ -1089,8 +1171,8 @@ class DrivingVideoPolicy(nn.Module):
         state: TemporalState,
         prev_action: Optional[torch.Tensor] = None,
     ):
-        if frame.dim() != 4 or frame.size(1) != 3:
-            raise ValueError(f"Expected RGB frame with shape [B,3,H,W], got {tuple(frame.shape)}.")
+        if frame.dim() != 4 or frame.size(1) != RGB_INPUT_CHANNELS:
+            raise ValueError(f"Expected RGB frame with shape [B,{RGB_INPUT_CHANNELS},H,W], got {tuple(frame.shape)}.")
         b = frame.shape[0]
 
         frame_norm = self._normalize_frames(frame)

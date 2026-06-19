@@ -63,10 +63,11 @@ class RuntimeConfig(ModelConfig):
     print_prob_decimals: int = 3
 
     mouse_buttons_enabled: bool = False
-    # Feeding applied model outputs back as last_action can latch keys when the
-    # checkpoint learned a persistence shortcut. Keep this off for deployment
-    # diagnostics; the model still receives a zero last-action vector.
+    # Feed model outputs back as last_action to match closed-loop training.
+    # Soft mode uses probabilities for the model context while thresholds still
+    # decide which keys are actually pressed.
     prev_action_feedback: bool = True
+    prev_action_feedback_soft: bool = True
     gru_memory_frames: int = 80
     # data.py records at 512x512 INTER_LINEAR before DALI linear-resizes to
     # model_size; runtime capture must mirror that two-stage path.
@@ -84,6 +85,7 @@ class RuntimeConfig(ModelConfig):
         self.button_threshold_max = float(np.clip(float(self.button_threshold_max), self.button_threshold_min, 1.0))
         self.mouse_buttons_enabled = bool(self.mouse_buttons_enabled)
         self.prev_action_feedback = bool(self.prev_action_feedback)
+        self.prev_action_feedback_soft = bool(self.prev_action_feedback_soft)
         self.gru_memory_frames = max(1, int(self.gru_memory_frames))
         self.record_frame_size = max(1, int(self.record_frame_size))
 
@@ -321,6 +323,8 @@ def _apply_checkpoint_config(cfg: RuntimeConfig, overrides: Dict) -> RuntimeConf
         trained_with_feedback = float(overrides.get("last_action_feedback_train_prob", 0.0) or 0.0) > 0.0
         validated_with_feedback = bool(overrides.get("last_action_feedback_validation", False))
         cfg.prev_action_feedback = bool(trained_with_feedback and validated_with_feedback)
+    if "prev_action_feedback_soft" not in overrides:
+        cfg.prev_action_feedback_soft = bool(overrides.get("last_action_feedback_soft", True))
     cfg = _coerce_config_types(cfg)
     if not checkpoint_has_thresholds:
         derived = _derive_button_thresholds_from_csv(cfg)
@@ -519,6 +523,7 @@ def main() -> None:
     print(
         "Runtime last-action feedback:",
         f"enabled={cfg.prev_action_feedback}",
+        f"mode={'soft' if cfg.prev_action_feedback_soft else 'hard'}",
     )
 
     inference_dtype = torch.float32
@@ -579,10 +584,13 @@ def main() -> None:
                         button_probs=button_probs,
                     )
                     if cfg.prev_action_feedback:
-                        prev_action = applied_buttons.detach().reshape(1, cfg.num_bin).to(
+                        feedback_buttons = button_probs if cfg.prev_action_feedback_soft else applied_buttons
+                        prev_action = feedback_buttons.detach().reshape(1, cfg.num_bin).to(
                             device=device,
                             dtype=inference_dtype,
                         )
+                        if cfg.prev_action_feedback_soft and not cfg.mouse_buttons_enabled:
+                            prev_action[:, len(cfg.key_names) :] = 0.0
                     else:
                         prev_action.zero_()
 

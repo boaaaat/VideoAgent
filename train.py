@@ -1,9 +1,11 @@
 import argparse
 import csv
 import glob
+import hashlib
 import math
 import os
 import random
+import shutil
 from dataclasses import asdict, dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -25,7 +27,7 @@ from nvidia.dali.plugin.pytorch import DALIGenericIterator, LastBatchPolicy
 
 from action_space import game_data_root
 from augmentations import augment_frames
-from dataset_wsl_sync import sync_dataset_for_training
+from dataset_wsl_sync import default_target_root, sync_dataset_for_training
 from models import (
     ACTION_DECODER_ACTION_QUERY,
     ACTION_DECODER_MLP,
@@ -101,6 +103,15 @@ def _require_float_range(name: str, value: object, minimum: float, maximum: floa
     return result
 
 
+def _normalize_optional_path(name: str, value: object) -> Optional[str]:
+    if value is None:
+        return None
+    result = str(value).strip()
+    if not result:
+        raise ValueError(f"{name} must not be empty.")
+    return result
+
+
 @dataclass
 class TrainConfig(ModelConfig):
     action_decoder: str = ACTION_DECODER_ACTION_QUERY
@@ -121,9 +132,11 @@ class TrainConfig(ModelConfig):
     compile_model: bool = True
     compile_mode: str = "default"
 
-    train_split: float = 0.8
+    train_data_root: Optional[str] = None
+    val_data_root: Optional[str] = None
+    train_split: float = 0.9
     split_seed: int = 1337
-    pos_weight_power: float = 0.65
+    pos_weight_power: float = 0.6
     pos_weight_clamp: float = 25
     button_threshold_from_pos_weight: bool = True
     button_threshold_min: float = 0.2
@@ -145,7 +158,7 @@ class TrainConfig(ModelConfig):
     # hide runtime latching. Scheduled feedback below trains recovery from the
     # model's own previous predictions while keeping ground-truth labels.
     last_action_conditioning: bool = True
-    last_action_feedback_train_prob: float = 0.25
+    last_action_feedback_train_prob: float = 1.0
     last_action_feedback_warmup_epochs: int = 4
     last_action_feedback_ramp_epochs: int = 8
     last_action_feedback_validation: bool = True
@@ -153,7 +166,7 @@ class TrainConfig(ModelConfig):
     skipped_key_names: Optional[Sequence[str]] = ("e", "q", "c", "z")
     # Extra BCE weight on frames where a key changes state. Transitions are
     # ~5% of labels but are all that matters for control.
-    transition_loss_weight: float = 4.0
+    transition_loss_weight: float = 5.0
 
     aug_brightness: float = 0.15
     aug_contrast: float = 0.20
@@ -219,6 +232,10 @@ class TrainConfig(ModelConfig):
         self.target_effective_batch = _require_int_at_least("target_effective_batch", self.target_effective_batch, 1)
         self.grad_accum = int(math.ceil(self.target_effective_batch / float(self.batch_size)))
         self.num_epochs = _require_int_at_least("num_epochs", self.num_epochs, 1)
+        self.train_data_root = _normalize_optional_path("train_data_root", self.train_data_root)
+        self.val_data_root = _normalize_optional_path("val_data_root", self.val_data_root)
+        if (self.train_data_root is None) != (self.val_data_root is None):
+            raise ValueError("train_data_root and val_data_root must be provided together.")
         self.lr = _require_float_at_least("lr", self.lr, 0.0)
         if self.lr <= 0.0:
             raise ValueError(f"lr must be > 0.0, got {self.lr}.")
@@ -509,8 +526,14 @@ class ThresholdFitter:
         return fitted, [float(x) for x in best_f1.tolist()]
 
 
-def find_runs(data_root: str, video_ext: str, csv_ext: str) -> List[Tuple[str, str]]:
-    video_files = sorted(glob.glob(os.path.join(data_root, f"run_*{video_ext}")))
+def find_runs(
+    data_root: str,
+    video_ext: str,
+    csv_ext: str,
+    *,
+    video_name_glob: str = "run_*",
+) -> List[Tuple[str, str]]:
+    video_files = sorted(glob.glob(os.path.join(data_root, f"{video_name_glob}{video_ext}")))
     pairs: List[Tuple[str, str]] = []
     for video_path in video_files:
         csv_path = os.path.splitext(video_path)[0] + csv_ext
@@ -531,6 +554,172 @@ def split_runs(
         return pairs, []
     split_idx = max(1, min(len(pairs) - 1, int(round(len(pairs) * float(train_split)))))
     return pairs[:split_idx], pairs[split_idx:]
+
+
+def split_cache_root(cfg: TrainConfig, split_name: str) -> str:
+    base_root = str(cfg.dataset_cache_root) if cfg.dataset_cache_root is not None else str(default_target_root())
+    return os.path.join(base_root, split_name)
+
+
+def detected_split_roots(data_root: str) -> Optional[Tuple[str, str]]:
+    train_root = os.path.join(data_root, "train")
+    val_root = os.path.join(data_root, "val")
+    if os.path.isdir(train_root) and os.path.isdir(val_root):
+        return train_root, val_root
+    return None
+
+
+def _sha256_file(path: str, chunk_size: int = 1024 * 1024) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as file_obj:
+        for chunk in iter(lambda: file_obj.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _same_cached_file(source_path: str, target_path: str, *, hash_same_size: bool) -> bool:
+    if not os.path.exists(target_path):
+        return False
+    source_stat = os.stat(source_path)
+    target_stat = os.stat(target_path)
+    if source_stat.st_size != target_stat.st_size:
+        return False
+    if source_stat.st_mtime_ns == target_stat.st_mtime_ns:
+        return True
+    if not hash_same_size:
+        return False
+    return _sha256_file(source_path) == _sha256_file(target_path)
+
+
+def sync_clip_folder_for_training(
+    *,
+    data_root: str,
+    target_root: str,
+    split_name: str,
+    cfg: TrainConfig,
+) -> str:
+    source_root = os.path.abspath(data_root)
+    cache_root = os.path.abspath(target_root)
+    try:
+        if os.path.samefile(source_root, cache_root):
+            print(f"Dataset cache already selected for {split_name}: {cache_root}")
+            return cache_root
+    except FileNotFoundError:
+        if source_root == cache_root:
+            print(f"Dataset cache already selected for {split_name}: {cache_root}")
+            return cache_root
+
+    pairs = find_runs(source_root, cfg.video_ext, cfg.csv_ext, video_name_glob="*")
+    if not pairs:
+        raise RuntimeError(
+            f"No {split_name} clips found under {source_root!r} "
+            f"(expected *{cfg.video_ext} with matching {cfg.csv_ext})."
+        )
+
+    os.makedirs(cache_root, exist_ok=True)
+    expected_paths = set()
+    files_seen = 0
+    unchanged = 0
+    copied = 0
+    bytes_copied = 0
+    for video_path, csv_path in pairs:
+        for source_path in (video_path, csv_path):
+            files_seen += 1
+            target_path = os.path.join(cache_root, os.path.basename(source_path))
+            expected_paths.add(os.path.abspath(target_path))
+            if _same_cached_file(source_path, target_path, hash_same_size=bool(cfg.dataset_sync_hash_same_size)):
+                unchanged += 1
+                continue
+            shutil.copy2(source_path, target_path)
+            copied += 1
+            bytes_copied += int(os.path.getsize(source_path))
+
+    deleted = 0
+    should_delete_stale = True if cfg.dataset_sync_delete_stale is None else bool(cfg.dataset_sync_delete_stale)
+    if should_delete_stale:
+        stale_patterns = [f"*{cfg.video_ext}"]
+        if cfg.csv_ext != cfg.video_ext:
+            stale_patterns.append(f"*{cfg.csv_ext}")
+        for pattern in stale_patterns:
+            for path in glob.glob(os.path.join(cache_root, pattern)):
+                if os.path.isfile(path) and os.path.abspath(path) not in expected_paths:
+                    os.remove(path)
+                    deleted += 1
+
+    print(f"Dataset cache ready for {split_name}:")
+    print(f"  source={source_root}")
+    print(f"  target={cache_root}")
+    print(
+        "  "
+        f"files={files_seen} unchanged={unchanged} copied={copied} "
+        f"bytes_copied={bytes_copied} deleted_stale={deleted}"
+    )
+    return cache_root
+
+
+def resolve_train_val_pairs(cfg: TrainConfig) -> Tuple[List[Tuple[str, str]], List[Tuple[str, str]]]:
+    split_source = "manual"
+    if cfg.train_data_root is not None and cfg.val_data_root is not None:
+        train_root = cfg.train_data_root
+        val_root = cfg.val_data_root
+    else:
+        detected_roots = detected_split_roots(cfg.data_root)
+        if detected_roots is None:
+            train_root = None
+            val_root = None
+        else:
+            train_root, val_root = detected_roots
+            split_source = "detected"
+
+    if train_root is not None and val_root is not None:
+        if cfg.sync_dataset:
+            train_root = sync_clip_folder_for_training(
+                data_root=train_root,
+                target_root=split_cache_root(cfg, "train"),
+                split_name="train",
+                cfg=cfg,
+            )
+            val_root = sync_clip_folder_for_training(
+                data_root=val_root,
+                target_root=split_cache_root(cfg, "val"),
+                split_name="val",
+                cfg=cfg,
+            )
+        cfg.train_data_root = train_root
+        cfg.val_data_root = val_root
+
+        train_pairs = find_runs(train_root, cfg.video_ext, cfg.csv_ext, video_name_glob="*")
+        val_pairs = find_runs(val_root, cfg.video_ext, cfg.csv_ext, video_name_glob="*")
+        if not train_pairs:
+            raise RuntimeError(
+                f"No train clips found under {train_root!r} "
+                f"(expected *{cfg.video_ext} with matching {cfg.csv_ext})."
+            )
+        if not val_pairs:
+            raise RuntimeError(
+                f"No validation clips found under {val_root!r} "
+                f"(expected *{cfg.video_ext} with matching {cfg.csv_ext})."
+            )
+        print(f"{split_source.title()} split roots: train={train_root} val={val_root}")
+        print(f"Runs: train={len(train_pairs)} val={len(val_pairs)}")
+        return train_pairs, val_pairs
+
+    if cfg.sync_dataset:
+        cfg.data_root = sync_dataset_for_training(
+            data_root=cfg.data_root,
+            target_root=cfg.dataset_cache_root,
+            video_ext=cfg.video_ext,
+            csv_ext=cfg.csv_ext,
+            delete_stale=cfg.dataset_sync_delete_stale,
+            hash_same_size=bool(cfg.dataset_sync_hash_same_size),
+        )
+
+    pairs = find_runs(cfg.data_root, cfg.video_ext, cfg.csv_ext)
+    if not pairs:
+        raise RuntimeError(f"No runs found under {cfg.data_root!r}.")
+    train_pairs, val_pairs = split_runs(pairs, cfg.train_split, cfg.split_seed)
+    print(f"Runs: total={len(pairs)} train={len(train_pairs)} val={len(val_pairs)}")
+    return train_pairs, val_pairs
 
 
 def _parse_float(value: object) -> float:
@@ -1665,6 +1854,22 @@ def parse_args() -> TrainConfig:
     parser = argparse.ArgumentParser(description="Train the CNN+temporal behavioral cloning policy.")
     add = parser.add_argument
     add("--data-root", default=None)
+    add(
+        "--train-data-root",
+        "--train-folder",
+        "--train-dir",
+        dest="train_data_root",
+        default=None,
+        help="Explicit training clip folder. Scans *<video-ext> files with same-stem CSVs.",
+    )
+    add(
+        "--val-data-root",
+        "--val-folder",
+        "--val-dir",
+        dest="val_data_root",
+        default=None,
+        help="Explicit validation clip folder. Must be provided with --train-data-root.",
+    )
     add("--ckpt-dir", default=None)
     add("--resume", dest="resume", action="store_true", default=None)
     add("--no-resume", dest="resume", action="store_false")
@@ -1772,6 +1977,8 @@ def parse_args() -> TrainConfig:
     kwargs = {}
     for key in (
         "data_root",
+        "train_data_root",
+        "val_data_root",
         "ckpt_dir",
         "resume",
         "resume_path",
@@ -1882,21 +2089,7 @@ def train() -> None:
     torch.backends.cudnn.benchmark = True
     torch.set_float32_matmul_precision("high")
 
-    if cfg.sync_dataset:
-        cfg.data_root = sync_dataset_for_training(
-            data_root=cfg.data_root,
-            target_root=cfg.dataset_cache_root,
-            video_ext=cfg.video_ext,
-            csv_ext=cfg.csv_ext,
-            delete_stale=cfg.dataset_sync_delete_stale,
-            hash_same_size=bool(cfg.dataset_sync_hash_same_size),
-        )
-
-    pairs = find_runs(cfg.data_root, cfg.video_ext, cfg.csv_ext)
-    if not pairs:
-        raise RuntimeError(f"No runs found under {cfg.data_root!r}.")
-    train_pairs, val_pairs = split_runs(pairs, cfg.train_split, cfg.split_seed)
-    print(f"Runs: total={len(pairs)} train={len(train_pairs)} val={len(val_pairs)}")
+    train_pairs, val_pairs = resolve_train_val_pairs(cfg)
     if cfg.skipped_key_names:
         print(f"Skipping action keys for this training run: {', '.join(cfg.skipped_key_names)}")
     print(f"Training action keys: {', '.join(cfg.key_names + cfg.mouse_button_names)}")
