@@ -36,6 +36,9 @@ DEFAULT_PREDICTION_OFFSET = 1
 ACTION_DECODER_MLP = "mlp"
 ACTION_DECODER_ACTION_QUERY = "action_query"
 ACTION_DECODERS = (ACTION_DECODER_MLP, ACTION_DECODER_ACTION_QUERY)
+LAST_ACTION_FUSION_LATE_MLP = "late_mlp"
+LAST_ACTION_FUSION_FIXED_PRIOR = "fixed_prior"
+LAST_ACTION_FUSION_MODES = (LAST_ACTION_FUSION_FIXED_PRIOR, LAST_ACTION_FUSION_LATE_MLP)
 
 
 def _require_int_at_least(name: str, value: object, minimum: int) -> int:
@@ -93,6 +96,9 @@ class ModelConfig:
     val_seq_stride: int = 80
     prediction_horizon: int = 1
     prediction_horizon_offsets: Optional[Sequence[int]] = None
+    # Sequence forward consumes the whole window but can return only the final
+    # N predictions. Runtime forward_step is unaffected.
+    sequence_output_tail_frames: int = 0
 
     key_names: Optional[List[str]] = None
     mouse_button_names: Optional[List[str]] = None
@@ -104,10 +110,13 @@ class ModelConfig:
     action_decoder: str = ACTION_DECODER_MLP
     action_query_heads: int = ACTION_QUERY_DECODER_HEADS
     action_query_layers: int = ACTION_QUERY_DECODER_LAYERS
-    # Feed the previous action into the heads. Training can replace teacher
-    # actions with detached model outputs, so this remains enabled for current
-    # runs while legacy checkpoints with last_action_encoder weights still load.
+    # Feed the previous action as a bounded inertial hold prior by default. The
+    # old late_mlp mode is kept for checkpoint/debug ablations, but it can learn
+    # a direct copy shortcut on +1 frame prediction.
     last_action_conditioning: bool = True
+    last_action_fusion: str = LAST_ACTION_FUSION_FIXED_PRIOR
+    last_action_prior_logit: float = 1.5
+    last_action_absence_prior_logit: float = 0.0
 
     button_state_threshold: float = 0.5
     button_state_thresholds: Optional[Sequence[float]] = None
@@ -122,6 +131,13 @@ class ModelConfig:
         self.seq_len = _require_int_at_least("seq_len", self.seq_len, 1)
         self.train_seq_stride = _require_int_at_least("train_seq_stride", self.train_seq_stride, 1)
         self.val_seq_stride = _require_int_at_least("val_seq_stride", self.val_seq_stride, 1)
+        self.sequence_output_tail_frames = _require_int_at_least(
+            "sequence_output_tail_frames",
+            self.sequence_output_tail_frames,
+            0,
+        )
+        if self.sequence_output_tail_frames > self.seq_len:
+            self.sequence_output_tail_frames = self.seq_len
         self.prediction_horizon = _require_int_at_least("prediction_horizon", self.prediction_horizon, 1)
         self.prediction_horizon_offsets = _single_prediction_offset(
             self.prediction_horizon,
@@ -145,6 +161,24 @@ class ModelConfig:
             )
         self.action_query_layers = _require_int_at_least("action_query_layers", self.action_query_layers, 1)
         self.last_action_conditioning = bool(self.last_action_conditioning)
+        self.last_action_fusion = str(self.last_action_fusion).strip().lower()
+        if self.last_action_fusion not in LAST_ACTION_FUSION_MODES:
+            raise ValueError(
+                f"last_action_fusion must be one of {LAST_ACTION_FUSION_MODES}, "
+                f"got {self.last_action_fusion!r}."
+            )
+        self.last_action_prior_logit = _require_float_range(
+            "last_action_prior_logit",
+            self.last_action_prior_logit,
+            0.0,
+            5.0,
+        )
+        self.last_action_absence_prior_logit = _require_float_range(
+            "last_action_absence_prior_logit",
+            self.last_action_absence_prior_logit,
+            0.0,
+            5.0,
+        )
 
         if self.key_names is None:
             self.key_names = get_key_names(self.selected_game)
@@ -943,14 +977,46 @@ class DrivingVideoPolicy(nn.Module):
         if features.dim() not in (3, 4):
             raise ValueError(f"Expected features with shape [B,T,F] or [B,T,A,F], got {tuple(features.shape)}.")
         b, t = int(features.shape[0]), int(features.shape[1])
+        action_prior: Optional[torch.Tensor] = None
         if self.last_action_encoder is not None:
-            action_feat = self._last_action_features(prev_action, b, t, device=features.device, dtype=features.dtype)
+            if self.cfg.last_action_fusion == LAST_ACTION_FUSION_LATE_MLP:
+                action_feat = self._last_action_features(prev_action, b, t, device=features.device, dtype=features.dtype)
+            else:
+                action_feat = features.new_zeros((b, t, self.cfg.d_model))
+                action_prior = self._last_action_prior_logits(
+                    prev_action,
+                    b,
+                    t,
+                    device=features.device,
+                    dtype=features.dtype,
+                )
             if features.dim() == 4:
                 action_feat = action_feat.unsqueeze(2).expand(b, t, features.size(2), self.cfg.d_model)
             features = self.head_fusion(torch.cat([features, action_feat], dim=-1))
         else:
             features = self.head_fusion(features)
-        return self._button_logits(features)
+        logits = self._button_logits(features)
+        if action_prior is not None:
+            logits = logits + action_prior.to(device=logits.device, dtype=logits.dtype)
+        return logits
+
+    def _sequence_output_start(self, time_steps: int) -> int:
+        time_steps = int(time_steps)
+        tail_frames = int(getattr(self.cfg, "sequence_output_tail_frames", 0))
+        if tail_frames <= 0 or tail_frames >= time_steps:
+            return 0
+        return time_steps - tail_frames
+
+    def _slice_prev_action_for_output(
+        self,
+        prev_action: Optional[torch.Tensor],
+        output_start: int,
+    ) -> Optional[torch.Tensor]:
+        if prev_action is None or int(output_start) <= 0:
+            return prev_action
+        if prev_action.dim() == 3:
+            return prev_action[:, int(output_start) :]
+        return prev_action
 
     def _sequence_visual_features(
         self,
@@ -1062,6 +1128,28 @@ class DrivingVideoPolicy(nn.Module):
 
         raise ValueError(f"Expected prev_action with 2 or 3 dims, got {tuple(action_values.shape)}.")
 
+    def _last_action_prior_logits(
+        self,
+        prev_action: Optional[torch.Tensor],
+        batch_size: int,
+        time_steps: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        hold_strength = float(self.cfg.last_action_prior_logit)
+        absence_strength = float(getattr(self.cfg, "last_action_absence_prior_logit", 0.0))
+        if hold_strength <= 0.0 and absence_strength <= 0.0:
+            return torch.zeros((batch_size, time_steps, self.cfg.num_bin), device=device, dtype=dtype)
+        action_values = self._teacher_action_sequence(
+            prev_action,
+            batch_size,
+            time_steps,
+            device=device,
+            dtype=dtype,
+        )
+        return (action_values * hold_strength) - ((1.0 - action_values) * absence_strength)
+
     def _prediction_as_prev_action(
         self,
         logits: torch.Tensor,
@@ -1115,13 +1203,17 @@ class DrivingVideoPolicy(nn.Module):
         *,
         soft_feedback: bool,
     ) -> torch.Tensor:
-        if self.last_action_encoder is None or feedback_mask is None:
-            return self._features_to_logits(visual_feat, prev_action)
         if visual_feat.dim() not in (3, 4):
             raise ValueError(
                 f"Expected visual features with shape [B,T,F] or [B,T,A,F], got {tuple(visual_feat.shape)}."
             )
         b, t = int(visual_feat.shape[0]), int(visual_feat.shape[1])
+        output_start = self._sequence_output_start(t)
+        if self.last_action_encoder is None or feedback_mask is None:
+            output_feat = visual_feat[:, output_start:] if output_start > 0 else visual_feat
+            output_prev_action = self._slice_prev_action_for_output(prev_action, output_start)
+            return self._features_to_logits(output_feat, output_prev_action)
+
         teacher = self._teacher_action_sequence(
             prev_action,
             b,
@@ -1146,7 +1238,8 @@ class DrivingVideoPolicy(nn.Module):
             else:
                 action_input = torch.where(mask[:, step], feedback_action, teacher[:, step])
             logits = self._features_to_logits(visual_feat[:, step : step + 1], action_input).reshape(b, self.cfg.num_bin)
-            logits_steps.append(logits)
+            if step >= output_start:
+                logits_steps.append(logits)
             feedback_action = self._prediction_as_prev_action(
                 logits,
                 feedback_thresholds,

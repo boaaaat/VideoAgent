@@ -67,7 +67,7 @@ class RuntimeConfig(ModelConfig):
     # Soft mode uses probabilities for the model context while thresholds still
     # decide which keys are actually pressed.
     prev_action_feedback: bool = True
-    prev_action_feedback_soft: bool = True
+    prev_action_feedback_soft: bool = False
     gru_memory_frames: int = 80
     # data.py records at 512x512 INTER_LINEAR before DALI linear-resizes to
     # model_size; runtime capture must mirror that two-stage path.
@@ -238,9 +238,17 @@ def _coerce_config_types(cfg: RuntimeConfig) -> RuntimeConfig:
             raise ValueError(f"Single-horizon checkpoints must provide exactly one prediction offset, got {cfg.prediction_horizon_offsets}.")
     cfg.command_horizon = 1
     cfg.d_model = int(cfg.d_model)
+    cfg.sequence_output_tail_frames = max(0, int(getattr(cfg, "sequence_output_tail_frames", 0)))
+    if cfg.sequence_output_tail_frames > cfg.seq_len:
+        cfg.sequence_output_tail_frames = cfg.seq_len
     cfg.action_decoder = str(getattr(cfg, "action_decoder", "mlp")).strip().lower()
     cfg.action_query_heads = int(getattr(cfg, "action_query_heads", 4))
     cfg.action_query_layers = int(getattr(cfg, "action_query_layers", 2))
+    cfg.last_action_fusion = str(getattr(cfg, "last_action_fusion", "fixed_prior")).strip().lower()
+    cfg.last_action_prior_logit = float(np.clip(float(getattr(cfg, "last_action_prior_logit", 1.5)), 0.0, 5.0))
+    cfg.last_action_absence_prior_logit = float(
+        np.clip(float(getattr(cfg, "last_action_absence_prior_logit", 0.0)), 0.0, 5.0)
+    )
     cfg.mouse_buttons_enabled = bool(cfg.mouse_buttons_enabled)
     cfg.gru_memory_frames = max(1, int(getattr(cfg, "gru_memory_frames", 80)))
     cfg.num_bin = len(cfg.key_names) + len(cfg.mouse_button_names)
@@ -362,7 +370,7 @@ def _checkpoint_path(cfg: RuntimeConfig) -> str:
             raise FileNotFoundError(f"Checkpoint not found: {cfg.ckpt_path}")
         return cfg.ckpt_path
 
-    best_path = os.path.join(cfg.ckpt_dir, "model_best.pt")
+    best_path = os.path.join(cfg.ckpt_dir, "model_latest.pt")
     if os.path.exists(best_path):
         return best_path
     latest_path = os.path.join(cfg.ckpt_dir, "model_latest.pt")
@@ -524,6 +532,9 @@ def main() -> None:
         "Runtime last-action feedback:",
         f"enabled={cfg.prev_action_feedback}",
         f"mode={'soft' if cfg.prev_action_feedback_soft else 'hard'}",
+        f"fusion={cfg.last_action_fusion}",
+        f"hold_prior_logit={float(cfg.last_action_prior_logit):.2f}",
+        f"absence_prior_logit={float(cfg.last_action_absence_prior_logit):.2f}",
     )
 
     inference_dtype = torch.float32

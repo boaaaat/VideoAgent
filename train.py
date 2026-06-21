@@ -34,6 +34,7 @@ from models import (
     ACTION_DECODERS,
     DrivingVideoPolicy,
     LAST_ACTION_EMBEDDING_DROPOUT,
+    LAST_ACTION_FUSION_MODES,
     ModelConfig,
     PolicyOutput,
     TemporalState,
@@ -112,6 +113,20 @@ def _normalize_optional_path(name: str, value: object) -> Optional[str]:
     return result
 
 
+def resolve_local_path(path: str) -> str:
+    """Resolve Windows drive paths when this script is launched from WSL."""
+    result = str(path)
+    if os.path.exists(result):
+        return result
+    if len(result) >= 3 and result[1] == ":" and result[2] in ("\\", "/"):
+        drive = result[0].lower()
+        tail = result[3:].replace("\\", "/")
+        wsl_path = f"/mnt/{drive}/{tail}"
+        if os.path.exists(wsl_path):
+            return wsl_path
+    return result
+
+
 @dataclass
 class TrainConfig(ModelConfig):
     action_decoder: str = ACTION_DECODER_ACTION_QUERY
@@ -142,9 +157,11 @@ class TrainConfig(ModelConfig):
     button_threshold_min: float = 0.2
     button_threshold_max: float = 0.85
     fit_thresholds_from_val: bool = True
+    deploy_val_thresholds: bool = False
     eval_only: bool = False
     eval_ckpt: Optional[str] = None
 
+    sequence_output_tail_frames: int = 16
     button_loss_weight: float = 1.0
     # Keep binary heads, but make impossible driving chords costly enough to
     # matter during training.
@@ -158,11 +175,11 @@ class TrainConfig(ModelConfig):
     # hide runtime latching. Scheduled feedback below trains recovery from the
     # model's own previous predictions while keeping ground-truth labels.
     last_action_conditioning: bool = True
-    last_action_feedback_train_prob: float = 1.0
-    last_action_feedback_warmup_epochs: int = 3
-    last_action_feedback_ramp_epochs: int = 7
+    last_action_feedback_train_prob: float = .8
+    last_action_feedback_warmup_epochs: int = 2
+    last_action_feedback_ramp_epochs: int = 8
     last_action_feedback_validation: bool = True
-    last_action_feedback_soft: bool = True
+    last_action_feedback_soft: bool = False
     skipped_key_names: Optional[Sequence[str]] = ("e", "q", "c", "z")
     # Extra BCE weight on frames where a key changes state. Transitions are
     # ~5% of labels but are all that matters for control.
@@ -269,6 +286,7 @@ class TrainConfig(ModelConfig):
             self.button_threshold_from_pos_weight,
         )
         self.fit_thresholds_from_val = _require_bool("fit_thresholds_from_val", self.fit_thresholds_from_val)
+        self.deploy_val_thresholds = _require_bool("deploy_val_thresholds", self.deploy_val_thresholds)
         self.eval_only = _require_bool("eval_only", self.eval_only)
         if self.eval_ckpt is not None:
             self.eval_ckpt = str(self.eval_ckpt)
@@ -1058,42 +1076,66 @@ def compute_pos_weight(
     return weight.clamp(min=1.0, max=float(clamp)).float()
 
 
-def supervised_start_frame(seq_len: int) -> int:
-    _require_int_at_least("seq_len", seq_len, 1)
-    return 0
-
-
-def supervised_frame_range(seq_len: int) -> Tuple[int, int]:
+def sequence_output_start_frame(seq_len: int, tail_frames: int) -> int:
     seq_len = _require_int_at_least("seq_len", seq_len, 1)
-    return supervised_start_frame(seq_len), seq_len
+    tail_frames = _require_int_at_least("sequence_output_tail_frames", tail_frames, 0)
+    if tail_frames <= 0 or tail_frames >= seq_len:
+        return 0
+    return max(0, seq_len - tail_frames)
 
 
-def supervised_frames_only(valid: torch.Tensor) -> torch.Tensor:
-    if valid.dim() < 2:
-        raise ValueError(f"Expected a time dimension in valid mask, got shape {tuple(valid.shape)}")
-    time = torch.arange(valid.size(1), device=valid.device) >= supervised_start_frame(valid.size(1))
-    view_shape = [1] * valid.dim()
-    view_shape[1] = valid.size(1)
-    time = time.view(*view_shape)
-    if valid.dtype == torch.bool:
-        return valid & time
-    return valid * time.to(dtype=valid.dtype)
+def sequence_output_frame_range(seq_len: int, tail_frames: int) -> Tuple[int, int]:
+    seq_len = _require_int_at_least("seq_len", seq_len, 1)
+    return sequence_output_start_frame(seq_len, tail_frames), seq_len
 
 
-def warmup_masked_valid(valid: torch.Tensor, fresh_state: Optional[torch.Tensor]) -> torch.Tensor:
+def slice_window_targets(targets: WindowTargets, start: int, end: Optional[int] = None) -> WindowTargets:
+    return WindowTargets(
+        button_target=targets.button_target[:, start:end],
+        target_valid=targets.target_valid[:, start:end],
+        last_action=targets.last_action[:, start:end],
+        button_transition=(
+            None if targets.button_transition is None else targets.button_transition[:, start:end]
+        ),
+        meta=targets.meta,
+    )
+
+
+def sequence_output_targets(targets: WindowTargets, cfg: TrainConfig) -> WindowTargets:
+    start = sequence_output_start_frame(
+        int(targets.button_target.size(1)),
+        int(cfg.sequence_output_tail_frames),
+    )
+    if start <= 0:
+        return targets
+    return slice_window_targets(targets, start)
+
+
+def align_targets_to_output(output: PolicyOutput, targets: WindowTargets) -> WindowTargets:
+    output_steps = int(output.button_logits.size(1))
+    target_steps = int(targets.button_target.size(1))
+    if output_steps == target_steps:
+        return targets
+    if output_steps <= 0 or output_steps > target_steps:
+        raise ValueError(
+            f"Cannot align output time steps {output_steps} to target time steps {target_steps}."
+        )
+    return slice_window_targets(targets, target_steps - output_steps)
+
+
+def valid_prediction_frames(valid: torch.Tensor, fresh_state: Optional[torch.Tensor]) -> torch.Tensor:
     """Return the valid mask for supervised frames.
 
-    All frames are supervised; fresh_state is retained for shape validation and
-    compatibility with the streaming-state call sites.
+    Sequence outputs are already tail-trimmed by the model, so every returned
+    prediction is supervised if its target label is valid.
     """
-    if fresh_state is None:
-        return supervised_frames_only(valid)
-    if fresh_state.dim() != 1 or int(fresh_state.size(0)) != int(valid.size(0)):
+    if fresh_state is not None and (
+        fresh_state.dim() != 1 or int(fresh_state.size(0)) != int(valid.size(0))
+    ):
         raise ValueError(
             f"Expected fresh_state shape [{int(valid.size(0))}], got {tuple(fresh_state.shape)}."
         )
-    fresh = fresh_state.to(device=valid.device, dtype=torch.bool).view(-1, *([1] * (valid.dim() - 1)))
-    return torch.where(fresh, supervised_frames_only(valid), valid)
+    return valid
 
 
 def decision_thresholds_from_pos_weight(pos_weight: torch.Tensor, cfg: TrainConfig) -> torch.Tensor:
@@ -1191,10 +1233,14 @@ def compute_losses(
     button_pos_weight: torch.Tensor,
     fresh_state_mask: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    valid = warmup_masked_valid(targets.target_valid, fresh_state_mask).float()
-    valid_weight = valid.unsqueeze(-1)
     button_target = targets.button_target.float()
     button_logits = output.button_logits.float()
+    if tuple(button_logits.shape) != tuple(button_target.shape):
+        raise ValueError(
+            f"Output logits shape {tuple(button_logits.shape)} must match target shape {tuple(button_target.shape)}."
+        )
+    valid = valid_prediction_frames(targets.target_valid, fresh_state_mask).float()
+    valid_weight = valid.unsqueeze(-1)
     button_loss_raw = F.binary_cross_entropy_with_logits(
         button_logits,
         button_target,
@@ -1304,7 +1350,11 @@ def update_metrics(
     button_stats: BinaryStats,
     fresh_state_mask: Optional[torch.Tensor] = None,
 ) -> None:
-    valid = warmup_masked_valid(targets.target_valid, fresh_state_mask)
+    if tuple(output.button_logits.shape) != tuple(targets.button_target.shape):
+        raise ValueError(
+            f"Output logits shape {tuple(output.button_logits.shape)} must match target shape {tuple(targets.button_target.shape)}."
+        )
+    valid = valid_prediction_frames(targets.target_valid, fresh_state_mask)
     thresholds = button_threshold_tensor(cfg, device=output.button_logits.device).view(1, 1, -1)
     button_pred = torch.sigmoid(output.button_logits.float()) >= thresholds
     button_stats.update(button_pred, targets.button_target > 0.5, valid > 0.5)
@@ -1345,11 +1395,19 @@ def binary_stats_rows(stats: BinaryStats, names: Sequence[str]) -> List[Dict[str
 
 def persistence_baseline_metrics(targets: WindowTargets, cfg: TrainConfig) -> Dict[str, float]:
     stats = BinaryStats(cfg.num_bin, torch.device("cpu"))
-    current = targets.button_target.new_zeros(targets.button_target.shape)
-    current[:, 1:] = targets.button_target[:, :-1]
-    valid = supervised_frames_only(targets.target_valid > 0.5)
-    valid[:, 0] = False
-    stats.update(current > 0.5, targets.button_target > 0.5, valid)
+    start = sequence_output_start_frame(
+        int(targets.button_target.size(1)),
+        int(cfg.sequence_output_tail_frames),
+    )
+    button_target = targets.button_target[:, start:]
+    valid = targets.target_valid[:, start:] > 0.5
+    if start > 0:
+        current = targets.button_target[:, start - 1 : targets.button_target.size(1) - 1]
+    else:
+        current = targets.button_target.new_zeros(button_target.shape)
+        current[:, 1:] = button_target[:, :-1]
+        valid[:, 0] = False
+    stats.update(current > 0.5, button_target > 0.5, valid)
     result = stats.compute()
     result["per_class_summary"] = per_class_f1_summary(stats, list(cfg.key_names) + list(cfg.mouse_button_names))
     return result
@@ -1666,9 +1724,10 @@ def run_epoch(
                         prev_action=prev_action,
                         feedback_mask=feedback_mask,
                     )
+                output_targets = align_targets_to_output(output, batch_targets)
                 loss, details = compute_losses(
                     output,
-                    batch_targets,
+                    output_targets,
                     cfg,
                     button_pos_weight=button_pos_weight,
                     fresh_state_mask=fresh_state_mask,
@@ -1694,7 +1753,7 @@ def run_epoch(
                     global_step += 1
         update_metrics(
             output,
-            batch_targets,
+            output_targets,
             cfg,
             button_stats,
             fresh_state_mask=fresh_state_mask,
@@ -1702,8 +1761,8 @@ def run_epoch(
         if threshold_fitter is not None:
             threshold_fitter.update(
                 torch.sigmoid(output.button_logits.float()),
-                batch_targets.button_target > 0.5,
-                warmup_masked_valid(batch_targets.target_valid, fresh_state_mask) > 0.5,
+                output_targets.button_target > 0.5,
+                valid_prediction_frames(output_targets.target_valid, fresh_state_mask) > 0.5,
             )
         loss_sum += loss.detach().float()
         for name, value in details.items():
@@ -1789,6 +1848,36 @@ def save_checkpoint(
     torch.save(payload, path)
 
 
+def restore_checkpoint_thresholds(cfg: TrainConfig, ckpt_config: object) -> None:
+    if not bool(cfg.deploy_val_thresholds):
+        print("Skipping checkpoint decision thresholds: validation threshold deployment is disabled.")
+        return
+    if not isinstance(ckpt_config, dict):
+        return
+    raw_thresholds = ckpt_config.get("button_state_thresholds")
+    if raw_thresholds is None:
+        return
+    try:
+        thresholds = tuple(float(value) for value in raw_thresholds)
+    except (TypeError, ValueError):
+        print("Skipping checkpoint decision thresholds: values are not numeric.")
+        return
+    if len(thresholds) != int(cfg.num_bin):
+        print(
+            "Skipping checkpoint decision thresholds: "
+            f"checkpoint has {len(thresholds)}, current config has {int(cfg.num_bin)}."
+        )
+        return
+    cfg.button_state_thresholds = thresholds
+    print(
+        "Restored checkpoint decision thresholds: "
+        + " ".join(
+            f"{name}={threshold:.3f}"
+            for name, threshold in zip(list(cfg.key_names) + list(cfg.mouse_button_names), thresholds)
+        )
+    )
+
+
 def maybe_resume(
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -1803,6 +1892,7 @@ def maybe_resume(
         ckpt_path = latest_checkpoint(cfg.ckpt_dir)
     if not ckpt_path:
         return 0, 0, -1e9
+    ckpt_path = resolve_local_path(ckpt_path)
     print(f"Resuming from {ckpt_path}")
     state = torch.load(ckpt_path, map_location=device)
     if not isinstance(state, dict):
@@ -1830,6 +1920,7 @@ def maybe_resume(
             raise RuntimeError(f"Cannot resume checkpoint {ckpt_path}: {message}")
         print(f"Skipping incompatible checkpoint {ckpt_path}: {message} Starting a fresh run.")
         return 0, 0, -1e9
+    restore_checkpoint_thresholds(cfg, ckpt_config)
     try:
         model.load_state_dict(state["model_state"])
     except RuntimeError as exc:
@@ -1903,8 +1994,12 @@ def parse_args() -> TrainConfig:
     add("--button-threshold-max", type=float, default=None)
     add("--fit-thresholds-from-val", dest="fit_thresholds_from_val", action="store_true", default=None)
     add("--no-fit-thresholds-from-val", dest="fit_thresholds_from_val", action="store_false")
+    add("--deploy-val-thresholds", dest="deploy_val_thresholds", action="store_true", default=None)
+    add("--no-deploy-val-thresholds", dest="deploy_val_thresholds", action="store_false")
     add("--eval-only", dest="eval_only", action="store_true", default=None, help="Run a single validation pass on a checkpoint and exit (no training).")
     add("--eval-ckpt", default=None, help="Checkpoint for --eval-only. Defaults to <ckpt-dir>/model_best.pt.")
+    add("--sequence-output-tail-frames", type=int, default=None)
+    add("--supervised-tail-frames", dest="sequence_output_tail_frames", type=int, default=None, help=argparse.SUPPRESS)
     add("--conflicting-button-loss-weight", type=float, default=None)
     add("--streaming-state-training", dest="streaming_state_training", action="store_true", default=None)
     add("--no-streaming-state-training", dest="streaming_state_training", action="store_false")
@@ -1915,6 +2010,9 @@ def parse_args() -> TrainConfig:
     add("--action-label-offset", type=int, default=None)
     add("--last-action-conditioning", dest="last_action_conditioning", action="store_true", default=None)
     add("--no-last-action-conditioning", dest="last_action_conditioning", action="store_false")
+    add("--last-action-fusion", choices=list(LAST_ACTION_FUSION_MODES), default=None)
+    add("--last-action-prior-logit", type=float, default=None)
+    add("--last-action-absence-prior-logit", type=float, default=None)
     add("--transition-loss-weight", type=float, default=None, help="Extra BCE weight on key state changes; 1 disables.")
     add("--last-action-feedback-train-prob", type=float, default=None, help="Max probability of feeding detached model predictions back as prev_action during training.")
     add("--last-action-feedback-warmup-epochs", type=int, default=None)
@@ -2009,8 +2107,10 @@ def parse_args() -> TrainConfig:
         "button_threshold_min",
         "button_threshold_max",
         "fit_thresholds_from_val",
+        "deploy_val_thresholds",
         "eval_only",
         "eval_ckpt",
+        "sequence_output_tail_frames",
         "conflicting_button_loss_weight",
         "streaming_state_training",
         "streaming_state_validation",
@@ -2018,6 +2118,9 @@ def parse_args() -> TrainConfig:
         "streaming_segment_max_chunks",
         "action_label_offset",
         "last_action_conditioning",
+        "last_action_fusion",
+        "last_action_prior_logit",
+        "last_action_absence_prior_logit",
         "transition_loss_weight",
         "last_action_feedback_train_prob",
         "last_action_feedback_warmup_epochs",
@@ -2105,10 +2208,11 @@ def train() -> None:
         f"action_label_offset={cfg.action_label_offset}",
         f"prediction_offset=+{prediction_offset}",
     )
-    supervised_start, supervised_end = supervised_frame_range(cfg.seq_len)
+    output_start, output_end = sequence_output_frame_range(cfg.seq_len, cfg.sequence_output_tail_frames)
     print(
-        "Loss supervision:",
-        f"frames={supervised_start}-{supervised_end}",
+        "Sequence outputs:",
+        f"frames={output_start}-{output_end}",
+        f"count={output_end - output_start}",
         f"conflict_weight={float(cfg.conflicting_button_loss_weight):.4f}",
         f"transition_weight={float(cfg.transition_loss_weight):.1f}",
     )
@@ -2135,6 +2239,9 @@ def train() -> None:
     print(
         "Last action conditioning:",
         f"enabled={bool(cfg.last_action_conditioning)}",
+        f"fusion={cfg.last_action_fusion}",
+        f"hold_prior_logit={float(cfg.last_action_prior_logit):.2f}",
+        f"absence_prior_logit={float(cfg.last_action_absence_prior_logit):.2f}",
         f"embedding_dropout={LAST_ACTION_EMBEDDING_DROPOUT:.2f}",
     )
     print(
@@ -2144,6 +2251,11 @@ def train() -> None:
         f"ramp_epochs={int(cfg.last_action_feedback_ramp_epochs)}",
         f"val_closed_loop={bool(cfg.last_action_feedback_validation)}",
         f"mode={'soft' if cfg.last_action_feedback_soft else 'hard'}",
+    )
+    print(
+        "Validation threshold fitting:",
+        f"enabled={bool(cfg.fit_thresholds_from_val)}",
+        "deploy=improved_only" if bool(cfg.deploy_val_thresholds) else "deploy=disabled_report_only",
     )
     train_persist = persistence_baseline_metrics(train_targets, cfg)
     print(f"Persistence baseline: train_f1@+{prediction_offset}={train_persist['macro_f1']:.4f}")
@@ -2161,11 +2273,12 @@ def train() -> None:
             raise RuntimeError("Validation window metadata is required for DALI file list generation.")
         write_window_file_list(val_targets.meta, val_file_list)
 
+    train_output_targets = sequence_output_targets(train_targets, cfg)
     button_pos_weight = compute_pos_weight(
-        train_targets.button_target,
+        train_output_targets.button_target,
         cfg.pos_weight_power,
         cfg.pos_weight_clamp,
-        valid=supervised_frames_only(train_targets.target_valid),
+        valid=train_output_targets.target_valid,
     ).to(device)
     button_thresholds = decision_thresholds_from_pos_weight(button_pos_weight, cfg).detach().cpu()
     cfg.button_state_thresholds = tuple(float(x) for x in list(button_thresholds.tolist()))
@@ -2224,7 +2337,7 @@ def train() -> None:
 
     eval_state = None
     if cfg.eval_only:
-        eval_ckpt_path = cfg.eval_ckpt or os.path.join(cfg.ckpt_dir, "model_best.pt")
+        eval_ckpt_path = resolve_local_path(cfg.eval_ckpt or os.path.join(cfg.ckpt_dir, "model_best.pt"))
         eval_state = torch.load(eval_ckpt_path, map_location=device)
         ckpt_config = eval_state.get("config") if isinstance(eval_state, dict) else None
         if isinstance(ckpt_config, dict):
@@ -2236,16 +2349,26 @@ def train() -> None:
                     "vector_gru architecture."
                 )
             cfg.last_action_conditioning = bool(ckpt_config.get("last_action_conditioning", True))
+            cfg.sequence_output_tail_frames = int(
+                ckpt_config.get("sequence_output_tail_frames", cfg.sequence_output_tail_frames)
+            )
             cfg.action_decoder = str(ckpt_config.get("action_decoder", ACTION_DECODER_MLP)).strip().lower()
             cfg.action_query_heads = int(ckpt_config.get("action_query_heads", cfg.action_query_heads))
             cfg.action_query_layers = int(ckpt_config.get("action_query_layers", cfg.action_query_layers))
+            cfg.last_action_fusion = str(ckpt_config.get("last_action_fusion", cfg.last_action_fusion)).strip().lower()
+            cfg.last_action_prior_logit = float(
+                ckpt_config.get("last_action_prior_logit", cfg.last_action_prior_logit)
+            )
+            cfg.last_action_absence_prior_logit = float(
+                ckpt_config.get("last_action_absence_prior_logit", cfg.last_action_absence_prior_logit)
+            )
 
     base_model: torch.nn.Module = DrivingVideoPolicy(cfg).to(device)
     base_model = base_model.to(memory_format=torch.channels_last)
     optimizer = torch.optim.AdamW(base_model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay, fused=True)
     print(f"Parameters: {sum(p.numel() for p in base_model.parameters()) / 1e6:.4f}M")
     if cfg.eval_only:
-        eval_ckpt = cfg.eval_ckpt or os.path.join(cfg.ckpt_dir, "model_best.pt")
+        eval_ckpt = resolve_local_path(cfg.eval_ckpt or os.path.join(cfg.ckpt_dir, "model_best.pt"))
         base_model.load_state_dict(eval_state["model_state"])
         print(
             f"Eval-only: loaded {eval_ckpt} (epoch={eval_state.get('epoch')}"
@@ -2350,6 +2473,8 @@ def train() -> None:
         )
 
         val_metrics = None
+        fitted_thresholds = None
+        fitted_f1 = None
         score = driving_score(train_metrics, cfg)
         if val_iter is not None and val_targets is not None and val_batches > 0:
             val_feedback_prob = 1.0 if bool(cfg.last_action_feedback_validation) else 0.0
@@ -2370,22 +2495,36 @@ def train() -> None:
             score = driving_score(val_metrics, cfg)
             fitted_thresholds = val_metrics.get("fitted_button_thresholds")
             if fitted_thresholds:
+                fitted_f1 = val_metrics.get("fitted_button_f1") or [0.0] * len(button_names)
+
+        improved = score > best_score
+        if improved:
+            if fitted_thresholds and bool(cfg.deploy_val_thresholds):
                 current_thresholds = list(cfg.button_state_thresholds)
                 cfg.button_state_thresholds = tuple(
                     current if new is None else float(new)
                     for current, new in zip(current_thresholds, fitted_thresholds)
                 )
-                fitted_f1 = val_metrics.get("fitted_button_f1") or [0.0] * len(button_names)
                 print(
                     f"Fitted val thresholds @+{prediction_offset} (deployed): "
                     + " ".join(
                         f"{name}={threshold:.3f}(f1={f1:.3f})"
-                        for name, threshold, f1 in zip(button_names, cfg.button_state_thresholds, fitted_f1)
+                        for name, threshold, f1 in zip(button_names, cfg.button_state_thresholds, fitted_f1 or [])
                     )
                 )
-
-        improved = score > best_score
-        if improved:
+            elif fitted_thresholds:
+                current_thresholds = list(cfg.button_state_thresholds)
+                candidate_thresholds = tuple(
+                    current if new is None else float(new)
+                    for current, new in zip(current_thresholds, fitted_thresholds)
+                )
+                print(
+                    f"Fitted val thresholds @+{prediction_offset} (report-only, not deployed): "
+                    + " ".join(
+                        f"{name}={threshold:.3f}(f1={f1:.3f})"
+                        for name, threshold, f1 in zip(button_names, candidate_thresholds, fitted_f1 or [])
+                    )
+                )
             best_score = score
             epochs_without_improvement = 0
             save_checkpoint(
@@ -2398,6 +2537,19 @@ def train() -> None:
                 best_score=best_score,
             )
         else:
+            if fitted_thresholds:
+                current_thresholds = list(cfg.button_state_thresholds)
+                candidate_thresholds = tuple(
+                    current if new is None else float(new)
+                    for current, new in zip(current_thresholds, fitted_thresholds)
+                )
+                print(
+                    f"Fitted val thresholds @+{prediction_offset} (report-only, not deployed): "
+                    + " ".join(
+                        f"{name}={threshold:.3f}(f1={f1:.3f})"
+                        for name, threshold, f1 in zip(button_names, candidate_thresholds, fitted_f1 or [])
+                    )
+                )
             epochs_without_improvement += 1
 
         save_checkpoint(
