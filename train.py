@@ -1,8 +1,9 @@
-"""DALI trainer for the final-state FPN + ConvGRU driving policy.
+"""Stateful DALI trainer for the final-state FPN + ConvGRU driving policy.
 
 The DALI pipeline owns GPU video decode and resize. CSV labels are parsed once
 on the host, then joined to decoded 80-frame windows through the DALI sample
-label written into the file list.
+label written into the file list. Stateful mode processes complete videos as
+contiguous chunks and detaches the ConvGRU state at every chunk boundary.
 """
 
 from __future__ import annotations
@@ -10,6 +11,7 @@ from __future__ import annotations
 import argparse
 import csv
 import glob
+import hashlib
 import math
 import os
 import random
@@ -25,7 +27,7 @@ import nvidia.dali.fn as fn
 from nvidia.dali.plugin.pytorch import DALIGenericIterator, LastBatchPolicy
 
 from augmentations import augment_frames
-from models import ARCHITECTURE_VERSION, DrivingVideoPolicy, ModelConfig, PolicyOutput
+from models import ARCHITECTURE_VERSION, DrivingVideoPolicy, ModelConfig, PolicyOutput, TemporalState
 
 
 CONFLICTING_ACTION_PAIRS = (("w", "s"), ("a", "d"))
@@ -57,9 +59,11 @@ def _finite_float(name: str, value: object, minimum: float, maximum: Optional[fl
 class TrainConfig(ModelConfig):
     """Training settings. The inherited model config fixes the six action names."""
 
-    train_seq_stride: int = 20
+    train_seq_stride: int = 80
     val_seq_stride: int = 80
     action_offset: int = 1
+    streaming_state_training: bool = True
+    streaming_state_validation: bool = True
 
     batch_size: int = 1
     target_effective_batch: int = 8
@@ -146,6 +150,8 @@ class TrainConfig(ModelConfig):
             raise ValueError("amp_dtype must be bf16 or fp32.")
         self.compile_model = bool(self.compile_model)
         self.fit_thresholds_from_val = bool(self.fit_thresholds_from_val)
+        self.streaming_state_training = bool(self.streaming_state_training)
+        self.streaming_state_validation = bool(self.streaming_state_validation)
 
         for name in (
             "aug_brightness",
@@ -181,6 +187,24 @@ class TrainConfig(ModelConfig):
         self.dali_dont_use_mmap = bool(self.dali_dont_use_mmap)
         self.dali_shuffle_seed = int(self.dali_shuffle_seed)
         self.split_seed = int(self.split_seed)
+        if self.streaming_state_training:
+            if self.batch_size != 1:
+                raise ValueError("streaming_state_training requires batch_size=1.")
+            if self.train_seq_stride != self.seq_len:
+                raise ValueError(
+                    "streaming_state_training requires train_seq_stride to equal seq_len "
+                    f"({self.seq_len}), got {self.train_seq_stride}."
+                )
+            self.dali_train_random_shuffle = False
+        if self.streaming_state_validation:
+            if self.batch_size != 1:
+                raise ValueError("streaming_state_validation requires batch_size=1.")
+            if self.val_seq_stride != self.seq_len:
+                raise ValueError(
+                    "streaming_state_validation requires val_seq_stride to equal seq_len "
+                    f"({self.seq_len}), got {self.val_seq_stride}."
+                )
+            self.dali_val_random_shuffle = False
 
         if (self.train_data_root is None) != (self.val_data_root is None):
             raise ValueError("train_data_root and val_data_root must be supplied together.")
@@ -192,8 +216,12 @@ class TrainConfig(ModelConfig):
         self.print_every = _positive_int("print_every", self.print_every)
         if self.max_train_batches is not None:
             self.max_train_batches = _positive_int("max_train_batches", self.max_train_batches)
+            if self.streaming_state_training:
+                raise ValueError("max_train_batches is incompatible with complete-video streaming training.")
         if self.max_val_batches is not None:
             self.max_val_batches = _positive_int("max_val_batches", self.max_val_batches)
+            if self.streaming_state_validation:
+                raise ValueError("max_val_batches is incompatible with complete-video streaming validation.")
         self.ckpt_dir = os.path.abspath(self.ckpt_dir)
 
 
@@ -383,11 +411,66 @@ def build_window_targets(
     return WindowTargets(labels=torch.stack(label_windows, dim=0), meta=meta)
 
 
-def write_window_file_list(meta: Sequence[WindowMeta], path: str) -> None:
-    """Write DALI video file-list rows keyed by the target tensor index."""
+def video_streams(meta: Sequence[WindowMeta]) -> List[List[int]]:
+    """Return sorted, contiguous window-index streams, one stream per video."""
 
+    by_video: Dict[str, List[int]] = {}
+    for index, item in enumerate(meta):
+        by_video.setdefault(item.video_path, []).append(index)
+
+    streams: List[List[int]] = []
+    for video_path in sorted(by_video):
+        indices = sorted(by_video[video_path], key=lambda index: meta[index].start_frame)
+        if not indices:
+            continue
+        first = meta[indices[0]]
+        if first.start_frame != 0:
+            raise RuntimeError(
+                f"Streaming video {video_path!r} must begin at frame 0, got {first.start_frame}."
+            )
+        for previous_index, current_index in zip(indices, indices[1:]):
+            previous = meta[previous_index]
+            current = meta[current_index]
+            if current.start_frame != previous.end_frame:
+                raise RuntimeError(
+                    "Streaming windows must be contiguous: "
+                    f"{video_path!r} has [{previous.start_frame}, {previous.end_frame}) followed by "
+                    f"[{current.start_frame}, {current.end_frame})."
+                )
+        streams.append(indices)
+    if not streams:
+        raise RuntimeError("No video streams were built from the training windows.")
+    return streams
+
+
+def streaming_window_order(
+    meta: Sequence[WindowMeta],
+    *,
+    seed: int,
+    shuffle_streams: bool,
+) -> List[int]:
+    """Shuffle complete video streams while preserving order inside every run."""
+
+    streams = video_streams(meta)
+    if shuffle_streams:
+        random.Random(int(seed)).shuffle(streams)
+    return [index for stream in streams for index in stream]
+
+
+def write_window_file_list(
+    meta: Sequence[WindowMeta],
+    path: str,
+    *,
+    indices: Optional[Sequence[int]] = None,
+) -> None:
+    """Write DALI rows in a requested order while preserving original sample IDs."""
+
+    ordered_indices = list(range(len(meta))) if indices is None else [int(index) for index in indices]
     with open(path, "w", encoding="utf-8") as handle:
-        for sample_id, item in enumerate(meta):
+        for sample_id in ordered_indices:
+            if sample_id < 0 or sample_id >= len(meta):
+                raise IndexError(f"Window index {sample_id} is out of range for {len(meta)} entries.")
+            item = meta[sample_id]
             handle.write(f"{item.video_path} {sample_id} {item.start_frame} {item.end_frame}\n")
 
 
@@ -488,7 +571,7 @@ def load_batch(
     *,
     device: torch.device,
     amp_dtype: torch.dtype,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, List[int]]:
     batch = next(iterator)[0]
     if "frames" not in batch or "sample_ids" not in batch:
         raise RuntimeError(f"Unexpected DALI outputs: {sorted(batch)}.")
@@ -506,7 +589,7 @@ def load_batch(
     if bool((sample_ids < 0).any()) or bool((sample_ids >= len(targets.meta)).any()):
         raise RuntimeError(f"DALI returned an out-of-range sample ID: {sample_ids.tolist()}.")
     labels = targets.labels[sample_ids].to(device, non_blocking=True)
-    return frames, labels
+    return frames, labels, [int(sample_id) for sample_id in sample_ids.tolist()]
 
 
 def compute_pos_weight(labels: torch.Tensor, power: float, clamp: float) -> torch.Tensor:
@@ -561,6 +644,56 @@ def print_metric_rows(prefix: str, rows: Iterable[Dict[str, float | str | int]])
         )
 
 
+StreamingStateCache = Dict[str, Tuple[int, TemporalState]]
+
+
+def stream_initial_state(
+    sample_ids: Sequence[int],
+    targets: WindowTargets,
+    cache: StreamingStateCache,
+) -> Tuple[Optional[TemporalState], WindowMeta, bool]:
+    """Return the state for the next contiguous chunk and whether it was carried."""
+
+    if len(sample_ids) != 1:
+        raise RuntimeError(
+            "Stateful ConvGRU training requires one DALI sample per batch; "
+            f"received {len(sample_ids)}."
+        )
+    item = targets.meta[int(sample_ids[0])]
+    cached = cache.get(item.video_path)
+    if cached is None:
+        if item.start_frame != 0:
+            raise RuntimeError(
+                f"Streaming state for {item.video_path!r} is missing before frame {item.start_frame}; "
+                "DALI window order is not a complete video stream."
+            )
+        return None, item, False
+
+    expected_start, state = cached
+    if item.start_frame != expected_start:
+        raise RuntimeError(
+            f"Non-contiguous DALI stream for {item.video_path!r}: "
+            f"expected frame {expected_start}, got {item.start_frame}."
+        )
+    return state, item, True
+
+
+def stream_augmentation_generator(
+    item: WindowMeta,
+    *,
+    epoch_index: int,
+    cfg: TrainConfig,
+    device: torch.device,
+) -> torch.Generator:
+    """Return the same transform seed for every chunk in one video/epoch."""
+
+    source = f"{cfg.dali_shuffle_seed}:{epoch_index}:{item.video_path}".encode("utf-8")
+    seed = int.from_bytes(hashlib.sha256(source).digest()[:8], "little") % (2**63 - 1)
+    generator = torch.Generator(device=device)
+    generator.manual_seed(seed)
+    return generator
+
+
 def run_epoch(
     *,
     model: torch.nn.Module,
@@ -575,6 +708,8 @@ def run_epoch(
     total_steps: int,
     global_step: int,
     description: str,
+    streaming_state: bool,
+    epoch_index: int,
 ) -> Tuple[Dict[str, object], int]:
     training = optimizer is not None
     model.train(training)
@@ -589,18 +724,46 @@ def run_epoch(
     thresholds = threshold_tensor(cfg, device=device)
     progress = tqdm(range(num_batches), desc=description, dynamic_ncols=True)
     iterator_it = iter(iterator)
+    state_cache: StreamingStateCache = {}
+    stream_resets = 0
+    stream_carried = 0
+    stream_total = 0
 
     for batch_index in progress:
-        frames, labels = load_batch(iterator_it, targets, device=device, amp_dtype=amp_dtype)
+        frames, labels, sample_ids = load_batch(iterator_it, targets, device=device, amp_dtype=amp_dtype)
+        initial_state: Optional[TemporalState] = None
+        stream_item: Optional[WindowMeta] = None
+        carried = False
+        if streaming_state:
+            initial_state, stream_item, carried = stream_initial_state(sample_ids, targets, state_cache)
+            stream_total += 1
+            stream_carried += int(carried)
+            stream_resets += int(not carried)
         if training:
-            frames = augment_frames(frames, cfg, same_over_time=True)
+            generator = (
+                stream_augmentation_generator(
+                    stream_item,
+                    epoch_index=epoch_index,
+                    cfg=cfg,
+                    device=frames.device,
+                )
+                if streaming_state and stream_item is not None
+                else None
+            )
+            frames = augment_frames(frames, cfg, same_over_time=True, generator=generator)
         with torch.set_grad_enabled(training):
             with torch.amp.autocast(
                 device_type="cuda",
                 dtype=amp_dtype,
                 enabled=amp_dtype == torch.bfloat16,
             ):
-                output: PolicyOutput = model(frames)
+                if streaming_state:
+                    output, next_state = model(frames, state=initial_state, return_aux=True)
+                    if stream_item is None:
+                        raise RuntimeError("Streaming state metadata was not resolved.")
+                    state_cache[stream_item.video_path] = (stream_item.end_frame, next_state)
+                else:
+                    output = model(frames)
                 logits = output.button_logits
                 if tuple(logits.shape) != tuple(labels.shape):
                     raise RuntimeError(
@@ -645,6 +808,7 @@ def run_epoch(
                 bce=f"{bce_loss_sum / float(batch_index + 1):.4f}",
                 conflict=f"{conflict_loss_sum / float(batch_index + 1):.4f}",
                 f1=f"{stats.macro_f1():.3f}",
+                carry=f"{stream_carried / max(1, stream_total):.3f}" if streaming_state else "n/a",
             )
     iterator.reset()
 
@@ -655,6 +819,11 @@ def run_epoch(
         "macro_f1": stats.macro_f1(),
         "rows": stats.rows(cfg.key_names),
     }
+    if streaming_state:
+        metrics["stream_chunks"] = stream_total
+        metrics["stream_resets"] = stream_resets
+        metrics["stream_carried"] = stream_carried
+        metrics["stream_carry_rate"] = stream_carried / max(1, stream_total)
     if fitter is not None:
         metrics["fitted_thresholds"] = fitter.fit(cfg.threshold_min, cfg.threshold_max, cfg.num_bin)
     return metrics, global_step
@@ -781,6 +950,16 @@ def print_startup_stats(
         f"train_shuffle={cfg.dali_train_random_shuffle}",
     )
     print(
+        "  Streaming:",
+        f"train={cfg.streaming_state_training}",
+        f"validation={cfg.streaming_state_validation}",
+        f"chunk_stride={cfg.seq_len}",
+        "state=detached_at_chunk_boundary",
+        "stream_order=shuffled_videos/ordered_chunks"
+        if cfg.streaming_state_training
+        else "stream_order=fresh_windows",
+    )
+    print(
         "  Loss:",
         "BCEWithLogits",
         f"pos_weight_power={cfg.pos_weight_power:.3f}",
@@ -814,11 +993,19 @@ def train(cfg: Optional[TrainConfig] = None) -> None:
     val_targets = build_window_targets(val_pairs, cfg, stride=cfg.val_seq_stride)
     train_file_list = os.path.join(cfg.ckpt_dir, "train_windows.txt")
     val_file_list = os.path.join(cfg.ckpt_dir, "val_windows.txt")
-    write_window_file_list(train_targets.meta, train_file_list)
-    write_window_file_list(val_targets.meta, val_file_list)
+    val_order = (
+        streaming_window_order(
+            val_targets.meta,
+            seed=cfg.dali_shuffle_seed,
+            shuffle_streams=False,
+        )
+        if cfg.streaming_state_validation
+        else list(range(len(val_targets.meta)))
+    )
+    write_window_file_list(val_targets.meta, val_file_list, indices=val_order)
 
     train_batches = _batch_count(train_targets, cfg.batch_size, partial=False)
-    val_batch_size = min(cfg.batch_size, len(val_targets.meta))
+    val_batch_size = 1 if cfg.streaming_state_validation else min(cfg.batch_size, len(val_targets.meta))
     val_batches = _batch_count(val_targets, val_batch_size, partial=True)
     if cfg.max_train_batches is not None:
         train_batches = min(train_batches, cfg.max_train_batches)
@@ -827,13 +1014,6 @@ def train(cfg: Optional[TrainConfig] = None) -> None:
     if train_batches <= 0 or val_batches <= 0:
         raise RuntimeError("Insufficient windows for the configured batch size.")
 
-    train_iterator = make_dali_iterator(
-        train_file_list,
-        cfg,
-        batch_size=cfg.batch_size,
-        random_shuffle=cfg.dali_train_random_shuffle,
-        last_batch_policy=LastBatchPolicy.DROP,
-    )
     val_iterator = make_dali_iterator(
         val_file_list,
         cfg,
@@ -864,6 +1044,23 @@ def train(cfg: Optional[TrainConfig] = None) -> None:
     total_steps = max(1, int(math.ceil(train_batches / float(cfg.grad_accum))) * cfg.num_epochs)
 
     for epoch in range(start_epoch, cfg.num_epochs):
+        train_order = (
+            streaming_window_order(
+                train_targets.meta,
+                seed=cfg.dali_shuffle_seed + epoch,
+                shuffle_streams=True,
+            )
+            if cfg.streaming_state_training
+            else list(range(len(train_targets.meta)))
+        )
+        write_window_file_list(train_targets.meta, train_file_list, indices=train_order)
+        train_iterator = make_dali_iterator(
+            train_file_list,
+            cfg,
+            batch_size=cfg.batch_size,
+            random_shuffle=cfg.dali_train_random_shuffle,
+            last_batch_policy=LastBatchPolicy.DROP,
+        )
         train_metrics, global_step = run_epoch(
             model=model,
             iterator=train_iterator,
@@ -877,7 +1074,10 @@ def train(cfg: Optional[TrainConfig] = None) -> None:
             total_steps=total_steps,
             global_step=global_step,
             description=f"Epoch {epoch + 1}/{cfg.num_epochs} train",
+            streaming_state=cfg.streaming_state_training,
+            epoch_index=epoch,
         )
+        del train_iterator
         with torch.inference_mode():
             val_metrics, _ = run_epoch(
                 model=model,
@@ -892,6 +1092,8 @@ def train(cfg: Optional[TrainConfig] = None) -> None:
                 total_steps=total_steps,
                 global_step=global_step,
                 description=f"Epoch {epoch + 1}/{cfg.num_epochs} val",
+                streaming_state=cfg.streaming_state_validation,
+                epoch_index=epoch,
             )
 
         fitted = val_metrics.get("fitted_thresholds")
@@ -903,9 +1105,15 @@ def train(cfg: Optional[TrainConfig] = None) -> None:
             f"train_loss={float(train_metrics['loss']):.4f} "
             f"train_conflict={float(train_metrics['conflict_penalty']):.4f} "
             f"train_f1={float(train_metrics['macro_f1']):.4f} "
+            f"train_stream={int(train_metrics.get('stream_resets', 0))}reset/"
+            f"{int(train_metrics.get('stream_carried', 0))}carried/"
+            f"{float(train_metrics.get('stream_carry_rate', 0.0)):.3f} "
             f"val_loss={float(val_metrics['loss']):.4f} "
             f"val_conflict={float(val_metrics['conflict_penalty']):.4f} "
-            f"val_f1={score:.4f}"
+            f"val_f1={score:.4f} "
+            f"val_stream={int(val_metrics.get('stream_resets', 0))}reset/"
+            f"{int(val_metrics.get('stream_carried', 0))}carried/"
+            f"{float(val_metrics.get('stream_carry_rate', 0.0)):.3f}"
         )
         print_metric_rows("Validation controls:", val_metrics["rows"])
         if fitted is not None:
@@ -943,6 +1151,10 @@ def parse_args() -> TrainConfig:
     add("--seq-len", type=int, default=None)
     add("--train-seq-stride", type=int, default=None)
     add("--val-seq-stride", type=int, default=None)
+    add("--streaming-state-training", dest="streaming_state_training", action="store_true", default=None)
+    add("--no-streaming-state-training", dest="streaming_state_training", action="store_false")
+    add("--streaming-state-validation", dest="streaming_state_validation", action="store_true", default=None)
+    add("--no-streaming-state-validation", dest="streaming_state_validation", action="store_false")
     add(
         "--action-offset",
         "--prediction-horizon",
