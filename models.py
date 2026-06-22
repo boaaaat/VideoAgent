@@ -78,6 +78,9 @@ class ModelConfig:
     seq_len: int = DEFAULT_SEQUENCE_LENGTH
     train_seq_stride: int = DEFAULT_SEQUENCE_LENGTH
     val_seq_stride: int = DEFAULT_SEQUENCE_LENGTH
+    # Future target measured from the source frame. action_offset=1 means
+    # frame[i] is supervised with action[i + 1].
+    action_offset: int = 1
     prediction_horizon: int = 1
     prediction_horizon_offsets: Optional[Sequence[int]] = None
     # Retained so existing checkpoint readers can deserialize their configs.
@@ -122,11 +125,11 @@ class ModelConfig:
         self.sequence_output_tail_frames = _as_int(
             "sequence_output_tail_frames", self.sequence_output_tail_frames, 0
         )
-        self.prediction_horizon = _as_int("prediction_horizon", self.prediction_horizon, 1)
-        self.prediction_horizon_offsets = _prediction_offsets(
-            self.prediction_horizon, self.prediction_horizon_offsets
-        )
-        self.prediction_horizon = int(self.prediction_horizon_offsets[0])
+        self.action_offset = _as_int("action_offset", self.action_offset, 1)
+        # Keep the legacy horizon fields synchronized for runtime/debug tools
+        # that still read them from checkpoints.
+        self.prediction_horizon = self.action_offset
+        self.prediction_horizon_offsets = (self.action_offset,)
 
         available_keys = set(get_key_names(self.selected_game))
         if self.key_names is None:

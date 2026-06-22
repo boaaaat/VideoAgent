@@ -28,6 +28,9 @@ from augmentations import augment_frames
 from models import ARCHITECTURE_VERSION, DrivingVideoPolicy, ModelConfig, PolicyOutput
 
 
+CONFLICTING_ACTION_PAIRS = (("w", "s"), ("a", "d"))
+
+
 def _positive_int(name: str, value: object, minimum: int = 1) -> int:
     if isinstance(value, bool):
         raise ValueError(f"{name} must be an integer, got {value!r}.")
@@ -56,6 +59,7 @@ class TrainConfig(ModelConfig):
 
     train_seq_stride: int = 20
     val_seq_stride: int = 80
+    action_offset: int = 1
 
     batch_size: int = 1
     target_effective_batch: int = 8
@@ -67,7 +71,7 @@ class TrainConfig(ModelConfig):
     weight_decay: float = 0.03
     grad_clip: float = 1.0
     amp_dtype: str = "bf16"
-    compile_model: bool = False
+    compile_model: bool = True
 
     train_data_root: Optional[str] = None
     val_data_root: Optional[str] = None
@@ -76,6 +80,7 @@ class TrainConfig(ModelConfig):
 
     pos_weight_power: float = 0.6
     pos_weight_clamp: float = 25.0
+    conflict_penalty_weight: float = 0.20
     fit_thresholds_from_val: bool = True
     threshold_min: float = 0.10
     threshold_max: float = 0.90
@@ -84,12 +89,12 @@ class TrainConfig(ModelConfig):
     aug_contrast: float = 0.10
     aug_noise_std: float = 0.006
     aug_gray_prob: float = 0.02
-    aug_translate_frac: float = 0.02
-    aug_scale_frac: float = 0.03
-    aug_edges_crop_prob: float = 0.25
+    aug_translate_frac: float = 0.0
+    aug_scale_frac: float = 0.0
+    aug_edges_crop_prob: float = 0.0
     aug_edges_crop_min_frac: float = 0.02
     aug_edges_crop_max_frac: float = 0.06
-    aug_cutout_prob: float = 0.20
+    aug_cutout_prob: float = 0.0
     aug_cutout_min_frac: float = 0.04
     aug_cutout_max_frac: float = 0.12
     aug_cutout_count: int = 1
@@ -129,6 +134,9 @@ class TrainConfig(ModelConfig):
         self.train_split = _finite_float("train_split", self.train_split, 0.05, 0.95)
         self.pos_weight_power = _finite_float("pos_weight_power", self.pos_weight_power, 0.0)
         self.pos_weight_clamp = _finite_float("pos_weight_clamp", self.pos_weight_clamp, 1.0)
+        self.conflict_penalty_weight = _finite_float(
+            "conflict_penalty_weight", self.conflict_penalty_weight, 0.0
+        )
         self.threshold_min = _finite_float("threshold_min", self.threshold_min, 0.0, 1.0)
         self.threshold_max = _finite_float("threshold_max", self.threshold_max, 0.0, 1.0)
         if self.threshold_max < self.threshold_min:
@@ -358,14 +366,14 @@ def build_window_targets(
     stride = _positive_int("stride", stride)
     label_windows: List[torch.Tensor] = []
     meta: List[WindowMeta] = []
-    horizon = int(cfg.prediction_horizon_offsets[0])
+    action_offset = int(cfg.action_offset)
     for video_path, csv_path in pairs:
         labels = load_run_labels(csv_path, cfg)
         # Input ends at start + seq_len - 1. The supervision is its future
-        # action at start + seq_len - 1 + horizon.
-        max_start = int(labels.size(0)) - int(cfg.seq_len) - horizon
+        # action at start + seq_len - 1 + action_offset.
+        max_start = int(labels.size(0)) - int(cfg.seq_len) - action_offset
         for start in range(0, max_start + 1, stride):
-            target_index = start + int(cfg.seq_len) - 1 + horizon
+            target_index = start + int(cfg.seq_len) - 1 + action_offset
             label_windows.append(labels[target_index])
             meta.append(WindowMeta(video_path, start, start + int(cfg.seq_len)))
     if not label_windows:
@@ -508,6 +516,24 @@ def compute_pos_weight(labels: torch.Tensor, power: float, clamp: float) -> torc
     return (negative / positive.clamp(min=1.0)).pow(float(power)).clamp(1.0, float(clamp))
 
 
+def conflicting_action_penalty(logits: torch.Tensor, cfg: TrainConfig) -> torch.Tensor:
+    """Penalize probability mass assigned to mutually exclusive driving chords."""
+
+    if cfg.conflict_penalty_weight <= 0.0:
+        return logits.new_zeros(())
+    action_index = {name: index for index, name in enumerate(cfg.key_names)}
+    pair_penalties: List[torch.Tensor] = []
+    probabilities = torch.sigmoid(logits.float())
+    for first, second in CONFLICTING_ACTION_PAIRS:
+        first_index = action_index.get(first)
+        second_index = action_index.get(second)
+        if first_index is not None and second_index is not None:
+            pair_penalties.append(probabilities[:, first_index] * probabilities[:, second_index])
+    if not pair_penalties:
+        return logits.new_zeros(())
+    return torch.stack(pair_penalties, dim=1).mean()
+
+
 def warmup_cosine_lr(
     step: int, *, total_steps: int, base_lr: float, min_lr: float, warmup_steps: int
 ) -> float:
@@ -556,6 +582,8 @@ def run_epoch(
         optimizer.zero_grad(set_to_none=True)
 
     loss_sum = 0.0
+    bce_loss_sum = 0.0
+    conflict_loss_sum = 0.0
     stats = BinaryStats(cfg.num_bin, device)
     fitter = ThresholdFitter() if (not training and cfg.fit_thresholds_from_val) else None
     thresholds = threshold_tensor(cfg, device=device)
@@ -578,9 +606,11 @@ def run_epoch(
                     raise RuntimeError(
                         f"Model logits shape {tuple(logits.shape)} does not match labels {tuple(labels.shape)}."
                     )
-                loss = F.binary_cross_entropy_with_logits(
+                bce_loss = F.binary_cross_entropy_with_logits(
                     logits.float(), labels.float(), pos_weight=pos_weight.float()
                 )
+                conflict_loss = conflicting_action_penalty(logits, cfg)
+                loss = bce_loss + float(cfg.conflict_penalty_weight) * conflict_loss
                 scaled_loss = loss / int(cfg.grad_accum)
             if training:
                 scaled_loss.backward()
@@ -607,12 +637,21 @@ def run_epoch(
             if fitter is not None:
                 fitter.update(logits, labels)
         loss_sum += float(loss.detach().item())
+        bce_loss_sum += float(bce_loss.detach().item())
+        conflict_loss_sum += float(conflict_loss.detach().item())
         if (batch_index + 1) % cfg.print_every == 0 or batch_index + 1 == num_batches:
-            progress.set_postfix(loss=f"{loss_sum / float(batch_index + 1):.4f}", f1=f"{stats.macro_f1():.3f}")
+            progress.set_postfix(
+                loss=f"{loss_sum / float(batch_index + 1):.4f}",
+                bce=f"{bce_loss_sum / float(batch_index + 1):.4f}",
+                conflict=f"{conflict_loss_sum / float(batch_index + 1):.4f}",
+                f1=f"{stats.macro_f1():.3f}",
+            )
     iterator.reset()
 
     metrics: Dict[str, object] = {
         "loss": loss_sum / max(1, num_batches),
+        "bce_loss": bce_loss_sum / max(1, num_batches),
+        "conflict_penalty": conflict_loss_sum / max(1, num_batches),
         "macro_f1": stats.macro_f1(),
         "rows": stats.rows(cfg.key_names),
     }
@@ -670,6 +709,97 @@ def _batch_count(targets: WindowTargets, batch_size: int, *, partial: bool) -> i
     return len(targets.meta) // int(batch_size)
 
 
+def print_startup_stats(
+    cfg: TrainConfig,
+    *,
+    train_pairs: Sequence[Tuple[str, str]],
+    val_pairs: Sequence[Tuple[str, str]],
+    train_targets: WindowTargets,
+    val_targets: WindowTargets,
+    train_batches: int,
+    val_batches: int,
+    parameter_count: int,
+    pos_weight: torch.Tensor,
+) -> None:
+    """Print the fixed data/model contract before the first DALI batch is read."""
+
+    action_names = list(cfg.key_names)
+    train_positive_rate = train_targets.labels.float().mean(dim=0)
+    val_positive_rate = val_targets.labels.float().mean(dim=0)
+    total_videos = len(train_pairs) + len(val_pairs)
+    print("Startup configuration:")
+    print(
+        "  Model:",
+        f"architecture={ARCHITECTURE_VERSION}",
+        f"parameters={parameter_count / 1_000_000:.4f}M",
+        f"input=[B,{cfg.seq_len},3,{cfg.model_size},{cfg.model_size}]",
+        f"temporal=2xConvGRU(128x{cfg.model_size // 16}x{cfg.model_size // 16})",
+        f"readout=6x192",
+    )
+    print(
+        "  Actions:",
+        f"order={action_names}",
+        f"action_offset=+{int(cfg.action_offset)}",
+        f"thresholds={list(cfg.button_state_thresholds)}",
+    )
+    print(
+        "  Data:",
+        f"videos_total={total_videos}",
+        f"train_videos={len(train_pairs)}",
+        f"val_videos={len(val_pairs)}",
+        f"train_windows={len(train_targets.meta)}",
+        f"val_windows={len(val_targets.meta)}",
+        f"train_stride={cfg.train_seq_stride}",
+        f"val_stride={cfg.val_seq_stride}",
+    )
+    print(
+        "  Batches:",
+        f"batch_size={cfg.batch_size}",
+        f"grad_accum={cfg.grad_accum}",
+        f"effective_batch={cfg.batch_size * cfg.grad_accum}",
+        f"train_batches={train_batches}",
+        f"val_batches={val_batches}",
+    )
+    print(
+        "  Optimizer:",
+        "AdamW",
+        f"lr={cfg.lr:.6g}",
+        f"min_lr={cfg.min_lr:.6g}",
+        f"warmup_steps={cfg.warmup_steps}",
+        f"weight_decay={cfg.weight_decay:.6g}",
+        f"grad_clip={cfg.grad_clip:.6g}",
+        f"amp={cfg.amp_dtype}",
+        f"compile={cfg.compile_model}",
+    )
+    print(
+        "  DALI:",
+        "gpu_decode_resize",
+        f"output=fp16",
+        f"reader_threads={cfg.dali_num_threads}",
+        f"pipeline_prefetch={cfg.dali_prefetch_queue_depth}",
+        f"reader_prefetch={cfg.dali_reader_prefetch_queue_depth}",
+        f"train_shuffle={cfg.dali_train_random_shuffle}",
+    )
+    print(
+        "  Loss:",
+        "BCEWithLogits",
+        f"pos_weight_power={cfg.pos_weight_power:.3f}",
+        f"pos_weight_clamp={cfg.pos_weight_clamp:.3f}",
+        f"conflict_weight={cfg.conflict_penalty_weight:.3f}",
+    )
+    print(
+        "  Train class stats:",
+        " ".join(
+            f"{name}:pos={float(rate):.4f},w={float(weight):.3f}"
+            for name, rate, weight in zip(action_names, train_positive_rate, pos_weight.detach().cpu())
+        ),
+    )
+    print(
+        "  Val class stats:",
+        " ".join(f"{name}:pos={float(rate):.4f}" for name, rate in zip(action_names, val_positive_rate)),
+    )
+
+
 def train(cfg: Optional[TrainConfig] = None) -> None:
     cfg = TrainConfig() if cfg is None else cfg
     if not torch.cuda.is_available():
@@ -719,14 +849,17 @@ def train(cfg: Optional[TrainConfig] = None) -> None:
     model = torch.compile(base_model) if cfg.compile_model else base_model
     amp_dtype = torch.bfloat16 if cfg.amp_dtype == "bf16" else torch.float32
     pos_weight = compute_pos_weight(train_targets.labels, cfg.pos_weight_power, cfg.pos_weight_clamp).to(device)
-
-    print(
-        "Training:",
-        f"architecture={ARCHITECTURE_VERSION}",
-        f"actions={cfg.key_names}",
-        f"train_windows={len(train_targets.meta)}",
-        f"val_windows={len(val_targets.meta)}",
-        f"pos_weight={pos_weight.detach().cpu().tolist()}",
+    parameter_count = sum(parameter.numel() for parameter in base_model.parameters())
+    print_startup_stats(
+        cfg,
+        train_pairs=train_pairs,
+        val_pairs=val_pairs,
+        train_targets=train_targets,
+        val_targets=val_targets,
+        train_batches=train_batches,
+        val_batches=val_batches,
+        parameter_count=parameter_count,
+        pos_weight=pos_weight,
     )
     total_steps = max(1, int(math.ceil(train_batches / float(cfg.grad_accum))) * cfg.num_epochs)
 
@@ -768,8 +901,10 @@ def train(cfg: Optional[TrainConfig] = None) -> None:
         print(
             f"Epoch {epoch + 1}/{cfg.num_epochs}: "
             f"train_loss={float(train_metrics['loss']):.4f} "
+            f"train_conflict={float(train_metrics['conflict_penalty']):.4f} "
             f"train_f1={float(train_metrics['macro_f1']):.4f} "
             f"val_loss={float(val_metrics['loss']):.4f} "
+            f"val_conflict={float(val_metrics['conflict_penalty']):.4f} "
             f"val_f1={score:.4f}"
         )
         print_metric_rows("Validation controls:", val_metrics["rows"])
@@ -808,7 +943,14 @@ def parse_args() -> TrainConfig:
     add("--seq-len", type=int, default=None)
     add("--train-seq-stride", type=int, default=None)
     add("--val-seq-stride", type=int, default=None)
-    add("--prediction-horizon", type=int, default=None)
+    add(
+        "--action-offset",
+        "--prediction-horizon",
+        dest="action_offset",
+        type=int,
+        default=None,
+        help="Future label shift: frame[i] predicts action[i + action_offset]. Default: 1.",
+    )
     add("--model-size", type=int, default=None)
     add("--lr", type=float, default=None)
     add("--min-lr", type=float, default=None)
@@ -818,6 +960,7 @@ def parse_args() -> TrainConfig:
     add("--train-split", type=float, default=None)
     add("--pos-weight-power", type=float, default=None)
     add("--pos-weight-clamp", type=float, default=None)
+    add("--conflict-penalty-weight", type=float, default=None)
     add("--threshold-min", type=float, default=None)
     add("--threshold-max", type=float, default=None)
     add("--fit-thresholds-from-val", dest="fit_thresholds_from_val", action="store_true", default=None)
