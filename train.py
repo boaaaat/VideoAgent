@@ -1,0 +1,842 @@
+"""DALI trainer for the final-state FPN + ConvGRU driving policy.
+
+The DALI pipeline owns GPU video decode and resize. CSV labels are parsed once
+on the host, then joined to decoded 80-frame windows through the DALI sample
+label written into the file list.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import glob
+import math
+import os
+import random
+from dataclasses import asdict, dataclass, field
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+import torch
+import torch.nn.functional as F
+from tqdm.auto import tqdm
+
+from nvidia.dali import pipeline_def, types
+import nvidia.dali.fn as fn
+from nvidia.dali.plugin.pytorch import DALIGenericIterator, LastBatchPolicy
+
+from augmentations import augment_frames
+from models import ARCHITECTURE_VERSION, DrivingVideoPolicy, ModelConfig, PolicyOutput
+
+
+def _positive_int(name: str, value: object, minimum: int = 1) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be an integer, got {value!r}.")
+    try:
+        result = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an integer, got {value!r}.") from exc
+    if result < minimum:
+        raise ValueError(f"{name} must be >= {minimum}, got {result}.")
+    return result
+
+
+def _finite_float(name: str, value: object, minimum: float, maximum: Optional[float] = None) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be numeric, got {value!r}.")
+    result = float(value)
+    if not math.isfinite(result) or result < minimum or (maximum is not None and result > maximum):
+        ceiling = "infinity" if maximum is None else str(maximum)
+        raise ValueError(f"{name} must be in [{minimum}, {ceiling}], got {value!r}.")
+    return result
+
+
+@dataclass
+class TrainConfig(ModelConfig):
+    """Training settings. The inherited model config fixes the six action names."""
+
+    train_seq_stride: int = 20
+    val_seq_stride: int = 80
+
+    batch_size: int = 1
+    target_effective_batch: int = 8
+    grad_accum: int = field(init=False)
+    num_epochs: int = 50
+    lr: float = 2e-4
+    min_lr: float = 1e-5
+    warmup_steps: int = 100
+    weight_decay: float = 0.03
+    grad_clip: float = 1.0
+    amp_dtype: str = "bf16"
+    compile_model: bool = False
+
+    train_data_root: Optional[str] = None
+    val_data_root: Optional[str] = None
+    train_split: float = 0.9
+    split_seed: int = 1337
+
+    pos_weight_power: float = 0.6
+    pos_weight_clamp: float = 25.0
+    fit_thresholds_from_val: bool = True
+    threshold_min: float = 0.10
+    threshold_max: float = 0.90
+
+    aug_brightness: float = 0.08
+    aug_contrast: float = 0.10
+    aug_noise_std: float = 0.006
+    aug_gray_prob: float = 0.02
+    aug_translate_frac: float = 0.02
+    aug_scale_frac: float = 0.03
+    aug_edges_crop_prob: float = 0.25
+    aug_edges_crop_min_frac: float = 0.02
+    aug_edges_crop_max_frac: float = 0.06
+    aug_cutout_prob: float = 0.20
+    aug_cutout_min_frac: float = 0.04
+    aug_cutout_max_frac: float = 0.12
+    aug_cutout_count: int = 1
+
+    dali_num_threads: int = 6
+    dali_prefetch_queue_depth: int = 4
+    dali_reader_prefetch_queue_depth: int = 4
+    dali_read_ahead: bool = False
+    dali_dont_use_mmap: bool = False
+    dali_train_random_shuffle: bool = True
+    dali_val_random_shuffle: bool = False
+    dali_shuffle_seed: int = 1337
+
+    resume: bool = True
+    resume_path: Optional[str] = None
+    ckpt_dir: str = "./checkpoints_rt"
+    save_every: int = 1
+    print_every: int = 20
+    max_train_batches: Optional[int] = None
+    max_val_batches: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.batch_size = _positive_int("batch_size", self.batch_size)
+        self.target_effective_batch = _positive_int("target_effective_batch", self.target_effective_batch)
+        self.grad_accum = int(math.ceil(self.target_effective_batch / float(self.batch_size)))
+        self.num_epochs = _positive_int("num_epochs", self.num_epochs)
+        self.lr = _finite_float("lr", self.lr, 0.0)
+        if self.lr <= 0.0:
+            raise ValueError("lr must be positive.")
+        self.min_lr = _finite_float("min_lr", self.min_lr, 0.0)
+        if self.min_lr > self.lr:
+            raise ValueError(f"min_lr must be <= lr, got {self.min_lr} > {self.lr}.")
+        self.warmup_steps = _positive_int("warmup_steps", self.warmup_steps, 0)
+        self.weight_decay = _finite_float("weight_decay", self.weight_decay, 0.0)
+        self.grad_clip = _finite_float("grad_clip", self.grad_clip, 0.0)
+        self.train_split = _finite_float("train_split", self.train_split, 0.05, 0.95)
+        self.pos_weight_power = _finite_float("pos_weight_power", self.pos_weight_power, 0.0)
+        self.pos_weight_clamp = _finite_float("pos_weight_clamp", self.pos_weight_clamp, 1.0)
+        self.threshold_min = _finite_float("threshold_min", self.threshold_min, 0.0, 1.0)
+        self.threshold_max = _finite_float("threshold_max", self.threshold_max, 0.0, 1.0)
+        if self.threshold_max < self.threshold_min:
+            raise ValueError("threshold_max must be >= threshold_min.")
+        self.amp_dtype = str(self.amp_dtype).lower().strip()
+        if self.amp_dtype not in {"bf16", "fp32", "float32"}:
+            raise ValueError("amp_dtype must be bf16 or fp32.")
+        self.compile_model = bool(self.compile_model)
+        self.fit_thresholds_from_val = bool(self.fit_thresholds_from_val)
+
+        for name in (
+            "aug_brightness",
+            "aug_contrast",
+            "aug_gray_prob",
+            "aug_translate_frac",
+            "aug_scale_frac",
+            "aug_edges_crop_prob",
+            "aug_edges_crop_min_frac",
+            "aug_edges_crop_max_frac",
+            "aug_cutout_prob",
+            "aug_cutout_min_frac",
+            "aug_cutout_max_frac",
+        ):
+            setattr(self, name, _finite_float(name, getattr(self, name), 0.0, 1.0))
+        self.aug_noise_std = _finite_float("aug_noise_std", self.aug_noise_std, 0.0, 0.1)
+        if self.aug_edges_crop_max_frac < self.aug_edges_crop_min_frac:
+            raise ValueError("aug_edges_crop_max_frac must be >= aug_edges_crop_min_frac.")
+        if self.aug_cutout_max_frac < self.aug_cutout_min_frac:
+            raise ValueError("aug_cutout_max_frac must be >= aug_cutout_min_frac.")
+        self.aug_cutout_count = _positive_int("aug_cutout_count", self.aug_cutout_count)
+
+        self.dali_num_threads = _positive_int("dali_num_threads", self.dali_num_threads)
+        self.dali_prefetch_queue_depth = _positive_int(
+            "dali_prefetch_queue_depth", self.dali_prefetch_queue_depth
+        )
+        self.dali_reader_prefetch_queue_depth = _positive_int(
+            "dali_reader_prefetch_queue_depth", self.dali_reader_prefetch_queue_depth
+        )
+        self.dali_train_random_shuffle = bool(self.dali_train_random_shuffle)
+        self.dali_val_random_shuffle = bool(self.dali_val_random_shuffle)
+        self.dali_read_ahead = bool(self.dali_read_ahead)
+        self.dali_dont_use_mmap = bool(self.dali_dont_use_mmap)
+        self.dali_shuffle_seed = int(self.dali_shuffle_seed)
+        self.split_seed = int(self.split_seed)
+
+        if (self.train_data_root is None) != (self.val_data_root is None):
+            raise ValueError("train_data_root and val_data_root must be supplied together.")
+        if self.train_data_root is not None:
+            self.train_data_root = str(self.train_data_root)
+            self.val_data_root = str(self.val_data_root)
+        self.resume = bool(self.resume)
+        self.save_every = _positive_int("save_every", self.save_every)
+        self.print_every = _positive_int("print_every", self.print_every)
+        if self.max_train_batches is not None:
+            self.max_train_batches = _positive_int("max_train_batches", self.max_train_batches)
+        if self.max_val_batches is not None:
+            self.max_val_batches = _positive_int("max_val_batches", self.max_val_batches)
+        self.ckpt_dir = os.path.abspath(self.ckpt_dir)
+
+
+@dataclass(frozen=True)
+class WindowMeta:
+    video_path: str
+    start_frame: int
+    end_frame: int
+
+
+@dataclass
+class WindowTargets:
+    labels: torch.Tensor
+    meta: List[WindowMeta]
+
+
+@dataclass
+class BinaryStats:
+    num_actions: int
+    device: torch.device
+
+    def __post_init__(self) -> None:
+        self.tp = torch.zeros(self.num_actions, dtype=torch.float64, device=self.device)
+        self.fp = torch.zeros(self.num_actions, dtype=torch.float64, device=self.device)
+        self.fn = torch.zeros(self.num_actions, dtype=torch.float64, device=self.device)
+
+    @torch.no_grad()
+    def update(self, prediction: torch.Tensor, target: torch.Tensor) -> None:
+        pred = prediction.bool().to(dtype=torch.float64)
+        true = target.bool().to(dtype=torch.float64)
+        self.tp += (pred * true).sum(dim=0)
+        self.fp += (pred * (1.0 - true)).sum(dim=0)
+        self.fn += ((1.0 - pred) * true).sum(dim=0)
+
+    def rows(self, names: Sequence[str]) -> List[Dict[str, float | str | int]]:
+        precision = self.tp / (self.tp + self.fp).clamp(min=1.0)
+        recall = self.tp / (self.tp + self.fn).clamp(min=1.0)
+        f1 = 2.0 * precision * recall / (precision + recall).clamp(min=1e-8)
+        support = self.tp + self.fn
+        return [
+            {
+                "name": str(name),
+                "precision": float(precision[index].item()),
+                "recall": float(recall[index].item()),
+                "f1": float(f1[index].item()),
+                "support": int(support[index].item()),
+            }
+            for index, name in enumerate(names)
+        ]
+
+    def macro_f1(self) -> float:
+        precision = self.tp / (self.tp + self.fp).clamp(min=1.0)
+        recall = self.tp / (self.tp + self.fn).clamp(min=1.0)
+        f1 = 2.0 * precision * recall / (precision + recall).clamp(min=1e-8)
+        observed = (self.tp + self.fp + self.fn) > 0
+        return float(f1[observed].mean().item()) if bool(observed.any()) else 0.0
+
+
+@dataclass
+class ThresholdFitter:
+    """Collect validation predictions and choose per-action F1 thresholds."""
+
+    probabilities: List[torch.Tensor] = field(default_factory=list)
+    targets: List[torch.Tensor] = field(default_factory=list)
+
+    @torch.no_grad()
+    def update(self, logits: torch.Tensor, target: torch.Tensor) -> None:
+        self.probabilities.append(torch.sigmoid(logits.float()).detach().cpu())
+        self.targets.append(target.bool().detach().cpu())
+
+    def fit(self, low: float, high: float, num_actions: int) -> Tuple[float, ...]:
+        if not self.probabilities:
+            return tuple(0.5 for _ in range(num_actions))
+        probabilities = torch.cat(self.probabilities, dim=0)
+        targets = torch.cat(self.targets, dim=0)
+        candidates = torch.linspace(float(low), float(high), 161)
+        fitted: List[float] = []
+        for action in range(num_actions):
+            truth = targets[:, action]
+            if not bool(truth.any()):
+                fitted.append(0.5)
+                continue
+            predictions = probabilities[:, action].unsqueeze(1) >= candidates.unsqueeze(0)
+            true = truth.unsqueeze(1)
+            tp = (predictions & true).sum(dim=0).float()
+            fp = (predictions & ~true).sum(dim=0).float()
+            fn = (~predictions & true).sum(dim=0).float()
+            f1 = 2.0 * tp / (2.0 * tp + fp + fn).clamp(min=1.0)
+            fitted.append(float(candidates[int(f1.argmax().item())].item()))
+        return tuple(fitted)
+
+
+def find_runs(data_root: str, video_ext: str, csv_ext: str) -> List[Tuple[str, str]]:
+    video_paths = sorted(glob.glob(os.path.join(data_root, f"*{video_ext}")))
+    pairs: List[Tuple[str, str]] = []
+    for video_path in video_paths:
+        csv_path = os.path.splitext(video_path)[0] + csv_ext
+        if os.path.isfile(csv_path):
+            pairs.append((video_path, csv_path))
+    return pairs
+
+
+def split_runs(
+    pairs: Sequence[Tuple[str, str]], train_split: float, seed: int
+) -> Tuple[List[Tuple[str, str]], List[Tuple[str, str]]]:
+    ordered = list(pairs)
+    random.Random(int(seed)).shuffle(ordered)
+    if len(ordered) <= 1:
+        return ordered, []
+    split = max(1, min(len(ordered) - 1, round(len(ordered) * float(train_split))))
+    return ordered[:split], ordered[split:]
+
+
+def resolve_run_pairs(cfg: TrainConfig) -> Tuple[List[Tuple[str, str]], List[Tuple[str, str]]]:
+    if cfg.train_data_root is not None and cfg.val_data_root is not None:
+        train_pairs = find_runs(cfg.train_data_root, cfg.video_ext, cfg.csv_ext)
+        val_pairs = find_runs(cfg.val_data_root, cfg.video_ext, cfg.csv_ext)
+    else:
+        detected_train = os.path.join(str(cfg.data_root), "train")
+        detected_val = os.path.join(str(cfg.data_root), "val")
+        if os.path.isdir(detected_train) and os.path.isdir(detected_val):
+            train_pairs = find_runs(detected_train, cfg.video_ext, cfg.csv_ext)
+            val_pairs = find_runs(detected_val, cfg.video_ext, cfg.csv_ext)
+        else:
+            pairs = find_runs(str(cfg.data_root), cfg.video_ext, cfg.csv_ext)
+            train_pairs, val_pairs = split_runs(pairs, cfg.train_split, cfg.split_seed)
+    if not train_pairs:
+        raise RuntimeError(f"No video/CSV pairs found for training under {cfg.data_root!r}.")
+    if not val_pairs:
+        raise RuntimeError(
+            "No validation runs were found. Provide train/val folders or at least two complete runs."
+        )
+    return train_pairs, val_pairs
+
+
+def _parse_float(value: object) -> float:
+    if isinstance(value, str):
+        value = value.strip()
+    return float(value)
+
+
+def load_run_labels(csv_path: str, cfg: TrainConfig) -> torch.Tensor:
+    rows: List[Dict[str, str]] = []
+    with open(csv_path, "r", newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames is None:
+            raise RuntimeError(f"CSV has no header: {csv_path}")
+        required = ["timestamp", *cfg.key_names]
+        missing = [name for name in required if name not in reader.fieldnames]
+        if missing:
+            raise RuntimeError(f"CSV schema mismatch for {csv_path}: missing columns={missing}")
+        rows.extend(reader)
+    if not rows:
+        raise RuntimeError(f"CSV has no rows: {csv_path}")
+    labels = torch.zeros((len(rows), cfg.num_bin), dtype=torch.float32)
+    for index, row in enumerate(rows):
+        for action, name in enumerate(cfg.key_names):
+            try:
+                labels[index, action] = 1.0 if _parse_float(row[name]) > 0.5 else 0.0
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(f"Invalid value in {csv_path} row {index + 2}, column {name!r}.") from exc
+    return labels
+
+
+def build_window_targets(
+    pairs: Sequence[Tuple[str, str]], cfg: TrainConfig, *, stride: int
+) -> WindowTargets:
+    """Create labels for the one decision read from each final recurrent state."""
+
+    stride = _positive_int("stride", stride)
+    label_windows: List[torch.Tensor] = []
+    meta: List[WindowMeta] = []
+    horizon = int(cfg.prediction_horizon_offsets[0])
+    for video_path, csv_path in pairs:
+        labels = load_run_labels(csv_path, cfg)
+        # Input ends at start + seq_len - 1. The supervision is its future
+        # action at start + seq_len - 1 + horizon.
+        max_start = int(labels.size(0)) - int(cfg.seq_len) - horizon
+        for start in range(0, max_start + 1, stride):
+            target_index = start + int(cfg.seq_len) - 1 + horizon
+            label_windows.append(labels[target_index])
+            meta.append(WindowMeta(video_path, start, start + int(cfg.seq_len)))
+    if not label_windows:
+        raise RuntimeError(
+            "No valid 80-frame windows were created. Check CSV lengths, seq_len, and prediction_horizon."
+        )
+    return WindowTargets(labels=torch.stack(label_windows, dim=0), meta=meta)
+
+
+def write_window_file_list(meta: Sequence[WindowMeta], path: str) -> None:
+    """Write DALI video file-list rows keyed by the target tensor index."""
+
+    with open(path, "w", encoding="utf-8") as handle:
+        for sample_id, item in enumerate(meta):
+            handle.write(f"{item.video_path} {sample_id} {item.start_frame} {item.end_frame}\n")
+
+
+@pipeline_def
+def video_window_pipeline(
+    file_list: str,
+    seq_len: int,
+    resize_size: int,
+    random_shuffle: bool,
+    reader_prefetch_queue_depth: int,
+    read_ahead: bool,
+    dont_use_mmap: bool,
+):
+    decode_bytes = int(seq_len) * int(resize_size) * int(resize_size) * 3
+    normalized_bytes = decode_bytes * 2
+    frames, sample_ids = fn.readers.video_resize(
+        device="gpu",
+        name="Reader",
+        file_list=file_list,
+        file_list_frame_num=True,
+        file_list_include_preceding_frame=False,
+        sequence_length=int(seq_len),
+        step=int(seq_len),
+        stride=1,
+        random_shuffle=bool(random_shuffle),
+        prefetch_queue_depth=int(reader_prefetch_queue_depth),
+        read_ahead=bool(read_ahead),
+        dont_use_mmap=bool(dont_use_mmap),
+        image_type=types.RGB,
+        resize_x=int(resize_size),
+        resize_y=int(resize_size),
+        interp_type=types.INTERP_LINEAR,
+        bytes_per_sample_hint=decode_bytes,
+        tensor_init_bytes=decode_bytes,
+        temp_buffer_hint=decode_bytes,
+    )
+    frames = fn.crop_mirror_normalize(
+        frames,
+        # Keep DALI's prefetched resized sequences in FP16. The trainer casts
+        # each current batch to BF16 or FP32 immediately before augmentation.
+        dtype=types.FLOAT16,
+        output_layout="FCHW",
+        mean=[0.0, 0.0, 0.0],
+        std=[255.0, 255.0, 255.0],
+        bytes_per_sample_hint=normalized_bytes,
+    )
+    return frames, sample_ids
+
+
+def make_dali_iterator(
+    file_list: str,
+    cfg: TrainConfig,
+    *,
+    batch_size: int,
+    random_shuffle: bool,
+    last_batch_policy,
+):
+    pipeline = video_window_pipeline(
+        batch_size=int(batch_size),
+        num_threads=int(cfg.dali_num_threads),
+        device_id=0,
+        seed=int(cfg.dali_shuffle_seed),
+        file_list=file_list,
+        seq_len=int(cfg.seq_len),
+        resize_size=int(cfg.model_size),
+        random_shuffle=bool(random_shuffle),
+        reader_prefetch_queue_depth=int(cfg.dali_reader_prefetch_queue_depth),
+        read_ahead=bool(cfg.dali_read_ahead),
+        dont_use_mmap=bool(cfg.dali_dont_use_mmap),
+        prefetch_queue_depth=int(cfg.dali_prefetch_queue_depth),
+        exec_async=True,
+        exec_pipelined=True,
+    )
+    pipeline.build()
+    return DALIGenericIterator(
+        [pipeline],
+        output_map=["frames", "sample_ids"],
+        reader_name="Reader",
+        auto_reset=False,
+        last_batch_policy=last_batch_policy,
+        prepare_first_batch=True,
+    )
+
+
+def _ensure_fchw(frames: torch.Tensor) -> torch.Tensor:
+    if frames.dim() != 5:
+        raise RuntimeError(f"Unexpected DALI frame shape: {tuple(frames.shape)}.")
+    if frames.size(2) == 3:
+        return frames
+    if frames.size(-1) == 3:
+        return frames.permute(0, 1, 4, 2, 3).contiguous()
+    raise RuntimeError(f"DALI did not produce RGB frames: {tuple(frames.shape)}.")
+
+
+def load_batch(
+    iterator,
+    targets: WindowTargets,
+    *,
+    device: torch.device,
+    amp_dtype: torch.dtype,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    batch = next(iterator)[0]
+    if "frames" not in batch or "sample_ids" not in batch:
+        raise RuntimeError(f"Unexpected DALI outputs: {sorted(batch)}.")
+    frames = _ensure_fchw(batch["frames"])
+    if frames.device != device:
+        frames = frames.to(device, non_blocking=True)
+    if frames.dtype != amp_dtype:
+        frames = frames.to(dtype=amp_dtype)
+
+    sample_ids = batch["sample_ids"].reshape(-1).long().cpu()
+    if sample_ids.numel() != frames.size(0):
+        raise RuntimeError(
+            f"DALI batch has {frames.size(0)} frame windows but {sample_ids.numel()} sample IDs."
+        )
+    if bool((sample_ids < 0).any()) or bool((sample_ids >= len(targets.meta)).any()):
+        raise RuntimeError(f"DALI returned an out-of-range sample ID: {sample_ids.tolist()}.")
+    labels = targets.labels[sample_ids].to(device, non_blocking=True)
+    return frames, labels
+
+
+def compute_pos_weight(labels: torch.Tensor, power: float, clamp: float) -> torch.Tensor:
+    labels = labels.float()
+    positive = labels.sum(dim=0)
+    negative = float(labels.size(0)) - positive
+    return (negative / positive.clamp(min=1.0)).pow(float(power)).clamp(1.0, float(clamp))
+
+
+def warmup_cosine_lr(
+    step: int, *, total_steps: int, base_lr: float, min_lr: float, warmup_steps: int
+) -> float:
+    if warmup_steps > 0 and step < warmup_steps:
+        return float(base_lr) * float(step + 1) / float(warmup_steps)
+    progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+    progress = min(max(progress, 0.0), 1.0)
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return float(min_lr) + (float(base_lr) - float(min_lr)) * cosine
+
+
+def threshold_tensor(cfg: TrainConfig, *, device: torch.device) -> torch.Tensor:
+    return torch.tensor(list(cfg.button_state_thresholds), device=device, dtype=torch.float32)
+
+
+def print_metric_rows(prefix: str, rows: Iterable[Dict[str, float | str | int]]) -> None:
+    print(prefix)
+    for row in rows:
+        print(
+            f"  {str(row['name']):>2}: "
+            f"f1={float(row['f1']):.3f} "
+            f"precision={float(row['precision']):.3f} "
+            f"recall={float(row['recall']):.3f} "
+            f"support={int(row['support'])}"
+        )
+
+
+def run_epoch(
+    *,
+    model: torch.nn.Module,
+    iterator,
+    num_batches: int,
+    targets: WindowTargets,
+    cfg: TrainConfig,
+    device: torch.device,
+    amp_dtype: torch.dtype,
+    pos_weight: torch.Tensor,
+    optimizer: Optional[torch.optim.Optimizer],
+    total_steps: int,
+    global_step: int,
+    description: str,
+) -> Tuple[Dict[str, object], int]:
+    training = optimizer is not None
+    model.train(training)
+    if training:
+        optimizer.zero_grad(set_to_none=True)
+
+    loss_sum = 0.0
+    stats = BinaryStats(cfg.num_bin, device)
+    fitter = ThresholdFitter() if (not training and cfg.fit_thresholds_from_val) else None
+    thresholds = threshold_tensor(cfg, device=device)
+    progress = tqdm(range(num_batches), desc=description, dynamic_ncols=True)
+    iterator_it = iter(iterator)
+
+    for batch_index in progress:
+        frames, labels = load_batch(iterator_it, targets, device=device, amp_dtype=amp_dtype)
+        if training:
+            frames = augment_frames(frames, cfg, same_over_time=True)
+        with torch.set_grad_enabled(training):
+            with torch.amp.autocast(
+                device_type="cuda",
+                dtype=amp_dtype,
+                enabled=amp_dtype == torch.bfloat16,
+            ):
+                output: PolicyOutput = model(frames)
+                logits = output.button_logits
+                if tuple(logits.shape) != tuple(labels.shape):
+                    raise RuntimeError(
+                        f"Model logits shape {tuple(logits.shape)} does not match labels {tuple(labels.shape)}."
+                    )
+                loss = F.binary_cross_entropy_with_logits(
+                    logits.float(), labels.float(), pos_weight=pos_weight.float()
+                )
+                scaled_loss = loss / int(cfg.grad_accum)
+            if training:
+                scaled_loss.backward()
+                is_last = batch_index + 1 == num_batches
+                if ((batch_index + 1) % cfg.grad_accum == 0) or is_last:
+                    if cfg.grad_clip > 0.0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), float(cfg.grad_clip))
+                    lr = warmup_cosine_lr(
+                        global_step,
+                        total_steps=total_steps,
+                        base_lr=cfg.lr,
+                        min_lr=cfg.min_lr,
+                        warmup_steps=cfg.warmup_steps,
+                    )
+                    for group in optimizer.param_groups:
+                        group["lr"] = lr
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    global_step += 1
+
+        with torch.no_grad():
+            prediction = torch.sigmoid(logits.float()) >= thresholds.view(1, -1)
+            stats.update(prediction, labels > 0.5)
+            if fitter is not None:
+                fitter.update(logits, labels)
+        loss_sum += float(loss.detach().item())
+        if (batch_index + 1) % cfg.print_every == 0 or batch_index + 1 == num_batches:
+            progress.set_postfix(loss=f"{loss_sum / float(batch_index + 1):.4f}", f1=f"{stats.macro_f1():.3f}")
+    iterator.reset()
+
+    metrics: Dict[str, object] = {
+        "loss": loss_sum / max(1, num_batches),
+        "macro_f1": stats.macro_f1(),
+        "rows": stats.rows(cfg.key_names),
+    }
+    if fitter is not None:
+        metrics["fitted_thresholds"] = fitter.fit(cfg.threshold_min, cfg.threshold_max, cfg.num_bin)
+    return metrics, global_step
+
+
+def checkpoint_payload(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    cfg: TrainConfig,
+    *,
+    epoch: int,
+    global_step: int,
+    best_score: float,
+) -> Dict[str, object]:
+    return {
+        "architecture_version": ARCHITECTURE_VERSION,
+        "model_state": model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "config": asdict(cfg),
+        "epoch": int(epoch),
+        "global_step": int(global_step),
+        "best_score": float(best_score),
+    }
+
+
+def maybe_resume(
+    model: torch.nn.Module, optimizer: torch.optim.Optimizer, cfg: TrainConfig, device: torch.device
+) -> Tuple[int, int, float]:
+    if not cfg.resume:
+        return 0, 0, float("-inf")
+    path = cfg.resume_path or os.path.join(cfg.ckpt_dir, "model_latest.pt")
+    if not os.path.isfile(path):
+        return 0, 0, float("-inf")
+    state = torch.load(path, map_location=device)
+    if not isinstance(state, dict) or state.get("architecture_version") != ARCHITECTURE_VERSION:
+        if cfg.resume_path is not None:
+            raise RuntimeError(f"Checkpoint {path!r} does not use {ARCHITECTURE_VERSION}.")
+        print(f"Skipping incompatible checkpoint: {path}")
+        return 0, 0, float("-inf")
+    config = state.get("config")
+    if not isinstance(config, dict) or list(config.get("key_names", [])) != list(cfg.key_names):
+        raise RuntimeError(f"Checkpoint {path!r} has a different action schema.")
+    model.load_state_dict(state["model_state"], strict=True)
+    optimizer.load_state_dict(state["optimizer_state"])
+    print(f"Resumed from {path} at epoch {state.get('epoch', 0)}.")
+    return int(state.get("epoch", 0)), int(state.get("global_step", 0)), float(state.get("best_score", -math.inf))
+
+
+def _batch_count(targets: WindowTargets, batch_size: int, *, partial: bool) -> int:
+    if partial:
+        return int(math.ceil(len(targets.meta) / float(batch_size)))
+    return len(targets.meta) // int(batch_size)
+
+
+def train(cfg: Optional[TrainConfig] = None) -> None:
+    cfg = TrainConfig() if cfg is None else cfg
+    if not torch.cuda.is_available():
+        raise RuntimeError("DALI GPU video decode requires a CUDA-visible PyTorch device.")
+    device = torch.device("cuda")
+    torch.manual_seed(cfg.split_seed)
+    random.seed(cfg.split_seed)
+    os.makedirs(cfg.ckpt_dir, exist_ok=True)
+
+    train_pairs, val_pairs = resolve_run_pairs(cfg)
+    train_targets = build_window_targets(train_pairs, cfg, stride=cfg.train_seq_stride)
+    val_targets = build_window_targets(val_pairs, cfg, stride=cfg.val_seq_stride)
+    train_file_list = os.path.join(cfg.ckpt_dir, "train_windows.txt")
+    val_file_list = os.path.join(cfg.ckpt_dir, "val_windows.txt")
+    write_window_file_list(train_targets.meta, train_file_list)
+    write_window_file_list(val_targets.meta, val_file_list)
+
+    train_batches = _batch_count(train_targets, cfg.batch_size, partial=False)
+    val_batch_size = min(cfg.batch_size, len(val_targets.meta))
+    val_batches = _batch_count(val_targets, val_batch_size, partial=True)
+    if cfg.max_train_batches is not None:
+        train_batches = min(train_batches, cfg.max_train_batches)
+    if cfg.max_val_batches is not None:
+        val_batches = min(val_batches, cfg.max_val_batches)
+    if train_batches <= 0 or val_batches <= 0:
+        raise RuntimeError("Insufficient windows for the configured batch size.")
+
+    train_iterator = make_dali_iterator(
+        train_file_list,
+        cfg,
+        batch_size=cfg.batch_size,
+        random_shuffle=cfg.dali_train_random_shuffle,
+        last_batch_policy=LastBatchPolicy.DROP,
+    )
+    val_iterator = make_dali_iterator(
+        val_file_list,
+        cfg,
+        batch_size=val_batch_size,
+        random_shuffle=cfg.dali_val_random_shuffle,
+        last_batch_policy=LastBatchPolicy.PARTIAL,
+    )
+
+    base_model: torch.nn.Module = DrivingVideoPolicy(cfg).to(device)
+    base_model = base_model.to(memory_format=torch.channels_last)
+    optimizer = torch.optim.AdamW(base_model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    start_epoch, global_step, best_score = maybe_resume(base_model, optimizer, cfg, device)
+    model = torch.compile(base_model) if cfg.compile_model else base_model
+    amp_dtype = torch.bfloat16 if cfg.amp_dtype == "bf16" else torch.float32
+    pos_weight = compute_pos_weight(train_targets.labels, cfg.pos_weight_power, cfg.pos_weight_clamp).to(device)
+
+    print(
+        "Training:",
+        f"architecture={ARCHITECTURE_VERSION}",
+        f"actions={cfg.key_names}",
+        f"train_windows={len(train_targets.meta)}",
+        f"val_windows={len(val_targets.meta)}",
+        f"pos_weight={pos_weight.detach().cpu().tolist()}",
+    )
+    total_steps = max(1, int(math.ceil(train_batches / float(cfg.grad_accum))) * cfg.num_epochs)
+
+    for epoch in range(start_epoch, cfg.num_epochs):
+        train_metrics, global_step = run_epoch(
+            model=model,
+            iterator=train_iterator,
+            num_batches=train_batches,
+            targets=train_targets,
+            cfg=cfg,
+            device=device,
+            amp_dtype=amp_dtype,
+            pos_weight=pos_weight,
+            optimizer=optimizer,
+            total_steps=total_steps,
+            global_step=global_step,
+            description=f"Epoch {epoch + 1}/{cfg.num_epochs} train",
+        )
+        with torch.inference_mode():
+            val_metrics, _ = run_epoch(
+                model=model,
+                iterator=val_iterator,
+                num_batches=val_batches,
+                targets=val_targets,
+                cfg=cfg,
+                device=device,
+                amp_dtype=amp_dtype,
+                pos_weight=pos_weight,
+                optimizer=None,
+                total_steps=total_steps,
+                global_step=global_step,
+                description=f"Epoch {epoch + 1}/{cfg.num_epochs} val",
+            )
+
+        fitted = val_metrics.get("fitted_thresholds")
+        if isinstance(fitted, tuple) and len(fitted) == cfg.num_bin:
+            cfg.button_state_thresholds = tuple(float(item) for item in fitted)
+        score = float(val_metrics["macro_f1"])
+        print(
+            f"Epoch {epoch + 1}/{cfg.num_epochs}: "
+            f"train_loss={float(train_metrics['loss']):.4f} "
+            f"train_f1={float(train_metrics['macro_f1']):.4f} "
+            f"val_loss={float(val_metrics['loss']):.4f} "
+            f"val_f1={score:.4f}"
+        )
+        print_metric_rows("Validation controls:", val_metrics["rows"])
+        if fitted is not None:
+            print("Validation thresholds:", dict(zip(cfg.key_names, cfg.button_state_thresholds)))
+
+        payload = checkpoint_payload(
+            base_model,
+            optimizer,
+            cfg,
+            epoch=epoch + 1,
+            global_step=global_step,
+            best_score=max(best_score, score),
+        )
+        torch.save(payload, os.path.join(cfg.ckpt_dir, "model_latest.pt"))
+        if score > best_score:
+            best_score = score
+            torch.save(payload, os.path.join(cfg.ckpt_dir, "model_best.pt"))
+        if (epoch + 1) % cfg.save_every == 0:
+            torch.save(payload, os.path.join(cfg.ckpt_dir, f"model_epoch_{epoch + 1}.pt"))
+
+
+def parse_args() -> TrainConfig:
+    parser = argparse.ArgumentParser(description="Train the six-action FPN/ConvGRU driving policy with DALI.")
+    add = parser.add_argument
+    add("--data-root", default=None)
+    add("--train-data-root", default=None)
+    add("--val-data-root", default=None)
+    add("--ckpt-dir", default=None)
+    add("--resume", dest="resume", action="store_true", default=None)
+    add("--no-resume", dest="resume", action="store_false")
+    add("--resume-path", default=None)
+    add("--num-epochs", type=int, default=None)
+    add("--batch-size", type=int, default=None)
+    add("--target-effective-batch", type=int, default=None)
+    add("--seq-len", type=int, default=None)
+    add("--train-seq-stride", type=int, default=None)
+    add("--val-seq-stride", type=int, default=None)
+    add("--prediction-horizon", type=int, default=None)
+    add("--model-size", type=int, default=None)
+    add("--lr", type=float, default=None)
+    add("--min-lr", type=float, default=None)
+    add("--warmup-steps", type=int, default=None)
+    add("--weight-decay", type=float, default=None)
+    add("--grad-clip", type=float, default=None)
+    add("--train-split", type=float, default=None)
+    add("--pos-weight-power", type=float, default=None)
+    add("--pos-weight-clamp", type=float, default=None)
+    add("--threshold-min", type=float, default=None)
+    add("--threshold-max", type=float, default=None)
+    add("--fit-thresholds-from-val", dest="fit_thresholds_from_val", action="store_true", default=None)
+    add("--no-fit-thresholds-from-val", dest="fit_thresholds_from_val", action="store_false")
+    add("--amp-dtype", choices=["bf16", "fp32"], default=None)
+    add("--compile", dest="compile_model", action="store_true", default=None)
+    add("--no-compile", dest="compile_model", action="store_false")
+    add("--dali-num-threads", type=int, default=None)
+    add("--dali-prefetch-queue-depth", type=int, default=None)
+    add("--dali-reader-prefetch-queue-depth", type=int, default=None)
+    add("--dali-train-random-shuffle", dest="dali_train_random_shuffle", action="store_true", default=None)
+    add("--no-dali-train-random-shuffle", dest="dali_train_random_shuffle", action="store_false")
+    add("--dali-val-random-shuffle", dest="dali_val_random_shuffle", action="store_true", default=None)
+    add("--no-dali-val-random-shuffle", dest="dali_val_random_shuffle", action="store_false")
+    add("--max-train-batches", type=int, default=None)
+    add("--max-val-batches", type=int, default=None)
+    args = vars(parser.parse_args())
+    return TrainConfig(**{name: value for name, value in args.items() if value is not None})
+
+
+if __name__ == "__main__":
+    train(parse_args())
