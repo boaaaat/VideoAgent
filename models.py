@@ -1,8 +1,8 @@
 """Streaming driving policy using an FPN encoder, ConvGRU memory, and action queries.
 
-The policy consumes only masked RGB frames. Training supplies a causal window
-and the model reads actions from its final recurrent state. forward_step
-exposes the identical computation one frame at a time for online control.
+The policy consumes only masked RGB frames. Training can read a causal action
+logit at every frame in a window; forward_step exposes the same computation
+one frame at a time for online control.
 """
 
 from __future__ import annotations
@@ -19,15 +19,15 @@ from action_space import game_data_root, get_key_names, normalize_game_name, sel
 
 
 RGB_CHANNELS = 3
-STEM_CHANNELS = 48
-LOW_CHANNELS = 64
-MID_CHANNELS = 96
-DEEP_CHANNELS = 128
-FUSED_CHANNELS = 128
-READOUT_CHANNELS = 192
+STEM_CHANNELS = 32
+LOW_CHANNELS = 48
+MID_CHANNELS = 64
+DEEP_CHANNELS = 80
+FUSED_CHANNELS = 80
+READOUT_CHANNELS = 128
 DEFAULT_SEQUENCE_LENGTH = 80
 DEFAULT_ACTION_NAMES = ("w", "a", "s", "d", "z", "c")
-ARCHITECTURE_VERSION = "fpn_convgru_attention_v1"
+ARCHITECTURE_VERSION = "fpn_convgru_attention_v2_compact"
 
 
 def _as_int(name: str, value: object, minimum: int) -> int:
@@ -187,14 +187,15 @@ class ModelConfig:
 
 @dataclass
 class PolicyOutput:
-    """The six independent control logits for the current final frame."""
+    """Final-frame logits, with optional causal logits for every input frame."""
 
     button_logits: torch.Tensor
+    sequence_button_logits: Optional[torch.Tensor] = None
 
 
 @dataclass
 class TemporalState:
-    """Packed ConvGRU state with shape [2, B, 128, H/16, W/16]."""
+    """Packed ConvGRU state with shape [2, B, FUSED_CHANNELS, H/16, W/16]."""
 
     hidden_state: Optional[torch.Tensor] = None
 
@@ -321,7 +322,7 @@ class SharedFrameEncoder(nn.Module):
 
 
 class FPNFusion(nn.Module):
-    """Top-down and return-path fusion into a 128x16x16 driving feature map."""
+    """Top-down and return-path fusion into a compact 16x16 driving feature map."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -565,6 +566,25 @@ class DrivingVideoPolicy(nn.Module):
         readout = self.spatial_dropout(readout)
         return self._features_to_logits(self._pool_features(readout))
 
+    def _readout_sequence_logits(self, current_fpn: torch.Tensor, hidden: torch.Tensor) -> torch.Tensor:
+        """Read all timestep logits in one batched head invocation.
+
+        The ConvGRU must remain sequential, but the readout has no dependency
+        between timesteps. Flattening B and T avoids compiling and launching
+        the fusion, attention, and control head once per frame.
+        """
+        if current_fpn.dim() != 5 or hidden.dim() != 5 or current_fpn.shape != hidden.shape:
+            raise ValueError(
+                "Expected matching current/hidden feature sequences [B,T,C,H,W], got "
+                f"{tuple(current_fpn.shape)} and {tuple(hidden.shape)}."
+            )
+        batch, steps, channels, height, width = current_fpn.shape
+        if channels != FUSED_CHANNELS:
+            raise ValueError(f"Expected {FUSED_CHANNELS} feature channels, got {channels}.")
+        flat_current = current_fpn.reshape(batch * steps, channels, height, width)
+        flat_hidden = hidden.reshape(batch * steps, channels, height, width)
+        return self._readout_logits(flat_current, flat_hidden).reshape(batch, steps, self.cfg.num_bin)
+
     def forward_step(
         self,
         frame: torch.Tensor,
@@ -600,12 +620,13 @@ class DrivingVideoPolicy(nn.Module):
         state: Optional[TemporalState] = None,
         *,
         return_aux: bool = False,
+        return_sequence_logits: bool = False,
         prev_action: Optional[torch.Tensor] = None,
         feedback_mask: Optional[torch.Tensor] = None,
         feedback_thresholds: Optional[torch.Tensor] = None,
         soft_feedback: bool = False,
     ) -> PolicyOutput | Tuple[PolicyOutput, TemporalState]:
-        """Run a causal sequence and read the final recurrent spatial map."""
+        """Run a causal sequence and optionally return logits at every timestep."""
 
         del prev_action, feedback_mask, feedback_thresholds, soft_feedback
         if frames.dim() != 5 or frames.size(2) != RGB_CHANNELS:
@@ -631,8 +652,17 @@ class DrivingVideoPolicy(nn.Module):
             dtype=fused.dtype,
         )
         final_hidden = fused[:, 0]
+        hidden_steps = [] if return_sequence_logits else None
         for index in range(steps):
             final_hidden, hidden = self._temporal_step(fused[:, index], hidden)
-        output = PolicyOutput(button_logits=self._readout_logits(fused[:, -1], final_hidden))
+            if hidden_steps is not None:
+                hidden_steps.append(final_hidden)
+        if hidden_steps is None:
+            final_logits = self._readout_logits(fused[:, -1], final_hidden)
+            dense_logits = None
+        else:
+            dense_logits = self._readout_sequence_logits(fused, torch.stack(hidden_steps, dim=1))
+            final_logits = dense_logits[:, -1]
+        output = PolicyOutput(button_logits=final_logits, sequence_button_logits=dense_logits)
         next_state = TemporalState(hidden_state=hidden.detach())
         return (output, next_state) if return_aux else output

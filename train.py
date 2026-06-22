@@ -1,4 +1,4 @@
-"""Stateful DALI trainer for the final-state FPN + ConvGRU driving policy.
+"""Stateful DALI trainer for the dense-supervision FPN + ConvGRU driving policy.
 
 The DALI pipeline owns GPU video decode and resize. CSV labels are parsed once
 on the host, then joined to decoded 80-frame windows through the DALI sample
@@ -27,7 +27,15 @@ import nvidia.dali.fn as fn
 from nvidia.dali.plugin.pytorch import DALIGenericIterator, LastBatchPolicy
 
 from augmentations import augment_frames
-from models import ARCHITECTURE_VERSION, DrivingVideoPolicy, ModelConfig, PolicyOutput, TemporalState
+from models import (
+    ARCHITECTURE_VERSION,
+    FUSED_CHANNELS,
+    READOUT_CHANNELS,
+    DrivingVideoPolicy,
+    ModelConfig,
+    PolicyOutput,
+    TemporalState,
+)
 
 
 CONFLICTING_ACTION_PAIRS = (("w", "s"), ("a", "d"))
@@ -64,6 +72,7 @@ class TrainConfig(ModelConfig):
     action_offset: int = 1
     streaming_state_training: bool = True
     streaming_state_validation: bool = True
+    dense_temporal_supervision: bool = True
 
     batch_size: int = 1
     target_effective_batch: int = 8
@@ -152,6 +161,9 @@ class TrainConfig(ModelConfig):
         self.fit_thresholds_from_val = bool(self.fit_thresholds_from_val)
         self.streaming_state_training = bool(self.streaming_state_training)
         self.streaming_state_validation = bool(self.streaming_state_validation)
+        if not bool(self.dense_temporal_supervision):
+            raise ValueError("This trainer requires dense_temporal_supervision=True.")
+        self.dense_temporal_supervision = True
 
         for name in (
             "aug_brightness",
@@ -389,7 +401,7 @@ def load_run_labels(csv_path: str, cfg: TrainConfig) -> torch.Tensor:
 def build_window_targets(
     pairs: Sequence[Tuple[str, str]], cfg: TrainConfig, *, stride: int
 ) -> WindowTargets:
-    """Create labels for the one decision read from each final recurrent state."""
+    """Create one causal action target for every frame in each input window."""
 
     stride = _positive_int("stride", stride)
     label_windows: List[torch.Tensor] = []
@@ -397,12 +409,14 @@ def build_window_targets(
     action_offset = int(cfg.action_offset)
     for video_path, csv_path in pairs:
         labels = load_run_labels(csv_path, cfg)
-        # Input ends at start + seq_len - 1. The supervision is its future
-        # action at start + seq_len - 1 + action_offset.
+        # For input frame start + t, predict the future action at
+        # start + t + action_offset. This preserves causality while
+        # supervising every frame instead of only the final frame.
         max_start = int(labels.size(0)) - int(cfg.seq_len) - action_offset
         for start in range(0, max_start + 1, stride):
-            target_index = start + int(cfg.seq_len) - 1 + action_offset
-            label_windows.append(labels[target_index])
+            target_start = start + action_offset
+            target_end = target_start + int(cfg.seq_len)
+            label_windows.append(labels[target_start:target_end])
             meta.append(WindowMeta(video_path, start, start + int(cfg.seq_len)))
     if not label_windows:
         raise RuntimeError(
@@ -593,7 +607,7 @@ def load_batch(
 
 
 def compute_pos_weight(labels: torch.Tensor, power: float, clamp: float) -> torch.Tensor:
-    labels = labels.float()
+    labels = labels.reshape(-1, labels.size(-1)).float()
     positive = labels.sum(dim=0)
     negative = float(labels.size(0)) - positive
     return (negative / positive.clamp(min=1.0)).pow(float(power)).clamp(1.0, float(clamp))
@@ -611,7 +625,7 @@ def conflicting_action_penalty(logits: torch.Tensor, cfg: TrainConfig) -> torch.
         first_index = action_index.get(first)
         second_index = action_index.get(second)
         if first_index is not None and second_index is not None:
-            pair_penalties.append(probabilities[:, first_index] * probabilities[:, second_index])
+            pair_penalties.append(probabilities[..., first_index] * probabilities[..., second_index])
     if not pair_penalties:
         return logits.new_zeros(())
     return torch.stack(pair_penalties, dim=1).mean()
@@ -758,13 +772,20 @@ def run_epoch(
                 enabled=amp_dtype == torch.bfloat16,
             ):
                 if streaming_state:
-                    output, next_state = model(frames, state=initial_state, return_aux=True)
+                    output, next_state = model(
+                        frames,
+                        state=initial_state,
+                        return_aux=True,
+                        return_sequence_logits=True,
+                    )
                     if stream_item is None:
                         raise RuntimeError("Streaming state metadata was not resolved.")
                     state_cache[stream_item.video_path] = (stream_item.end_frame, next_state)
                 else:
-                    output = model(frames)
-                logits = output.button_logits
+                    output = model(frames, return_sequence_logits=True)
+                logits = output.sequence_button_logits
+                if logits is None:
+                    raise RuntimeError("Dense temporal supervision requires per-timestep policy logits.")
                 if tuple(logits.shape) != tuple(labels.shape):
                     raise RuntimeError(
                         f"Model logits shape {tuple(logits.shape)} does not match labels {tuple(labels.shape)}."
@@ -795,10 +816,12 @@ def run_epoch(
                     global_step += 1
 
         with torch.no_grad():
-            prediction = torch.sigmoid(logits.float()) >= thresholds.view(1, -1)
-            stats.update(prediction, labels > 0.5)
+            flat_logits = logits.reshape(-1, cfg.num_bin)
+            flat_labels = labels.reshape(-1, cfg.num_bin)
+            prediction = torch.sigmoid(flat_logits.float()) >= thresholds.view(1, -1)
+            stats.update(prediction, flat_labels > 0.5)
             if fitter is not None:
-                fitter.update(logits, labels)
+                fitter.update(flat_logits, flat_labels)
         loss_sum += float(loss.detach().item())
         bce_loss_sum += float(bce_loss.detach().item())
         conflict_loss_sum += float(conflict_loss.detach().item())
@@ -866,6 +889,14 @@ def maybe_resume(
     config = state.get("config")
     if not isinstance(config, dict) or list(config.get("key_names", [])) != list(cfg.key_names):
         raise RuntimeError(f"Checkpoint {path!r} has a different action schema.")
+    if not bool(config.get("dense_temporal_supervision", False)):
+        if cfg.resume_path is not None:
+            raise RuntimeError(
+                f"Checkpoint {path!r} was trained with final-frame-only supervision and cannot be resumed "
+                "for dense temporal supervision. Start from scratch instead."
+            )
+        print(f"Skipping final-frame-only checkpoint: {path}")
+        return 0, 0, float("-inf")
     model.load_state_dict(state["model_state"], strict=True)
     optimizer.load_state_dict(state["optimizer_state"])
     print(f"Resumed from {path} at epoch {state.get('epoch', 0)}.")
@@ -893,8 +924,8 @@ def print_startup_stats(
     """Print the fixed data/model contract before the first DALI batch is read."""
 
     action_names = list(cfg.key_names)
-    train_positive_rate = train_targets.labels.float().mean(dim=0)
-    val_positive_rate = val_targets.labels.float().mean(dim=0)
+    train_positive_rate = train_targets.labels.reshape(-1, cfg.num_bin).float().mean(dim=0)
+    val_positive_rate = val_targets.labels.reshape(-1, cfg.num_bin).float().mean(dim=0)
     total_videos = len(train_pairs) + len(val_pairs)
     print("Startup configuration:")
     print(
@@ -902,8 +933,8 @@ def print_startup_stats(
         f"architecture={ARCHITECTURE_VERSION}",
         f"parameters={parameter_count / 1_000_000:.4f}M",
         f"input=[B,{cfg.seq_len},3,{cfg.model_size},{cfg.model_size}]",
-        f"temporal=2xConvGRU(128x{cfg.model_size // 16}x{cfg.model_size // 16})",
-        f"readout=6x192",
+        f"temporal=2xConvGRU({FUSED_CHANNELS}x{cfg.model_size // 16}x{cfg.model_size // 16})",
+        f"readout=6x{READOUT_CHANNELS}",
     )
     print(
         "  Actions:",
@@ -958,6 +989,12 @@ def print_startup_stats(
         "stream_order=shuffled_videos/ordered_chunks"
         if cfg.streaming_state_training
         else "stream_order=fresh_windows",
+    )
+    print(
+        "  Supervision:",
+        f"dense_causal={cfg.dense_temporal_supervision}",
+        f"targets_per_window={cfg.seq_len}",
+        f"action_offset=+{int(cfg.action_offset)}",
     )
     print(
         "  Loss:",
