@@ -19,6 +19,7 @@ from pynput import keyboard
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from models import (  # noqa: E402
+    ARCHITECTURE_VERSION,
     DrivingVideoPolicy,
     ModelConfig,
     TemporalState,
@@ -86,6 +87,10 @@ class RuntimeConfig(ModelConfig):
         self.mouse_buttons_enabled = bool(self.mouse_buttons_enabled)
         self.prev_action_feedback = bool(self.prev_action_feedback)
         self.prev_action_feedback_soft = bool(self.prev_action_feedback_soft)
+        if self.last_action_conditioning:
+            self.prev_action_feedback = True
+        if self.last_action_conditioning and self.prev_action_feedback_soft:
+            raise ValueError("Soft previous-action feedback is disabled for this architecture.")
         self.gru_memory_frames = max(1, int(self.gru_memory_frames))
         self.record_frame_size = max(1, int(self.record_frame_size))
 
@@ -244,12 +249,28 @@ def _coerce_config_types(cfg: RuntimeConfig) -> RuntimeConfig:
     cfg.action_decoder = str(getattr(cfg, "action_decoder", "mlp")).strip().lower()
     cfg.action_query_heads = int(getattr(cfg, "action_query_heads", 4))
     cfg.action_query_layers = int(getattr(cfg, "action_query_layers", 2))
-    cfg.last_action_fusion = str(getattr(cfg, "last_action_fusion", "fixed_prior")).strip().lower()
+    cfg.last_action_conditioning = bool(getattr(cfg, "last_action_conditioning", True))
+    cfg.last_action_fusion = str(
+        getattr(cfg, "last_action_fusion", "bounded_visual_residual")
+    ).strip().lower()
+    if cfg.last_action_fusion != "bounded_visual_residual":
+        raise ValueError(
+            "This runtime requires last_action_fusion='bounded_visual_residual', "
+            f"got {cfg.last_action_fusion!r}."
+        )
+    cfg.last_action_residual_cap = float(
+        np.clip(float(getattr(cfg, "last_action_residual_cap", 0.75)), 0.0, 5.0)
+    )
     cfg.last_action_prior_logit = float(np.clip(float(getattr(cfg, "last_action_prior_logit", 1.5)), 0.0, 5.0))
     cfg.last_action_absence_prior_logit = float(
         np.clip(float(getattr(cfg, "last_action_absence_prior_logit", 0.0)), 0.0, 5.0)
     )
     cfg.mouse_buttons_enabled = bool(cfg.mouse_buttons_enabled)
+    if cfg.last_action_conditioning:
+        cfg.prev_action_feedback = True
+    cfg.prev_action_feedback_soft = bool(cfg.prev_action_feedback_soft)
+    if cfg.prev_action_feedback_soft:
+        raise ValueError("Soft previous-action feedback is disabled for this architecture.")
     cfg.gru_memory_frames = max(1, int(getattr(cfg, "gru_memory_frames", 80)))
     cfg.num_bin = len(cfg.key_names) + len(cfg.mouse_button_names)
     cfg.button_state_threshold = float(np.clip(float(cfg.button_state_threshold), 0.0, 1.0))
@@ -327,12 +348,8 @@ def _apply_checkpoint_config(cfg: RuntimeConfig, overrides: Dict) -> RuntimeConf
             continue
         if hasattr(cfg, key):
             setattr(cfg, key, value)
-    if "prev_action_feedback" not in overrides:
-        trained_with_feedback = float(overrides.get("last_action_feedback_train_prob", 0.0) or 0.0) > 0.0
-        validated_with_feedback = bool(overrides.get("last_action_feedback_validation", False))
-        cfg.prev_action_feedback = bool(trained_with_feedback and validated_with_feedback)
-    if "prev_action_feedback_soft" not in overrides:
-        cfg.prev_action_feedback_soft = bool(overrides.get("last_action_feedback_soft", True))
+    cfg.prev_action_feedback = bool(overrides.get("last_action_conditioning", False))
+    cfg.prev_action_feedback_soft = False
     cfg = _coerce_config_types(cfg)
     if not checkpoint_has_thresholds:
         derived = _derive_button_thresholds_from_csv(cfg)
@@ -355,6 +372,14 @@ def _uses_removed_vector_gru(checkpoint_config: Dict, model_state: Dict) -> bool
 
 
 def _raise_incompatible_checkpoint(ckpt_path: str, checkpoint_config: Dict, model_state: Dict) -> None:
+    checkpoint_architecture = str(
+        checkpoint_config.get("architecture_version", "")
+    ).strip()
+    if checkpoint_architecture != ARCHITECTURE_VERSION:
+        raise RuntimeError(
+            f"Checkpoint {ckpt_path!r} uses architecture={checkpoint_architecture!r}, but this runtime requires "
+            f"{ARCHITECTURE_VERSION!r}. Previous-action conditioning changed the model; retrain from scratch."
+        )
     if _uses_removed_vector_gru(checkpoint_config, model_state):
         raise RuntimeError(
             f"Checkpoint {ckpt_path!r} was trained with the removed vector_gru architecture. "
@@ -531,10 +556,9 @@ def main() -> None:
     print(
         "Runtime last-action feedback:",
         f"enabled={cfg.prev_action_feedback}",
-        f"mode={'soft' if cfg.prev_action_feedback_soft else 'hard'}",
+        "mode=hard-applied",
         f"fusion={cfg.last_action_fusion}",
-        f"hold_prior_logit={float(cfg.last_action_prior_logit):.2f}",
-        f"absence_prior_logit={float(cfg.last_action_absence_prior_logit):.2f}",
+        f"residual_cap={float(cfg.last_action_residual_cap):.2f}",
     )
 
     inference_dtype = torch.float32

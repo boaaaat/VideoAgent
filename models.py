@@ -1,8 +1,8 @@
-"""Streaming driving policy using an FPN encoder, ConvGRU memory, and action queries.
+"""Streaming driving policy using RGB vision, ConvGRU memory, and action queries.
 
-The policy consumes only masked RGB frames. Training can read a causal action
-logit at every frame in a window; forward_step exposes the same computation
-one frame at a time for online control.
+Previous applied controls are optional, one-step readout context only. Training
+can read a causal action logit at every frame in a window; forward_step exposes
+the same computation one frame at a time for online control.
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ FUSED_CHANNELS = 80
 READOUT_CHANNELS = 128
 DEFAULT_SEQUENCE_LENGTH = 80
 DEFAULT_ACTION_NAMES = ("w", "a", "s", "d", "z", "c")
-ARCHITECTURE_VERSION = "fpn_convgru_attention_v2_compact"
+ARCHITECTURE_VERSION = "fpn_convgru_attention_v4_stem_fusion"
 
 
 def _as_int(name: str, value: object, minimum: int) -> int:
@@ -100,14 +100,17 @@ class ModelConfig:
     button_state_thresholds: Optional[Sequence[float]] = None
     architecture_version: str = ARCHITECTURE_VERSION
 
-    # Compatibility fields consumed by run.py and checkpoint utilities. They
-    # deliberately do not alter this RGB-only architecture.
+    # Compatibility fields consumed by run.py and checkpoint utilities.
     d_model: int = READOUT_CHANNELS
     action_decoder: str = "spatial_attention"
     action_query_heads: int = 4
     action_query_layers: int = 1
-    last_action_conditioning: bool = False
-    last_action_fusion: str = "none"
+    # Previous controls are deliberately a constrained readout-only input. They
+    # never enter the visual encoder or ConvGRU state, so vision remains the
+    # source of scene understanding.
+    last_action_conditioning: bool = True
+    last_action_fusion: str = "bounded_visual_residual"
+    last_action_residual_cap: float = 0.75
     last_action_prior_logit: float = 0.0
     last_action_absence_prior_logit: float = 0.0
 
@@ -178,6 +181,16 @@ class ModelConfig:
         self.d_model = _as_int("d_model", self.d_model, 1)
         self.action_query_heads = _as_int("action_query_heads", self.action_query_heads, 1)
         self.action_query_layers = _as_int("action_query_layers", self.action_query_layers, 1)
+        self.last_action_conditioning = bool(self.last_action_conditioning)
+        self.last_action_fusion = str(self.last_action_fusion).strip().lower()
+        if self.last_action_fusion != "bounded_visual_residual":
+            raise ValueError(
+                "last_action_fusion must be 'bounded_visual_residual', "
+                f"got {self.last_action_fusion!r}."
+            )
+        self.last_action_residual_cap = _as_float(
+            "last_action_residual_cap", self.last_action_residual_cap, 0.0, 5.0
+        )
         if str(self.architecture_version) != ARCHITECTURE_VERSION:
             raise ValueError(
                 f"Expected architecture_version={ARCHITECTURE_VERSION!r}, "
@@ -191,6 +204,9 @@ class PolicyOutput:
 
     button_logits: torch.Tensor
     sequence_button_logits: Optional[torch.Tensor] = None
+    vision_button_logits: Optional[torch.Tensor] = None
+    sequence_vision_button_logits: Optional[torch.Tensor] = None
+    next_feedback_action: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -316,39 +332,61 @@ class SharedFrameEncoder(nn.Module):
         deep = self.deep(mid)
         return [stem, low, mid, deep]
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        _, low, mid, deep = self.feature_stages(x)
-        return low, mid, deep
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        stem, low, mid, deep = self.feature_stages(x)
+        return stem, low, mid, deep
 
 
 class FPNFusion(nn.Module):
-    """Top-down and return-path fusion into a compact 16x16 driving feature map."""
+    """Fuse 128/64/32/16 feature levels into a compact 16x16 driving map."""
 
     def __init__(self) -> None:
         super().__init__()
+        self.stem_lateral = ConvNormAct(STEM_CHANNELS, FUSED_CHANNELS, kernel_size=1, activate=False)
         self.low_lateral = ConvNormAct(LOW_CHANNELS, FUSED_CHANNELS, kernel_size=1, activate=False)
         self.mid_lateral = ConvNormAct(MID_CHANNELS, FUSED_CHANNELS, kernel_size=1, activate=False)
         self.deep_lateral = ConvNormAct(DEEP_CHANNELS, FUSED_CHANNELS, kernel_size=1, activate=False)
 
         self.smooth32 = LightweightResidualBlock(FUSED_CHANNELS, FUSED_CHANNELS)
         self.smooth64 = LightweightResidualBlock(FUSED_CHANNELS, FUSED_CHANNELS)
+        self.smooth128 = LightweightResidualBlock(FUSED_CHANNELS, FUSED_CHANNELS)
         self.down32_to_16 = DepthwiseSeparableConv(FUSED_CHANNELS, FUSED_CHANNELS, stride=2)
         self.down64_to_16 = nn.Sequential(
             DepthwiseSeparableConv(FUSED_CHANNELS, FUSED_CHANNELS, stride=2),
             DepthwiseSeparableConv(FUSED_CHANNELS, FUSED_CHANNELS, stride=2),
         )
+        self.down128_to_16 = nn.Sequential(
+            DepthwiseSeparableConv(FUSED_CHANNELS, FUSED_CHANNELS, stride=2),
+            DepthwiseSeparableConv(FUSED_CHANNELS, FUSED_CHANNELS, stride=2),
+            DepthwiseSeparableConv(FUSED_CHANNELS, FUSED_CHANNELS, stride=2),
+        )
         self.output = LightweightResidualBlock(FUSED_CHANNELS, FUSED_CHANNELS)
 
-    def forward(self, low: torch.Tensor, mid: torch.Tensor, deep: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        stem: torch.Tensor,
+        low: torch.Tensor,
+        mid: torch.Tensor,
+        deep: torch.Tensor,
+    ) -> torch.Tensor:
         p16 = self.deep_lateral(deep)
         p32 = self.mid_lateral(mid) + F.interpolate(p16, size=mid.shape[-2:], mode="bilinear", align_corners=False)
         p32 = self.smooth32(p32)
         p64 = self.low_lateral(low) + F.interpolate(p32, size=low.shape[-2:], mode="bilinear", align_corners=False)
         p64 = self.smooth64(p64)
+        p128 = self.stem_lateral(stem) + F.interpolate(
+            p64, size=stem.shape[-2:], mode="bilinear", align_corners=False
+        )
+        p128 = self.smooth128(p128)
 
-        # Reinject the detail-enhanced pyramid levels into the compact grid
+        # Reinject every detail-enhanced pyramid level into the compact grid
         # that feeds causal temporal memory.
-        return self.output(p16 + self.down32_to_16(p32) + self.down64_to_16(p64))
+        return self.output(
+            p16
+            + self.down32_to_16(p32)
+            + self.down64_to_16(p64)
+            + self.down128_to_16(p128)
+        )
 
 
 class ConvGRUCell(nn.Module):
@@ -454,9 +492,24 @@ class DrivingVideoPolicy(nn.Module):
             nn.Dropout(float(cfg.head_dropout)),
             nn.Linear(READOUT_CHANNELS, 1),
         )
+        self.action_context = nn.Sequential(
+            nn.Linear(cfg.num_bin, 32),
+            nn.SiLU(inplace=True),
+            nn.Linear(32, cfg.num_bin),
+        )
+        self.action_context_gate = nn.Linear(READOUT_CHANNELS, 1)
+        action_codes = torch.arange(1 << cfg.num_bin, dtype=torch.long)
+        action_bits = torch.tensor([1 << index for index in range(cfg.num_bin)], dtype=torch.long)
+        action_states = ((action_codes.unsqueeze(1) & action_bits.unsqueeze(0)) != 0).float()
+        self.register_buffer("_action_context_states", action_states, persistent=False)
+        self.register_buffer("_action_context_bits", action_bits, persistent=False)
         final = self.control_head[-1]
         if isinstance(final, nn.Linear):
             nn.init.constant_(final.bias, -1.0)
+        context_final = self.action_context[-1]
+        if isinstance(context_final, nn.Linear):
+            nn.init.zeros_(context_final.weight)
+            nn.init.zeros_(context_final.bias)
 
         # Private compatibility attributes used by existing visual tooling.
         self.feat_channels = FUSED_CHANNELS
@@ -551,22 +604,82 @@ class DrivingVideoPolicy(nn.Module):
             )
         return self.query_pool(spatial_features)
 
-    def _features_to_logits(self, features: torch.Tensor, prev_action: Optional[torch.Tensor] = None) -> torch.Tensor:
-        del prev_action
+    def _features_to_logits(self, features: torch.Tensor) -> torch.Tensor:
         if features.dim() in (3, 4):
             return self.control_head(features).squeeze(-1)
         raise ValueError(f"Expected action features [B,6,C] or [B,T,6,C], got {tuple(features.shape)}.")
 
-    def _encode_frame(self, frame: torch.Tensor) -> torch.Tensor:
-        low, mid, deep = self.spatial_encoder(frame)
-        return self.fpn(low, mid, deep)
+    def _validate_action_context(
+        self,
+        prev_action: torch.Tensor,
+        action_features: torch.Tensor,
+    ) -> torch.Tensor:
+        expected = tuple(action_features.shape[:-1])
+        if tuple(prev_action.shape) != expected:
+            raise ValueError(
+                "Previous action context must match action-feature batch/time/action dimensions; "
+                f"expected {expected}, got {tuple(prev_action.shape)}."
+            )
+        if prev_action.size(-1) != self.cfg.num_bin:
+            raise ValueError(
+                f"Expected {self.cfg.num_bin} previous-action values, got {prev_action.size(-1)}."
+            )
+        return prev_action.to(device=action_features.device, dtype=action_features.dtype)
 
-    def _readout_logits(self, current_fpn: torch.Tensor, hidden: torch.Tensor) -> torch.Tensor:
+    def _fuse_action_context(
+        self,
+        vision_logits: torch.Tensor,
+        action_features: torch.Tensor,
+        prev_action: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Apply a bounded, visual-gated one-step action residual.
+
+        An absent context is intentionally an exact vision-only path. A present
+        all-zero vector remains meaningful: it represents a known prior state
+        with no keys held.
+        """
+
+        if not self.cfg.last_action_conditioning or prev_action is None:
+            return vision_logits
+        context = self._validate_action_context(prev_action, action_features)
+        residual = self.action_context(context)
+        gate = torch.sigmoid(self.action_context_gate(action_features)).squeeze(-1)
+        cap = float(self.cfg.last_action_residual_cap)
+        return vision_logits + gate * cap * torch.tanh(residual)
+
+    def _action_state_codes(self, action: torch.Tensor) -> torch.Tensor:
+        """Encode one hard six-key state per batch row as an integer lookup key."""
+
+        if action.dim() != 2 or action.size(-1) != self.cfg.num_bin:
+            raise ValueError(
+                f"Expected hard action states [B,{self.cfg.num_bin}], got {tuple(action.shape)}."
+            )
+        bits = self._action_context_bits.to(device=action.device)
+        return ((action >= 0.5).to(dtype=torch.long) * bits.view(1, -1)).sum(dim=-1)
+
+    def _encode_frame(self, frame: torch.Tensor) -> torch.Tensor:
+        stem, low, mid, deep = self.spatial_encoder(frame)
+        return self.fpn(stem, low, mid, deep)
+
+    def _readout_features(self, current_fpn: torch.Tensor, hidden: torch.Tensor) -> torch.Tensor:
         readout = self.readout_fusion(torch.cat((hidden, current_fpn), dim=1))
         readout = self.spatial_dropout(readout)
-        return self._features_to_logits(self._pool_features(readout))
+        return self._pool_features(readout)
 
-    def _readout_sequence_logits(self, current_fpn: torch.Tensor, hidden: torch.Tensor) -> torch.Tensor:
+    def _readout_logits(
+        self,
+        current_fpn: torch.Tensor,
+        hidden: torch.Tensor,
+        prev_action: Optional[torch.Tensor] = None,
+        *,
+        return_vision: bool = False,
+    ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
+        features = self._readout_features(current_fpn, hidden)
+        vision_logits = self._features_to_logits(features)
+        fused_logits = self._fuse_action_context(vision_logits, features, prev_action)
+        return (fused_logits, vision_logits) if return_vision else fused_logits
+
+    def _readout_sequence_features(self, current_fpn: torch.Tensor, hidden: torch.Tensor) -> torch.Tensor:
         """Read all timestep logits in one batched head invocation.
 
         The ConvGRU must remain sequential, but the readout has no dependency
@@ -583,7 +696,71 @@ class DrivingVideoPolicy(nn.Module):
             raise ValueError(f"Expected {FUSED_CHANNELS} feature channels, got {channels}.")
         flat_current = current_fpn.reshape(batch * steps, channels, height, width)
         flat_hidden = hidden.reshape(batch * steps, channels, height, width)
-        return self._readout_logits(flat_current, flat_hidden).reshape(batch, steps, self.cfg.num_bin)
+        flat_features = self._readout_features(flat_current, flat_hidden)
+        return flat_features.reshape(batch, steps, self.cfg.num_bin, READOUT_CHANNELS)
+
+    def _readout_sequence_logits(
+        self,
+        current_fpn: torch.Tensor,
+        hidden: torch.Tensor,
+        prev_action: Optional[torch.Tensor] = None,
+        *,
+        return_vision: bool = False,
+    ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
+        features = self._readout_sequence_features(current_fpn, hidden)
+        vision_logits = self._features_to_logits(features)
+        fused_logits = self._fuse_action_context(vision_logits, features, prev_action)
+        return (fused_logits, vision_logits) if return_vision else fused_logits
+
+    def _autoregressive_sequence_logits(
+        self,
+        current_fpn: torch.Tensor,
+        hidden: torch.Tensor,
+        initial_prev_action: Optional[torch.Tensor],
+        feedback_thresholds: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Apply detached hard feedback without allowing gradients through actions."""
+
+        features = self._readout_sequence_features(current_fpn, hidden)
+        vision_logits = self._features_to_logits(features)
+        batch, steps, actions = vision_logits.shape
+        if initial_prev_action is None:
+            previous = vision_logits.new_zeros((batch, actions))
+        else:
+            if tuple(initial_prev_action.shape) != (batch, actions):
+                raise ValueError(
+                    "Autoregressive initial action must have shape "
+                    f"[{batch},{actions}], got {tuple(initial_prev_action.shape)}."
+                )
+            previous = initial_prev_action.to(device=vision_logits.device, dtype=vision_logits.dtype)
+        if feedback_thresholds is None:
+            thresholds = vision_logits.new_full((actions,), 0.5)
+        else:
+            thresholds = feedback_thresholds.to(device=vision_logits.device, dtype=vision_logits.dtype).reshape(-1)
+            if thresholds.numel() != actions:
+                raise ValueError(f"Expected {actions} feedback thresholds, got {thresholds.numel()}.")
+
+        if not self.cfg.last_action_conditioning:
+            final_feedback = (torch.sigmoid(vision_logits[:, -1].detach()) >= thresholds.view(1, -1)).to(
+                dtype=vision_logits.dtype
+            )
+            return vision_logits, vision_logits, final_feedback
+
+        # The context input is one of only 64 binary six-key states. Evaluate
+        # the MLP once for those states and look up each autoregressive state
+        # below; evaluating it inside this 80-step loop was launch-bound.
+        context_states = self._action_context_states.to(device=vision_logits.device, dtype=vision_logits.dtype)
+        residual_table = float(self.cfg.last_action_residual_cap) * torch.tanh(self.action_context(context_states))
+        visual_gates = torch.sigmoid(self.action_context_gate(features)).squeeze(-1)
+        previous_code = self._action_state_codes(previous)
+        fused_steps = []
+        for index in range(steps):
+            residual = residual_table.index_select(0, previous_code)
+            fused = vision_logits[:, index] + visual_gates[:, index] * residual
+            fused_steps.append(fused)
+            previous = (torch.sigmoid(fused.detach()) >= thresholds.view(1, -1)).to(dtype=vision_logits.dtype)
+            previous_code = self._action_state_codes(previous)
+        return torch.stack(fused_steps, dim=1), vision_logits, previous.detach()
 
     def forward_step(
         self,
@@ -594,7 +771,6 @@ class DrivingVideoPolicy(nn.Module):
     ) -> Tuple[PolicyOutput, TemporalState]:
         """Run one causal RGB frame and return its six future-action logits."""
 
-        del prev_action
         if frame.dim() != 4 or frame.size(1) != RGB_CHANNELS:
             raise ValueError(f"Expected frame [B,3,H,W], got {tuple(frame.shape)}.")
         frame = self._normalize_frames(frame)
@@ -611,8 +787,16 @@ class DrivingVideoPolicy(nn.Module):
             dtype=fused.dtype,
         )
         final_hidden, next_hidden = self._temporal_step(fused, hidden)
-        logits = self._readout_logits(fused, final_hidden)
-        return PolicyOutput(button_logits=logits), TemporalState(hidden_state=next_hidden.detach())
+        logits, vision_logits = self._readout_logits(
+            fused,
+            final_hidden,
+            prev_action=prev_action,
+            return_vision=True,
+        )
+        return (
+            PolicyOutput(button_logits=logits, vision_button_logits=vision_logits),
+            TemporalState(hidden_state=next_hidden.detach()),
+        )
 
     def forward(
         self,
@@ -625,10 +809,13 @@ class DrivingVideoPolicy(nn.Module):
         feedback_mask: Optional[torch.Tensor] = None,
         feedback_thresholds: Optional[torch.Tensor] = None,
         soft_feedback: bool = False,
+        autoregressive_feedback: bool = False,
     ) -> PolicyOutput | Tuple[PolicyOutput, TemporalState]:
         """Run a causal sequence and optionally return logits at every timestep."""
 
-        del prev_action, feedback_mask, feedback_thresholds, soft_feedback
+        del feedback_mask
+        if soft_feedback:
+            raise ValueError("Soft previous-action feedback is disabled for this architecture.")
         if frames.dim() != 5 or frames.size(2) != RGB_CHANNELS:
             raise ValueError(f"Expected frames [B,T,3,H,W], got {tuple(frames.shape)}.")
         if frames.size(1) <= 0:
@@ -639,8 +826,8 @@ class DrivingVideoPolicy(nn.Module):
         flat = frames.reshape(batch * steps, RGB_CHANNELS, height, width)
         if flat.is_cuda:
             flat = flat.contiguous(memory_format=torch.channels_last)
-        low, mid, deep = self.spatial_encoder(flat)
-        fused = self.fpn(low, mid, deep).reshape(
+        stem, low, mid, deep = self.spatial_encoder(flat)
+        fused = self.fpn(stem, low, mid, deep).reshape(
             batch, steps, FUSED_CHANNELS, deep.size(-2), deep.size(-1)
         )
         hidden = self._prepare_temporal_state(
@@ -652,17 +839,57 @@ class DrivingVideoPolicy(nn.Module):
             dtype=fused.dtype,
         )
         final_hidden = fused[:, 0]
-        hidden_steps = [] if return_sequence_logits else None
+        hidden_steps = [] if (return_sequence_logits or autoregressive_feedback) else None
         for index in range(steps):
             final_hidden, hidden = self._temporal_step(fused[:, index], hidden)
             if hidden_steps is not None:
                 hidden_steps.append(final_hidden)
         if hidden_steps is None:
-            final_logits = self._readout_logits(fused[:, -1], final_hidden)
+            final_prev_action = prev_action
+            if prev_action is not None and prev_action.dim() == 3:
+                expected = (batch, steps, self.cfg.num_bin)
+                if tuple(prev_action.shape) != expected:
+                    raise ValueError(
+                        f"Expected sequence previous actions {expected}, got {tuple(prev_action.shape)}."
+                    )
+                final_prev_action = prev_action[:, -1]
+            final_logits, final_vision_logits = self._readout_logits(
+                fused[:, -1],
+                final_hidden,
+                prev_action=final_prev_action,
+                return_vision=True,
+            )
+            next_feedback_action = None
             dense_logits = None
+            dense_vision_logits = None
         else:
-            dense_logits = self._readout_sequence_logits(fused, torch.stack(hidden_steps, dim=1))
+            hidden_sequence = torch.stack(hidden_steps, dim=1)
+            if autoregressive_feedback:
+                dense_logits, dense_vision_logits, next_feedback_action = self._autoregressive_sequence_logits(
+                    fused,
+                    hidden_sequence,
+                    prev_action,
+                    feedback_thresholds,
+                )
+            else:
+                dense_logits, dense_vision_logits = self._readout_sequence_logits(
+                    fused,
+                    hidden_sequence,
+                    prev_action=prev_action,
+                    return_vision=True,
+                )
+                next_feedback_action = None
             final_logits = dense_logits[:, -1]
-        output = PolicyOutput(button_logits=final_logits, sequence_button_logits=dense_logits)
+            final_vision_logits = dense_vision_logits[:, -1]
+            if not return_sequence_logits:
+                dense_logits = None
+                dense_vision_logits = None
+        output = PolicyOutput(
+            button_logits=final_logits,
+            sequence_button_logits=dense_logits,
+            vision_button_logits=final_vision_logits,
+            sequence_vision_button_logits=dense_vision_logits,
+            next_feedback_action=next_feedback_action,
+        )
         next_state = TemporalState(hidden_state=hidden.detach())
         return (output, next_state) if return_aux else output

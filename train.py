@@ -26,6 +26,12 @@ from nvidia.dali import pipeline_def, types
 import nvidia.dali.fn as fn
 from nvidia.dali.plugin.pytorch import DALIGenericIterator, LastBatchPolicy
 
+# WSL:
+#   cd ~/ai
+#   source venv/bin/activate
+#   cd /mnt/c/Users/Abhil/Desktop/Github_Projects/VideoAgent/
+#   python train.py
+
 from augmentations import augment_frames
 from models import (
     ARCHITECTURE_VERSION,
@@ -94,6 +100,9 @@ class TrainConfig(ModelConfig):
     pos_weight_power: float = 0.6
     pos_weight_clamp: float = 25.0
     conflict_penalty_weight: float = 0.20
+    vision_aux_loss_weight: float = 0.50
+    autoregressive_feedback_stream_prob: float = 0.25
+    recorded_feedback_stream_prob: float = 0.75
     fit_thresholds_from_val: bool = True
     threshold_min: float = 0.10
     threshold_max: float = 0.90
@@ -150,6 +159,21 @@ class TrainConfig(ModelConfig):
         self.conflict_penalty_weight = _finite_float(
             "conflict_penalty_weight", self.conflict_penalty_weight, 0.0
         )
+        self.vision_aux_loss_weight = _finite_float("vision_aux_loss_weight", self.vision_aux_loss_weight, 0.0)
+        self.autoregressive_feedback_stream_prob = _finite_float(
+            "autoregressive_feedback_stream_prob", self.autoregressive_feedback_stream_prob, 0.0, 1.0
+        )
+        self.recorded_feedback_stream_prob = _finite_float(
+            "recorded_feedback_stream_prob", self.recorded_feedback_stream_prob, 0.0, 1.0
+        )
+        feedback_probability = (
+            self.autoregressive_feedback_stream_prob + self.recorded_feedback_stream_prob
+        )
+        if not math.isclose(feedback_probability, 1.0, rel_tol=0.0, abs_tol=1e-8):
+            raise ValueError(
+                "autoregressive_feedback_stream_prob and recorded_feedback_stream_prob must sum to 1.0, "
+                f"got {feedback_probability:.6f}."
+            )
         self.threshold_min = _finite_float("threshold_min", self.threshold_min, 0.0, 1.0)
         self.threshold_max = _finite_float("threshold_max", self.threshold_max, 0.0, 1.0)
         if self.threshold_max < self.threshold_min:
@@ -161,6 +185,12 @@ class TrainConfig(ModelConfig):
         self.fit_thresholds_from_val = bool(self.fit_thresholds_from_val)
         self.streaming_state_training = bool(self.streaming_state_training)
         self.streaming_state_validation = bool(self.streaming_state_validation)
+        if self.last_action_conditioning and (
+            not self.streaming_state_training or not self.streaming_state_validation
+        ):
+            raise ValueError(
+                "Previous-action conditioning requires streaming state for both training and validation."
+            )
         if not bool(self.dense_temporal_supervision):
             raise ValueError("This trainer requires dense_temporal_supervision=True.")
         self.dense_temporal_supervision = True
@@ -247,6 +277,7 @@ class WindowMeta:
 @dataclass
 class WindowTargets:
     labels: torch.Tensor
+    previous_actions: torch.Tensor
     meta: List[WindowMeta]
 
 
@@ -405,6 +436,7 @@ def build_window_targets(
 
     stride = _positive_int("stride", stride)
     label_windows: List[torch.Tensor] = []
+    previous_action_windows: List[torch.Tensor] = []
     meta: List[WindowMeta] = []
     action_offset = int(cfg.action_offset)
     for video_path, csv_path in pairs:
@@ -417,12 +449,23 @@ def build_window_targets(
             target_start = start + action_offset
             target_end = target_start + int(cfg.seq_len)
             label_windows.append(labels[target_start:target_end])
+            # The target at timestep t is labels[start + t + action_offset].
+            # Teacher-forced previous action must be the immediately preceding
+            # target, labels[start + t + action_offset - 1], matching the
+            # runtime autoregressive feedback at every chunk boundary.
+            previous_start = start + action_offset - 1
+            previous = labels[previous_start : previous_start + int(cfg.seq_len)]
+            previous_action_windows.append(previous)
             meta.append(WindowMeta(video_path, start, start + int(cfg.seq_len)))
     if not label_windows:
         raise RuntimeError(
             "No valid 80-frame windows were created. Check CSV lengths, seq_len, and prediction_horizon."
         )
-    return WindowTargets(labels=torch.stack(label_windows, dim=0), meta=meta)
+    return WindowTargets(
+        labels=torch.stack(label_windows, dim=0),
+        previous_actions=torch.stack(previous_action_windows, dim=0),
+        meta=meta,
+    )
 
 
 def video_streams(meta: Sequence[WindowMeta]) -> List[List[int]]:
@@ -585,7 +628,7 @@ def load_batch(
     *,
     device: torch.device,
     amp_dtype: torch.dtype,
-) -> Tuple[torch.Tensor, torch.Tensor, List[int]]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[int]]:
     batch = next(iterator)[0]
     if "frames" not in batch or "sample_ids" not in batch:
         raise RuntimeError(f"Unexpected DALI outputs: {sorted(batch)}.")
@@ -603,7 +646,8 @@ def load_batch(
     if bool((sample_ids < 0).any()) or bool((sample_ids >= len(targets.meta)).any()):
         raise RuntimeError(f"DALI returned an out-of-range sample ID: {sample_ids.tolist()}.")
     labels = targets.labels[sample_ids].to(device, non_blocking=True)
-    return frames, labels, [int(sample_id) for sample_id in sample_ids.tolist()]
+    previous_actions = targets.previous_actions[sample_ids].to(device, non_blocking=True)
+    return frames, labels, previous_actions, [int(sample_id) for sample_id in sample_ids.tolist()]
 
 
 def compute_pos_weight(labels: torch.Tensor, power: float, clamp: float) -> torch.Tensor:
@@ -658,14 +702,30 @@ def print_metric_rows(prefix: str, rows: Iterable[Dict[str, float | str | int]])
         )
 
 
-StreamingStateCache = Dict[str, Tuple[int, TemporalState]]
+@dataclass
+class StreamingStateEntry:
+    next_frame: int
+    temporal_state: TemporalState
+    feedback_mode: str
+    feedback_action: Optional[torch.Tensor] = None
+
+
+StreamingStateCache = Dict[str, StreamingStateEntry]
+
+
+def stream_feedback_mode(item: WindowMeta, *, epoch_index: int, cfg: TrainConfig) -> str:
+    """Pick one feedback distribution for a full stream, reproducibly per epoch."""
+
+    source = f"{cfg.dali_shuffle_seed}:{epoch_index}:{item.video_path}:action-feedback".encode("utf-8")
+    value = int.from_bytes(hashlib.sha256(source).digest()[:8], "little") / float(2**64)
+    return "autoregressive" if value < float(cfg.autoregressive_feedback_stream_prob) else "recorded"
 
 
 def stream_initial_state(
     sample_ids: Sequence[int],
     targets: WindowTargets,
     cache: StreamingStateCache,
-) -> Tuple[Optional[TemporalState], WindowMeta, bool]:
+) -> Tuple[Optional[StreamingStateEntry], WindowMeta, bool]:
     """Return the state for the next contiguous chunk and whether it was carried."""
 
     if len(sample_ids) != 1:
@@ -683,13 +743,12 @@ def stream_initial_state(
             )
         return None, item, False
 
-    expected_start, state = cached
-    if item.start_frame != expected_start:
+    if item.start_frame != cached.next_frame:
         raise RuntimeError(
             f"Non-contiguous DALI stream for {item.video_path!r}: "
-            f"expected frame {expected_start}, got {item.start_frame}."
+            f"expected frame {cached.next_frame}, got {item.start_frame}."
         )
-    return state, item, True
+    return cached, item, True
 
 
 def stream_augmentation_generator(
@@ -732,8 +791,10 @@ def run_epoch(
 
     loss_sum = 0.0
     bce_loss_sum = 0.0
+    vision_bce_loss_sum = 0.0
     conflict_loss_sum = 0.0
     stats = BinaryStats(cfg.num_bin, device)
+    vision_stats = BinaryStats(cfg.num_bin, device)
     fitter = ThresholdFitter() if (not training and cfg.fit_thresholds_from_val) else None
     thresholds = threshold_tensor(cfg, device=device)
     progress = tqdm(range(num_batches), desc=description, dynamic_ncols=True)
@@ -744,12 +805,30 @@ def run_epoch(
     stream_total = 0
 
     for batch_index in progress:
-        frames, labels, sample_ids = load_batch(iterator_it, targets, device=device, amp_dtype=amp_dtype)
+        frames, labels, previous_actions, sample_ids = load_batch(
+            iterator_it,
+            targets,
+            device=device,
+            amp_dtype=amp_dtype,
+        )
         initial_state: Optional[TemporalState] = None
         stream_item: Optional[WindowMeta] = None
+        stream_entry: Optional[StreamingStateEntry] = None
+        feedback_mode = "autoregressive"
+        feedback_action: Optional[torch.Tensor] = None
         carried = False
         if streaming_state:
-            initial_state, stream_item, carried = stream_initial_state(sample_ids, targets, state_cache)
+            stream_entry, stream_item, carried = stream_initial_state(sample_ids, targets, state_cache)
+            if stream_entry is not None:
+                initial_state = stream_entry.temporal_state
+                feedback_mode = stream_entry.feedback_mode
+                feedback_action = stream_entry.feedback_action
+            elif stream_item is not None:
+                feedback_mode = "autoregressive" if not training else stream_feedback_mode(
+                    stream_item,
+                    epoch_index=epoch_index,
+                    cfg=cfg,
+                )
             stream_total += 1
             stream_carried += int(carried)
             stream_resets += int(not carried)
@@ -772,20 +851,37 @@ def run_epoch(
                 enabled=amp_dtype == torch.bfloat16,
             ):
                 if streaming_state:
+                    use_autoregressive_feedback = feedback_mode == "autoregressive"
+                    model_prev_action = feedback_action if use_autoregressive_feedback else previous_actions
                     output, next_state = model(
                         frames,
                         state=initial_state,
                         return_aux=True,
                         return_sequence_logits=True,
+                        prev_action=model_prev_action,
+                        feedback_thresholds=thresholds,
+                        autoregressive_feedback=use_autoregressive_feedback,
                     )
                     if stream_item is None:
                         raise RuntimeError("Streaming state metadata was not resolved.")
-                    state_cache[stream_item.video_path] = (stream_item.end_frame, next_state)
+                    state_cache[stream_item.video_path] = StreamingStateEntry(
+                        next_frame=stream_item.end_frame,
+                        temporal_state=next_state,
+                        feedback_mode=feedback_mode,
+                        feedback_action=output.next_feedback_action if use_autoregressive_feedback else None,
+                    )
                 else:
-                    output = model(frames, return_sequence_logits=True)
+                    output = model(
+                        frames,
+                        return_sequence_logits=True,
+                        prev_action=previous_actions,
+                    )
                 logits = output.sequence_button_logits
+                vision_logits = output.sequence_vision_button_logits
                 if logits is None:
                     raise RuntimeError("Dense temporal supervision requires per-timestep policy logits.")
+                if vision_logits is None:
+                    raise RuntimeError("Previous-action training requires per-timestep vision-only logits.")
                 if tuple(logits.shape) != tuple(labels.shape):
                     raise RuntimeError(
                         f"Model logits shape {tuple(logits.shape)} does not match labels {tuple(labels.shape)}."
@@ -793,8 +889,15 @@ def run_epoch(
                 bce_loss = F.binary_cross_entropy_with_logits(
                     logits.float(), labels.float(), pos_weight=pos_weight.float()
                 )
+                vision_bce_loss = F.binary_cross_entropy_with_logits(
+                    vision_logits.float(), labels.float(), pos_weight=pos_weight.float()
+                )
                 conflict_loss = conflicting_action_penalty(logits, cfg)
-                loss = bce_loss + float(cfg.conflict_penalty_weight) * conflict_loss
+                loss = (
+                    bce_loss
+                    + float(cfg.vision_aux_loss_weight) * vision_bce_loss
+                    + float(cfg.conflict_penalty_weight) * conflict_loss
+                )
                 scaled_loss = loss / int(cfg.grad_accum)
             if training:
                 scaled_loss.backward()
@@ -817,20 +920,26 @@ def run_epoch(
 
         with torch.no_grad():
             flat_logits = logits.reshape(-1, cfg.num_bin)
+            flat_vision_logits = vision_logits.reshape(-1, cfg.num_bin)
             flat_labels = labels.reshape(-1, cfg.num_bin)
             prediction = torch.sigmoid(flat_logits.float()) >= thresholds.view(1, -1)
+            vision_prediction = torch.sigmoid(flat_vision_logits.float()) >= thresholds.view(1, -1)
             stats.update(prediction, flat_labels > 0.5)
+            vision_stats.update(vision_prediction, flat_labels > 0.5)
             if fitter is not None:
                 fitter.update(flat_logits, flat_labels)
         loss_sum += float(loss.detach().item())
         bce_loss_sum += float(bce_loss.detach().item())
+        vision_bce_loss_sum += float(vision_bce_loss.detach().item())
         conflict_loss_sum += float(conflict_loss.detach().item())
         if (batch_index + 1) % cfg.print_every == 0 or batch_index + 1 == num_batches:
             progress.set_postfix(
                 loss=f"{loss_sum / float(batch_index + 1):.4f}",
                 bce=f"{bce_loss_sum / float(batch_index + 1):.4f}",
+                vision_bce=f"{vision_bce_loss_sum / float(batch_index + 1):.4f}",
                 conflict=f"{conflict_loss_sum / float(batch_index + 1):.4f}",
                 f1=f"{stats.macro_f1():.3f}",
+                vision_f1=f"{vision_stats.macro_f1():.3f}",
                 carry=f"{stream_carried / max(1, stream_total):.3f}" if streaming_state else "n/a",
             )
     iterator.reset()
@@ -838,9 +947,12 @@ def run_epoch(
     metrics: Dict[str, object] = {
         "loss": loss_sum / max(1, num_batches),
         "bce_loss": bce_loss_sum / max(1, num_batches),
+        "vision_bce_loss": vision_bce_loss_sum / max(1, num_batches),
         "conflict_penalty": conflict_loss_sum / max(1, num_batches),
         "macro_f1": stats.macro_f1(),
         "rows": stats.rows(cfg.key_names),
+        "vision_macro_f1": vision_stats.macro_f1(),
+        "vision_rows": vision_stats.rows(cfg.key_names),
     }
     if streaming_state:
         metrics["stream_chunks"] = stream_total
@@ -1002,6 +1114,15 @@ def print_startup_stats(
         f"pos_weight_power={cfg.pos_weight_power:.3f}",
         f"pos_weight_clamp={cfg.pos_weight_clamp:.3f}",
         f"conflict_weight={cfg.conflict_penalty_weight:.3f}",
+        f"vision_aux_weight={cfg.vision_aux_loss_weight:.3f}",
+    )
+    print(
+        "  Previous action:",
+        f"conditioning={cfg.last_action_conditioning}",
+        f"residual_cap={cfg.last_action_residual_cap:.3f}",
+        f"train=ground_truth:{cfg.recorded_feedback_stream_prob:.2f}/"
+        f"autoregressive:{cfg.autoregressive_feedback_stream_prob:.2f}",
+        "validation=autoregressive",
     )
     print(
         "  Train class stats:",
@@ -1137,22 +1258,33 @@ def train(cfg: Optional[TrainConfig] = None) -> None:
         if isinstance(fitted, tuple) and len(fitted) == cfg.num_bin:
             cfg.button_state_thresholds = tuple(float(item) for item in fitted)
         score = float(val_metrics["macro_f1"])
+        is_best = score > best_score
+        if is_best:
+            best_score = score
         print(
             f"Epoch {epoch + 1}/{cfg.num_epochs}: "
             f"train_loss={float(train_metrics['loss']):.4f} "
             f"train_conflict={float(train_metrics['conflict_penalty']):.4f} "
             f"train_f1={float(train_metrics['macro_f1']):.4f} "
+            f"train_vision_f1={float(train_metrics['vision_macro_f1']):.4f} "
             f"train_stream={int(train_metrics.get('stream_resets', 0))}reset/"
             f"{int(train_metrics.get('stream_carried', 0))}carried/"
             f"{float(train_metrics.get('stream_carry_rate', 0.0)):.3f} "
             f"val_loss={float(val_metrics['loss']):.4f} "
             f"val_conflict={float(val_metrics['conflict_penalty']):.4f} "
             f"val_f1={score:.4f} "
+            f"val_vision_f1={float(val_metrics['vision_macro_f1']):.4f} "
             f"val_stream={int(val_metrics.get('stream_resets', 0))}reset/"
             f"{int(val_metrics.get('stream_carried', 0))}carried/"
             f"{float(val_metrics.get('stream_carry_rate', 0.0)):.3f}"
         )
+        print(
+            f"Validation best_macro_f1={best_score:.4f} "
+            f"current_macro_f1={score:.4f} "
+            f"new_best={is_best}"
+        )
         print_metric_rows("Validation controls:", val_metrics["rows"])
+        print_metric_rows("Validation vision-only controls:", val_metrics["vision_rows"])
         if fitted is not None:
             print("Validation thresholds:", dict(zip(cfg.key_names, cfg.button_state_thresholds)))
 
@@ -1162,11 +1294,10 @@ def train(cfg: Optional[TrainConfig] = None) -> None:
             cfg,
             epoch=epoch + 1,
             global_step=global_step,
-            best_score=max(best_score, score),
+            best_score=best_score,
         )
         torch.save(payload, os.path.join(cfg.ckpt_dir, "model_latest.pt"))
-        if score > best_score:
-            best_score = score
+        if is_best:
             torch.save(payload, os.path.join(cfg.ckpt_dir, "model_best.pt"))
         if (epoch + 1) % cfg.save_every == 0:
             torch.save(payload, os.path.join(cfg.ckpt_dir, f"model_epoch_{epoch + 1}.pt"))
@@ -1210,6 +1341,10 @@ def parse_args() -> TrainConfig:
     add("--pos-weight-power", type=float, default=None)
     add("--pos-weight-clamp", type=float, default=None)
     add("--conflict-penalty-weight", type=float, default=None)
+    add("--vision-aux-loss-weight", type=float, default=None)
+    add("--last-action-residual-cap", type=float, default=None)
+    add("--autoregressive-feedback-stream-prob", type=float, default=None)
+    add("--recorded-feedback-stream-prob", type=float, default=None)
     add("--threshold-min", type=float, default=None)
     add("--threshold-max", type=float, default=None)
     add("--fit-thresholds-from-val", dest="fit_thresholds_from_val", action="store_true", default=None)

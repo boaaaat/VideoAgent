@@ -11,7 +11,7 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
-from models import DrivingVideoPolicy, ModelConfig, TemporalState
+from models import ARCHITECTURE_VERSION, DrivingVideoPolicy, ModelConfig, TemporalState
 
 
 class FFmpegPipeWriter:
@@ -132,6 +132,11 @@ def load_model_checkpoint(
 
     config_dict = dict(state["config"])
     model_state = state["model_state"]
+    if str(config_dict.get("architecture_version", "")).strip() != ARCHITECTURE_VERSION:
+        raise RuntimeError(
+            f"Checkpoint {checkpoint_path!r} is incompatible with {ARCHITECTURE_VERSION!r}; retrain it "
+            "with previous-action conditioning."
+        )
     valid_keys = {field.name for field in fields(ModelConfig)}
     cfg_kwargs = {key: value for key, value in config_dict.items() if key in valid_keys}
     if not use_checkpoint_thresholds:

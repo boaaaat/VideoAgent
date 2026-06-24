@@ -17,6 +17,7 @@ from tqdm.auto import tqdm
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from models import (  # noqa: E402
+    ARCHITECTURE_VERSION,
     DrivingVideoPolicy,
     ModelConfig,
     TemporalState,
@@ -162,6 +163,11 @@ def load_model_from_checkpoint(
     state = _load_checkpoint_state(ckpt_path, device)
     cfg = ModelConfig()
     config_dict = _extract_checkpoint_config(state)
+    if str(config_dict.get("architecture_version", "")).strip() != ARCHITECTURE_VERSION:
+        raise RuntimeError(
+            f"Checkpoint {ckpt_path!r} is incompatible with {ARCHITECTURE_VERSION!r}; retrain it "
+            "with previous-action conditioning."
+        )
     if config_dict:
         cfg = _apply_config_overrides(cfg, config_dict)
     else:
@@ -484,7 +490,7 @@ def _policy_visuals_for_frame(
             if bool(need_trajectory):
                 if hidden is None:
                     raise RuntimeError("Temporal readout was not computed for the policy trajectory.")
-                logits = model._readout_logits(fused, hidden)[0].detach().float()
+                logits = model._readout_logits(fused, hidden, prev_action=prev_action)[0].detach().float()
                 trajectory_probs = torch.sigmoid(logits).reshape(1, -1).cpu().numpy().astype(np.float32)
                 thresholds = _button_thresholds(cfg, device=logits.device, dtype=logits.dtype)
                 next_action = (torch.sigmoid(logits) >= thresholds).to(
@@ -915,8 +921,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # parser.add_argument("--input", default=r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\data\greenville\train\run_20260520_214455.mp4', help="Input video path. Defaults to the newest run in cfg.data_root.")
     # parser.add_argument("--input", default=r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\data\greenville\train\run_20260522_161244.mp4', help="Input video path. Defaults to the newest run in cfg.data_root.")
     # parser.add_argument("--input", default=r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\data\greenville\train\run_20260526_174504.mp4', help="Input video path. Defaults to the newest run in cfg.data_root.")
-    # parser.add_argument("--input", default=r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\data\greenville\train\run_20260526_175335.mp4', help="Input video path. Defaults to the newest run in cfg.data_root.")
-    parser.add_argument("--input", default=r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\data\greenville\train\run_20260526_180131.mp4', help="Input video path. Defaults to the newest run in cfg.data_root.")
+    parser.add_argument("--input", default=r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\data\greenville\train\run_20260526_175335.mp4', help="Input video path. Defaults to the newest run in cfg.data_root.")
+    # parser.add_argument("--input", default=r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\data\greenville\train\run_20260526_180131.mp4', help="Input video path. Defaults to the newest run in cfg.data_root.")
     parser.add_argument("--output", default=None, help="Output video path (.mp4). Default auto-names next to input.")
     parser.add_argument("--csv", default=None, help="CSV labels for the input video. Default auto-detects next to --input.")
     parser.add_argument(

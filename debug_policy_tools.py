@@ -13,7 +13,7 @@ import torch
 import torch.nn.functional as F
 from tqdm.auto import tqdm
 
-from models import DrivingVideoPolicy, ModelConfig, TemporalState
+from models import ARCHITECTURE_VERSION, DrivingVideoPolicy, ModelConfig, TemporalState
 
 
 CONFLICTING_BUTTON_PAIRS = (("w", "s"), ("a", "d"))
@@ -236,6 +236,11 @@ def load_model_checkpoint(
         raise RuntimeError(f"Checkpoint {checkpoint_path!r} must contain a model_state dict.")
 
     config_dict = dict(state["config"])
+    if str(config_dict.get("architecture_version", "")).strip() != ARCHITECTURE_VERSION:
+        raise RuntimeError(
+            f"Checkpoint {checkpoint_path!r} is incompatible with {ARCHITECTURE_VERSION!r}; retrain it "
+            "with previous-action conditioning."
+        )
     valid_keys = {field.name for field in fields(ModelConfig)}
     cfg_kwargs = {key: value for key, value in config_dict.items() if key in valid_keys}
     if not use_checkpoint_thresholds:
