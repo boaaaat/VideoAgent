@@ -27,7 +27,7 @@ FUSED_CHANNELS = 80
 READOUT_CHANNELS = 128
 DEFAULT_SEQUENCE_LENGTH = 80
 DEFAULT_ACTION_NAMES = ("w", "a", "s", "d", "z", "c")
-ARCHITECTURE_VERSION = "fpn_convgru_attention_v4_stem_fusion"
+ARCHITECTURE_VERSION = "fpn_convgru_attention_v7_prestem_64residual"
 
 
 def _as_int(name: str, value: object, minimum: int) -> int:
@@ -326,45 +326,49 @@ class SharedFrameEncoder(nn.Module):
     def feature_stages(self, x: torch.Tensor) -> List[torch.Tensor]:
         if x.dim() != 4 or x.size(1) != RGB_CHANNELS:
             raise ValueError(f"Expected RGB images [B,3,H,W], got {tuple(x.shape)}.")
-        stem = self.stem_down(self.pre_stem(x))
+        pre_stem = self.pre_stem(x)
+        stem = self.stem_down(pre_stem)
         low = self.low(stem)
         mid = self.mid(low)
         deep = self.deep(mid)
-        return [stem, low, mid, deep]
+        return [pre_stem, stem, low, mid, deep]
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        stem, low, mid, deep = self.feature_stages(x)
-        return stem, low, mid, deep
+    def forward(
+        self, x: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        pre_stem, stem, low, mid, deep = self.feature_stages(x)
+        return pre_stem, stem, low, mid, deep
 
 
 class FPNFusion(nn.Module):
-    """Fuse 128/64/32/16 feature levels into a compact 16x16 driving map."""
+    """Fuse 256/64/32/16 feature levels into a compact 16x16 driving map."""
 
     def __init__(self) -> None:
         super().__init__()
-        self.stem_lateral = ConvNormAct(STEM_CHANNELS, FUSED_CHANNELS, kernel_size=1, activate=False)
         self.low_lateral = ConvNormAct(LOW_CHANNELS, FUSED_CHANNELS, kernel_size=1, activate=False)
         self.mid_lateral = ConvNormAct(MID_CHANNELS, FUSED_CHANNELS, kernel_size=1, activate=False)
         self.deep_lateral = ConvNormAct(DEEP_CHANNELS, FUSED_CHANNELS, kernel_size=1, activate=False)
 
         self.smooth32 = LightweightResidualBlock(FUSED_CHANNELS, FUSED_CHANNELS)
         self.smooth64 = LightweightResidualBlock(FUSED_CHANNELS, FUSED_CHANNELS)
-        self.smooth128 = LightweightResidualBlock(FUSED_CHANNELS, FUSED_CHANNELS)
-        self.down32_to_16 = DepthwiseSeparableConv(FUSED_CHANNELS, FUSED_CHANNELS, stride=2)
         self.down64_to_16 = nn.Sequential(
             DepthwiseSeparableConv(FUSED_CHANNELS, FUSED_CHANNELS, stride=2),
             DepthwiseSeparableConv(FUSED_CHANNELS, FUSED_CHANNELS, stride=2),
         )
-        self.down128_to_16 = nn.Sequential(
-            DepthwiseSeparableConv(FUSED_CHANNELS, FUSED_CHANNELS, stride=2),
-            DepthwiseSeparableConv(FUSED_CHANNELS, FUSED_CHANNELS, stride=2),
-            DepthwiseSeparableConv(FUSED_CHANNELS, FUSED_CHANNELS, stride=2),
+        # Preserve fine image structure in a narrow return path. Expanding a
+        # 256x256 tensor to all FPN channels would dominate model compute, so
+        # this path widens only as its spatial resolution decreases.
+        self.pre_stem_to_16 = nn.Sequential(
+            DepthwiseSeparableConv(STEM_CHANNELS, LOW_CHANNELS, stride=2),
+            DepthwiseSeparableConv(LOW_CHANNELS, MID_CHANNELS, stride=2),
+            DepthwiseSeparableConv(MID_CHANNELS, DEEP_CHANNELS, stride=2),
+            DepthwiseSeparableConv(DEEP_CHANNELS, FUSED_CHANNELS, stride=2),
         )
         self.output = LightweightResidualBlock(FUSED_CHANNELS, FUSED_CHANNELS)
 
     def forward(
         self,
-        stem: torch.Tensor,
+        pre_stem: torch.Tensor,
         low: torch.Tensor,
         mid: torch.Tensor,
         deep: torch.Tensor,
@@ -374,18 +378,13 @@ class FPNFusion(nn.Module):
         p32 = self.smooth32(p32)
         p64 = self.low_lateral(low) + F.interpolate(p32, size=low.shape[-2:], mode="bilinear", align_corners=False)
         p64 = self.smooth64(p64)
-        p128 = self.stem_lateral(stem) + F.interpolate(
-            p64, size=stem.shape[-2:], mode="bilinear", align_corners=False
-        )
-        p128 = self.smooth128(p128)
 
-        # Reinject every detail-enhanced pyramid level into the compact grid
-        # that feeds causal temporal memory.
+        # p64 already incorporates p32 and p16 through the top-down path, so
+        # return only the distinct 64x64 and high-resolution detail residuals.
         return self.output(
             p16
-            + self.down32_to_16(p32)
             + self.down64_to_16(p64)
-            + self.down128_to_16(p128)
+            + self.pre_stem_to_16(pre_stem)
         )
 
 
@@ -658,8 +657,8 @@ class DrivingVideoPolicy(nn.Module):
         return ((action >= 0.5).to(dtype=torch.long) * bits.view(1, -1)).sum(dim=-1)
 
     def _encode_frame(self, frame: torch.Tensor) -> torch.Tensor:
-        stem, low, mid, deep = self.spatial_encoder(frame)
-        return self.fpn(stem, low, mid, deep)
+        pre_stem, _stem, low, mid, deep = self.spatial_encoder(frame)
+        return self.fpn(pre_stem, low, mid, deep)
 
     def _readout_features(self, current_fpn: torch.Tensor, hidden: torch.Tensor) -> torch.Tensor:
         readout = self.readout_fusion(torch.cat((hidden, current_fpn), dim=1))
@@ -826,8 +825,8 @@ class DrivingVideoPolicy(nn.Module):
         flat = frames.reshape(batch * steps, RGB_CHANNELS, height, width)
         if flat.is_cuda:
             flat = flat.contiguous(memory_format=torch.channels_last)
-        stem, low, mid, deep = self.spatial_encoder(flat)
-        fused = self.fpn(stem, low, mid, deep).reshape(
+        pre_stem, _stem, low, mid, deep = self.spatial_encoder(flat)
+        fused = self.fpn(pre_stem, low, mid, deep).reshape(
             batch, steps, FUSED_CHANNELS, deep.size(-2), deep.size(-1)
         )
         hidden = self._prepare_temporal_state(

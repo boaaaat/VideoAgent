@@ -4,7 +4,7 @@ import subprocess
 from pathlib import Path
 
 # Path to your dataset.
-DATA_ROOT = str(Path(__file__).resolve().parent / "data" / "greenville_test")
+DATA_ROOT = str(Path(__file__).resolve().parent / "data" / "greenville" / 'low_res')
 
 # Output resolution (no aspect ratio preserved)
 TARGET_W = 256

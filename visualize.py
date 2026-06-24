@@ -24,7 +24,7 @@ from models import (  # noqa: E402
 )
 
 
-FeatureLayer = Literal["stage1", "stage2", "stage3", "stage4", "spatial", "tokens"]
+FeatureLayer = Literal["stage1", "stage2", "stage3", "stage4", "stage5", "spatial", "tokens"]
 ModelKind = Literal["auto", "policy"]
 LoadedModelKind = Literal["policy"]
 VisualModel = DrivingVideoPolicy
@@ -166,7 +166,7 @@ def load_model_from_checkpoint(
     if str(config_dict.get("architecture_version", "")).strip() != ARCHITECTURE_VERSION:
         raise RuntimeError(
             f"Checkpoint {ckpt_path!r} is incompatible with {ARCHITECTURE_VERSION!r}; retrain it "
-            "with previous-action conditioning."
+            "with the current policy architecture."
         )
     if config_dict:
         cfg = _apply_config_overrides(cfg, config_dict)
@@ -209,11 +209,12 @@ def _policy_fpn_features(
     masked_frame: torch.Tensor,
 ) -> Tuple[List[torch.Tensor], torch.Tensor]:
     stages = model.spatial_encoder.feature_stages(masked_frame)
-    if len(stages) != 4:
-        raise RuntimeError(f"Expected four encoder stages, got {len(stages)}.")
-    # stages are stem@128, low@64, mid@32, and deep@16. The spatial layer
-    # shown by this visualizer is the actual FPN output consumed by ConvGRU.
-    fused = model.fpn(stages[1], stages[2], stages[3])
+    if len(stages) != 5:
+        raise RuntimeError(f"Expected five encoder stages, got {len(stages)}.")
+    # Stages are pre_stem@256, stem@128, low@64, mid@32, and deep@16. Stem is
+    # retained as the backbone transition to low@64; the FPN directly fuses
+    # pre_stem, low, mid, and deep into the map consumed by ConvGRU.
+    fused = model.fpn(stages[0], stages[2], stages[3], stages[4])
     return stages, fused
 
 
@@ -943,10 +944,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--layer",
-        choices=["stage1", "stage2", "stage3", "stage4", "spatial", "tokens"],
+        choices=["stage1", "stage2", "stage3", "stage4", "stage5", "spatial", "tokens"],
         default="stage1",
         help=(
-            "Feature map to visualize: stem/encoder stages (stage1-stage4), FPN output "
+            "Feature map to visualize: pre-stem/encoder stages (stage1-stage5), FPN output "
             "(spatial), or the second ConvGRU hidden map (tokens)."
         ),
     )
