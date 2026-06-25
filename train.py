@@ -1138,7 +1138,8 @@ def print_startup_stats(
         f"architecture={ARCHITECTURE_VERSION}",
         f"parameters={parameter_count / 1_000_000:.4f}M",
         f"input=[B,{cfg.seq_len},3,{cfg.model_size},{cfg.model_size}]",
-        f"temporal=2xConvGRU({FUSED_CHANNELS}x{cfg.model_size // 16}x{cfg.model_size // 16})",
+        f"temporal=ConvGRU32({FUSED_CHANNELS}x{cfg.model_size // 8}x{cfg.model_size // 8})+"
+        f"2xConvGRU16({FUSED_CHANNELS}x{cfg.model_size // 16}x{cfg.model_size // 16})",
         f"readout=6x{READOUT_CHANNELS}",
     )
     print(
