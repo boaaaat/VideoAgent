@@ -106,9 +106,12 @@ class TrainConfig(ModelConfig):
     pos_weight_power: float = 0.5
     pos_weight_clamp: float = 8.0
     conflict_penalty_weight: float = 0.20
-    vision_aux_loss_weight: float = 0.50
-    autoregressive_feedback_stream_prob: float = 0.25
-    recorded_feedback_stream_prob: float = 0.75
+    # The current architecture has no previous-action readout branch, so
+    # policy logits and vision logits are identical. Keep the auxiliary term
+    # off to avoid silently scaling BCE.
+    vision_aux_loss_weight: float = 0.0
+    autoregressive_feedback_stream_prob: float = 0.0
+    recorded_feedback_stream_prob: float = 0.0
     fit_thresholds_from_val: bool = True
     threshold_min: float = 0.10
     threshold_max: float = 0.90
@@ -528,10 +531,8 @@ def build_window_targets(
             target_start = start + action_offset
             target_end = target_start + int(cfg.seq_len)
             label_windows.append(labels[target_start:target_end])
-            # The target at timestep t is labels[start + t + action_offset].
-            # Teacher-forced previous action is the immediately preceding
-            # target, labels[start + t + action_offset - 1], matching runtime
-            # autoregressive feedback at chunk boundaries.
+            # Retained for dataloader compatibility. The current model does
+            # not consume previous-action labels.
             previous_start = start + action_offset - 1
             previous = labels[previous_start : previous_start + int(cfg.seq_len)]
             previous_action_windows.append(previous)
@@ -893,21 +894,15 @@ def run_epoch(
         initial_state: Optional[TemporalState] = None
         stream_item: Optional[WindowMeta] = None
         stream_entry: Optional[StreamingStateEntry] = None
-        feedback_mode = "autoregressive"
-        feedback_action: Optional[torch.Tensor] = None
+        feedback_mode = "disabled"
         carried = False
         if streaming_state:
             stream_entry, stream_item, carried = stream_initial_state(sample_ids, targets, state_cache)
             if stream_entry is not None:
                 initial_state = stream_entry.temporal_state
                 feedback_mode = stream_entry.feedback_mode
-                feedback_action = stream_entry.feedback_action
             elif stream_item is not None:
-                feedback_mode = "autoregressive" if not training else stream_feedback_mode(
-                    stream_item,
-                    epoch_index=epoch_index,
-                    cfg=cfg,
-                )
+                feedback_mode = "disabled"
             stream_total += 1
             stream_carried += int(carried)
             stream_resets += int(not carried)
@@ -930,16 +925,14 @@ def run_epoch(
                 enabled=amp_dtype == torch.bfloat16,
             ):
                 if streaming_state:
-                    use_autoregressive_feedback = feedback_mode == "autoregressive"
-                    model_prev_action = feedback_action if use_autoregressive_feedback else previous_actions
                     output, next_state = model(
                         frames,
                         state=initial_state,
                         return_aux=True,
                         return_sequence_logits=True,
-                        prev_action=model_prev_action,
-                        feedback_thresholds=thresholds,
-                        autoregressive_feedback=use_autoregressive_feedback,
+                        prev_action=None,
+                        feedback_thresholds=None,
+                        autoregressive_feedback=False,
                     )
                     if stream_item is None:
                         raise RuntimeError("Streaming state metadata was not resolved.")
@@ -947,20 +940,20 @@ def run_epoch(
                         next_frame=stream_item.end_frame,
                         temporal_state=next_state,
                         feedback_mode=feedback_mode,
-                        feedback_action=output.next_feedback_action if use_autoregressive_feedback else None,
+                        feedback_action=None,
                     )
                 else:
                     output = model(
                         frames,
                         return_sequence_logits=True,
-                        prev_action=previous_actions,
+                        prev_action=None,
                     )
                 logits = output.sequence_button_logits
                 vision_logits = output.sequence_vision_button_logits
                 if logits is None:
                     raise RuntimeError("Dense temporal supervision requires per-timestep policy logits.")
                 if vision_logits is None:
-                    raise RuntimeError("Previous-action training requires per-timestep vision-only logits.")
+                    raise RuntimeError("Dense temporal supervision requires per-timestep vision logits.")
                 if tuple(logits.shape) != tuple(labels.shape):
                     raise RuntimeError(
                         f"Model logits shape {tuple(logits.shape)} does not match labels {tuple(labels.shape)}."
@@ -1218,10 +1211,8 @@ def print_startup_stats(
     print(
         "  Previous action:",
         f"conditioning={cfg.last_action_conditioning}",
-        f"residual_cap={cfg.last_action_residual_cap:.3f}",
-        f"train=ground_truth:{cfg.recorded_feedback_stream_prob:.2f}/"
-        f"autoregressive:{cfg.autoregressive_feedback_stream_prob:.2f}",
-        "validation=autoregressive",
+        "train_feedback=disabled",
+        "validation_feedback=disabled",
     )
     print(
         "  Train class stats:",
