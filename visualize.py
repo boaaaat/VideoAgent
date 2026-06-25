@@ -213,14 +213,9 @@ def _policy_fpn_features(
         raise RuntimeError(f"Expected five encoder stages, got {len(stages)}.")
     # Stages are pre_stem@256, stem@128, low@64, mid@32, and deep@16. The FPN
     # directly fuses pre_stem, low, mid, and deep into the 16x16 ConvGRU map
-    # and the separate 64x64 current-frame detail map.
-    fused, detail64 = model.fpn(
-        stages[0],
-        stages[2],
-        stages[3],
-        stages[4],
-        return_detail=True,
-    )
+    # and the separate 64x64 current-frame detail map used by the action
+    # readout.
+    fused, detail64 = model.fpn(stages[0], stages[2], stages[3], stages[4], return_detail=True)
     return stages, fused, detail64
 
 
@@ -951,7 +946,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="stage1",
         help=(
             "Feature map to visualize: pre-stem/encoder stages (stage1-stage5), FPN output "
-            "(spatial), or the final 16x16 ConvGRU readout map (tokens)."
+            "(spatial), or the second ConvGRU hidden map (tokens)."
         ),
     )
     parser.add_argument("--mode", choices=["heat", "overlay", "side_by_side", "triple"], default="side_by_side")

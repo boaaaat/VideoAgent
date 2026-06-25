@@ -27,7 +27,7 @@ READOUT_CHANNELS = 128
 DETAIL_CHANNELS = 64
 DEFAULT_SEQUENCE_LENGTH = 80
 DEFAULT_ACTION_NAMES = ("w", "a", "s", "d", "z", "c")
-ARCHITECTURE_VERSION = "fpn_convgru_attention_v13_no_action_context"
+ARCHITECTURE_VERSION = "fpn_convgru_attention_v14_action_context"
 
 
 def _as_int(name: str, value: object, minimum: int) -> int:
@@ -214,12 +214,7 @@ class PolicyOutput:
 
 @dataclass
 class TemporalState:
-    """ConvGRU state carried between streaming chunks.
-
-    ``hidden_state`` keeps compatibility with packed tensors shaped
-    [2, B, FUSED_CHANNELS, H/16, W/16]. Streaming code uses the split states
-    directly so it does not rebuild the packed tensor between chunks.
-    """
+    """Packed ConvGRU state with shape [2, B, FUSED_CHANNELS, H/16, W/16]."""
 
     hidden_state: Optional[torch.Tensor] = None
     low16_state1: Optional[torch.Tensor] = None
@@ -351,7 +346,7 @@ class SharedFrameEncoder(nn.Module):
 
 
 class FPNFusion(nn.Module):
-    """Build the 16x16 temporal map plus current-frame 64x64 detail features."""
+    """Build a temporal 16x16 map plus current-frame 64x64 detail features."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -387,7 +382,7 @@ class FPNFusion(nn.Module):
         deep: torch.Tensor,
         *,
         return_detail: bool = False,
-    ) -> torch.Tensor | Tuple[torch.Tensor, ...]:
+    ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
         p16 = self.deep_lateral(deep)
         p32 = self.mid_lateral(mid) + F.interpolate(p16, size=mid.shape[-2:], mode="bilinear", align_corners=False)
         p32 = self.smooth32(p32)
@@ -408,10 +403,7 @@ class FPNFusion(nn.Module):
             + self.down64_to_16(p64)
             + pre16
         )
-        outputs: List[torch.Tensor] = [fused16]
-        if return_detail:
-            outputs.append(detail64)
-        return tuple(outputs) if len(outputs) > 1 else fused16
+        return (fused16, detail64) if return_detail else fused16
 
 
 class ConvGRUCell(nn.Module):
@@ -423,11 +415,7 @@ class ConvGRUCell(nn.Module):
         self.gates = nn.Conv2d(2 * self.channels, 2 * self.channels, kernel_size=3, padding=1)
         self.candidate = nn.Conv2d(2 * self.channels, self.channels, kernel_size=3, padding=1)
         with torch.no_grad():
-            # This implementation uses the first gate as the candidate-write
-            # amount: h = (1 - update) * previous + update * candidate. A
-            # negative initial bias therefore preserves memory instead of
-            # overwriting it every frame.
-            self.gates.bias[: self.channels].fill_(-2.0)
+            self.gates.bias[: self.channels].fill_(1.0)
 
     def forward(self, x: torch.Tensor, previous: torch.Tensor) -> torch.Tensor:
         if x.shape != previous.shape:
@@ -593,11 +581,15 @@ class DrivingVideoPolicy(nn.Module):
         final = self.control_head[-1]
         if isinstance(final, nn.Linear):
             nn.init.constant_(final.bias, -1.0)
+        context_final = self.action_context[-1]
+        if isinstance(context_final, nn.Linear):
+            nn.init.zeros_(context_final.weight)
+            nn.init.zeros_(context_final.bias)
         # Preserve the temporal-only policy at initialization. The gate can
         # learn a distinct signed detail residual for every action/channel,
         # but random high-resolution attention cannot damage the base readout.
         nn.init.zeros_(self.detail_gate.weight)
-        nn.init.constant_(self.detail_gate.bias, math.atanh(DETAIL_INITIAL_RESIDUAL_GATE))
+        nn.init.zeros_(self.detail_gate.bias)
 
         # Private compatibility attributes used by existing visual tooling.
         self.feat_channels = FUSED_CHANNELS
@@ -648,154 +640,13 @@ class DrivingVideoPolicy(nn.Module):
         **_: object,
     ) -> torch.Tensor:
         return torch.zeros(
-            TEMPORAL_STATE_LAYERS,
+            2,
             int(batch_size),
             FUSED_CHANNELS,
             int(height),
             int(width),
             device=device,
             dtype=dtype,
-        )
-
-    def _initial_temporal_states(
-        self,
-        batch_size: int,
-        height: int,
-        width: int,
-        *,
-        device: torch.device,
-        dtype: torch.dtype,
-        **_: object,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        return (
-            self._new_recurrent_state(
-                batch_size,
-                height,
-                width,
-                device=device,
-                dtype=dtype,
-            ),
-            self._new_recurrent_state(
-                batch_size,
-                height,
-                width,
-                device=device,
-                dtype=dtype,
-            ),
-        )
-
-    def _pack_temporal_state(
-        self,
-        low16_1: torch.Tensor,
-        low16_2: torch.Tensor,
-    ) -> torch.Tensor:
-        return torch.stack((low16_1, low16_2), dim=0)
-
-    def _unpack_temporal_state(
-        self,
-        hidden_state: torch.Tensor,
-        batch_size: int,
-        height: int,
-        width: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        expected = (
-            TEMPORAL_STATE_LAYERS,
-            int(batch_size),
-            FUSED_CHANNELS,
-            int(height),
-            int(width),
-        )
-        if tuple(hidden_state.shape) != expected:
-            raise ValueError(f"Expected temporal state {expected}, got {tuple(hidden_state.shape)}.")
-        return (
-            self._as_recurrent_map(hidden_state[0]),
-            self._as_recurrent_map(hidden_state[1]),
-        )
-
-    def _validate_recurrent_state(
-        self,
-        name: str,
-        tensor: torch.Tensor,
-        expected: Tuple[int, int, int, int],
-        *,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        if tuple(tensor.shape) != expected:
-            raise ValueError(f"Expected {name} state {expected}, got {tuple(tensor.shape)}.")
-        return self._as_recurrent_map(tensor.to(device=device, dtype=dtype))
-
-    def _prepare_temporal_states(
-        self,
-        state: Optional[TemporalState],
-        batch_size: int,
-        height: int,
-        width: int,
-        *,
-        device: torch.device,
-        dtype: torch.dtype,
-        **_: object,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if state is None:
-            return self._initial_temporal_states(
-                batch_size,
-                height,
-                width,
-                device=device,
-                dtype=dtype,
-            )
-
-        split_state = (state.low16_state1, state.low16_state2)
-        if any(item is not None for item in split_state):
-            if not all(item is not None for item in split_state):
-                raise ValueError("TemporalState split states must be all set or all omitted.")
-            expected_low = (int(batch_size), FUSED_CHANNELS, int(height), int(width))
-            return (
-                self._validate_recurrent_state(
-                    "low16_state1",
-                    state.low16_state1,
-                    expected_low,
-                    device=device,
-                    dtype=dtype,
-                ),
-                self._validate_recurrent_state(
-                    "low16_state2",
-                    state.low16_state2,
-                    expected_low,
-                    device=device,
-                    dtype=dtype,
-                ),
-            )
-
-        if state.hidden_state is None:
-            return self._initial_temporal_states(
-                batch_size,
-                height,
-                width,
-                device=device,
-                dtype=dtype,
-            )
-
-        hidden = state.hidden_state.to(device=device, dtype=dtype)
-        if hidden.dim() == 4:
-            if tuple(hidden.shape) != (batch_size, FUSED_CHANNELS, height, width):
-                raise ValueError(f"Invalid temporal state shape {tuple(hidden.shape)}.")
-            low16 = self._as_recurrent_map(hidden)
-            return low16, low16
-        expected = (
-            TEMPORAL_STATE_LAYERS,
-            int(batch_size),
-            FUSED_CHANNELS,
-            int(height),
-            int(width),
-        )
-        if tuple(hidden.shape) != expected:
-            raise ValueError(f"Expected temporal state {expected}, got {tuple(hidden.shape)}.")
-        return self._unpack_temporal_state(
-            hidden,
-            batch_size,
-            height,
-            width,
         )
 
     def _prepare_temporal_state(
@@ -807,29 +658,19 @@ class DrivingVideoPolicy(nn.Module):
         *,
         device: torch.device,
         dtype: torch.dtype,
-        **kwargs: object,
+        **_: object,
     ) -> torch.Tensor:
-        return self._pack_temporal_state(
-            *self._prepare_temporal_states(
-                state,
-                batch_size,
-                height,
-                width,
-                device=device,
-                dtype=dtype,
-                **kwargs,
-            )
-        )
-
-    def _make_temporal_state(
-        self,
-        low16_1: torch.Tensor,
-        low16_2: torch.Tensor,
-    ) -> TemporalState:
-        return TemporalState(
-            low16_state1=low16_1.detach(),
-            low16_state2=low16_2.detach(),
-        )
+        if state is None or state.hidden_state is None:
+            return self._initial_temporal_state(batch_size, height, width, device=device, dtype=dtype)
+        hidden = state.hidden_state.to(device=device, dtype=dtype)
+        if hidden.dim() == 4:
+            if tuple(hidden.shape) != (batch_size, FUSED_CHANNELS, height, width):
+                raise ValueError(f"Invalid temporal state shape {tuple(hidden.shape)}.")
+            hidden = torch.stack((hidden, hidden), dim=0)
+        expected = (2, int(batch_size), FUSED_CHANNELS, int(height), int(width))
+        if tuple(hidden.shape) != expected:
+            raise ValueError(f"Expected temporal state {expected}, got {tuple(hidden.shape)}.")
+        return hidden
 
     def _zoneout(self, candidate: torch.Tensor, previous: torch.Tensor) -> torch.Tensor:
         if not self.training or self.cfg.zoneout <= 0.0:
@@ -843,7 +684,9 @@ class DrivingVideoPolicy(nn.Module):
         hidden_state: torch.Tensor,
         **_: object,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        hidden_states = self._prepare_temporal_states(
+        if fused_frame.dim() != 4 or fused_frame.size(1) != FUSED_CHANNELS:
+            raise ValueError(f"Expected FPN feature [B,{FUSED_CHANNELS},H,W], got {tuple(fused_frame.shape)}.")
+        hidden_state = self._prepare_temporal_state(
             TemporalState(hidden_state=hidden_state),
             fused_frame.size(0),
             fused_frame.size(-2),
@@ -851,51 +694,9 @@ class DrivingVideoPolicy(nn.Module):
             device=fused_frame.device,
             dtype=fused_frame.dtype,
         )
-        final_hidden, next_states = self._temporal_step_states(fused_frame, hidden_states)
-        return final_hidden, self._pack_temporal_state(*next_states)
-
-    def _temporal_step_states(
-        self,
-        fused_frame: torch.Tensor,
-        hidden_states: Tuple[torch.Tensor, torch.Tensor],
-    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        if fused_frame.dim() != 4 or fused_frame.size(1) != FUSED_CHANNELS:
-            raise ValueError(f"Expected FPN feature [B,{FUSED_CHANNELS},H,W], got {tuple(fused_frame.shape)}.")
-        fused_frame = self._as_recurrent_map(fused_frame)
-        h1_prev, h2_prev = hidden_states
-        h1 = self._zoneout(self.gru1(fused_frame, h1_prev), h1_prev)
-        h2 = self._zoneout(self.gru2(h1, h2_prev), h2_prev)
-        return h2, (h1, h2)
-
-    def _temporal_sequence(
-        self,
-        fused: torch.Tensor,
-        hidden_states: Tuple[torch.Tensor, torch.Tensor],
-        *,
-        return_steps: bool,
-    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Optional[torch.Tensor]]:
-        if fused.dim() != 5:
-            raise ValueError(f"Expected temporal feature sequence [B,T,C,H,W], got {tuple(fused.shape)}.")
-        if fused.size(2) != FUSED_CHANNELS:
-            raise ValueError(f"Expected {FUSED_CHANNELS} temporal channels, got {fused.size(2)}.")
-
-        batch, steps, _, height, width = fused.shape
-        h1, h2 = hidden_states
-        expected_low = (batch, FUSED_CHANNELS, height, width)
-        if tuple(h1.shape) != expected_low or tuple(h2.shape) != expected_low:
-            raise ValueError(
-                "Temporal states do not match sequence features: "
-                f"low1={tuple(h1.shape)} low2={tuple(h2.shape)} expected_low={expected_low}."
-            )
-        step_outputs = [] if return_steps else None
-        for index in range(steps):
-            fused_frame = self._as_recurrent_map(fused[:, index])
-            h1 = self._zoneout(self.gru1(fused_frame, h1), h1)
-            h2 = self._zoneout(self.gru2(h1, h2), h2)
-            if step_outputs is not None:
-                step_outputs.append(h2)
-        hidden_sequence = torch.stack(step_outputs, dim=1) if step_outputs is not None else None
-        return h2, (h1, h2), hidden_sequence
+        h1 = self._zoneout(self.gru1(fused_frame, hidden_state[0]), hidden_state[0])
+        h2 = self._zoneout(self.gru2(h1, hidden_state[1]), hidden_state[1])
+        return h2, torch.stack((h1, h2), dim=0)
 
     def _pool_features(self, spatial_features: torch.Tensor) -> torch.Tensor:
         if spatial_features.size(1) != READOUT_CHANNELS:
@@ -910,15 +711,52 @@ class DrivingVideoPolicy(nn.Module):
             return self.control_head(features).squeeze(-1)
         raise ValueError(f"Expected action features [B,6,C] or [B,T,6,C], got {tuple(features.shape)}.")
 
+    def _validate_action_context(
+        self,
+        prev_action: torch.Tensor,
+        action_features: torch.Tensor,
+    ) -> torch.Tensor:
+        expected = tuple(action_features.shape[:-1])
+        if tuple(prev_action.shape) != expected:
+            raise ValueError(
+                "Previous action context must match action-feature batch/time/action dimensions; "
+                f"expected {expected}, got {tuple(prev_action.shape)}."
+            )
+        if prev_action.size(-1) != self.cfg.num_bin:
+            raise ValueError(
+                f"Expected {self.cfg.num_bin} previous-action values, got {prev_action.size(-1)}."
+            )
+        return prev_action.to(device=action_features.device, dtype=action_features.dtype)
+
+    def _fuse_action_context(
+        self,
+        vision_logits: torch.Tensor,
+        action_features: torch.Tensor,
+        prev_action: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Apply a bounded, visual-gated one-step action residual."""
+
+        if not self.cfg.last_action_conditioning or prev_action is None:
+            return vision_logits
+        context = self._validate_action_context(prev_action, action_features)
+        residual = self.action_context(context)
+        gate = torch.sigmoid(self.action_context_gate(action_features)).squeeze(-1)
+        cap = float(self.cfg.last_action_residual_cap)
+        return vision_logits + gate * cap * torch.tanh(residual)
+
+    def _action_state_codes(self, action: torch.Tensor) -> torch.Tensor:
+        """Encode one hard six-key state per batch row as an integer lookup key."""
+
+        if action.dim() != 2 or action.size(-1) != self.cfg.num_bin:
+            raise ValueError(
+                f"Expected hard action states [B,{self.cfg.num_bin}], got {tuple(action.shape)}."
+            )
+        bits = self._action_context_bits.to(device=action.device)
+        return ((action >= 0.5).to(dtype=torch.long) * bits.view(1, -1)).sum(dim=-1)
+
     def _encode_frame(self, frame: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         pre_stem, _stem, low, mid, deep = self.spatial_encoder(frame)
-        fused, detail64 = self.fpn(
-            pre_stem,
-            low,
-            mid,
-            deep,
-            return_detail=True,
-        )
+        fused, detail64 = self.fpn(pre_stem, low, mid, deep, return_detail=True)
         return fused, detail64
 
     def _readout_features(
@@ -1040,7 +878,7 @@ class DrivingVideoPolicy(nn.Module):
         if frame.is_cuda:
             frame = frame.contiguous(memory_format=torch.channels_last)
         fused, detail64 = self._encode_frame(frame)
-        hidden_states = self._prepare_temporal_states(
+        hidden = self._prepare_temporal_state(
             state,
             fused.size(0),
             fused.size(-2),
@@ -1048,7 +886,7 @@ class DrivingVideoPolicy(nn.Module):
             device=fused.device,
             dtype=fused.dtype,
         )
-        final_hidden, next_hidden_states = self._temporal_step_states(fused, hidden_states)
+        final_hidden, next_hidden = self._temporal_step(fused, hidden)
         logits, vision_logits = self._readout_logits(
             fused,
             final_hidden,
@@ -1090,13 +928,7 @@ class DrivingVideoPolicy(nn.Module):
         if flat.is_cuda:
             flat = flat.contiguous(memory_format=torch.channels_last)
         pre_stem, _stem, low, mid, deep = self.spatial_encoder(flat)
-        fused, detail64 = self.fpn(
-            pre_stem,
-            low,
-            mid,
-            deep,
-            return_detail=True,
-        )
+        fused, detail64 = self.fpn(pre_stem, low, mid, deep, return_detail=True)
         fused = fused.reshape(
             batch, steps, FUSED_CHANNELS, deep.size(-2), deep.size(-1)
         )
