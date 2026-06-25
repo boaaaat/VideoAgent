@@ -442,7 +442,6 @@ def _policy_visuals_for_frame(
     need_trajectory: bool,
 ) -> Tuple[np.ndarray, torch.Tensor, Optional[TemporalState], Optional[np.ndarray], Optional[torch.Tensor]]:
     orig_h, orig_w = frame_bgr.shape[:2]
-    del prev_action
     proc = frame_bgr
     if resize_to is not None and (orig_h != resize_to or orig_w != resize_to):
         proc = cv2.resize(proc, (int(resize_to), int(resize_to)), interpolation=cv2.INTER_AREA)
@@ -493,8 +492,14 @@ def _policy_visuals_for_frame(
             if bool(need_trajectory):
                 if hidden is None:
                     raise RuntimeError("Temporal readout was not computed for the policy trajectory.")
-                logits = model._readout_logits(fused, hidden, detail64, prev_action=None)[0].detach().float()
+                logits = model._readout_logits(fused, hidden, detail64, prev_action=prev_action)[0].detach().float()
                 trajectory_probs = torch.sigmoid(logits).reshape(1, -1).cpu().numpy().astype(np.float32)
+                thresholds = torch.tensor(
+                    list(cfg.button_state_thresholds),
+                    device=logits.device,
+                    dtype=logits.dtype,
+                )
+                next_action = (torch.sigmoid(logits) >= thresholds).to(dtype=logits.dtype).reshape(1, -1)
             elif state is None:
                 state = TemporalState()
 
