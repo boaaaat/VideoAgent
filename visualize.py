@@ -207,22 +207,15 @@ def _policy_encoder_input(
 def _policy_fpn_features(
     model: DrivingVideoPolicy,
     masked_frame: torch.Tensor,
-) -> Tuple[List[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[List[torch.Tensor], torch.Tensor]:
     stages = model.spatial_encoder.feature_stages(masked_frame)
     if len(stages) != 5:
         raise RuntimeError(f"Expected five encoder stages, got {len(stages)}.")
-    # Stages are pre_stem@256, stem@128, low@64, mid@32, and deep@16. The FPN
-    # directly fuses pre_stem, low, mid, and deep into the 16x16 ConvGRU map,
-    # the 32x32 recurrent map, and the separate 64x64 current-frame detail map.
-    fused, detail64, temporal32 = model.fpn(
-        stages[0],
-        stages[2],
-        stages[3],
-        stages[4],
-        return_detail=True,
-        return_temporal32=True,
-    )
-    return stages, fused, detail64, temporal32
+    # Stages are pre_stem@256, stem@128, low@64, mid@32, and deep@16. Stem is
+    # retained as the backbone transition to low@64; the FPN directly fuses
+    # pre_stem, low, mid, and deep into the map consumed by ConvGRU.
+    fused = model.fpn(stages[0], stages[2], stages[3], stages[4])
+    return stages, fused
 
 
 def _compute_feature_map(
@@ -234,7 +227,7 @@ def _compute_feature_map(
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[TemporalState]]:
     del previous_frame_rgb
     masked_frame, current = _policy_encoder_input(model, frame_rgb)
-    stages, fused, _detail64, temporal32 = _policy_fpn_features(model, masked_frame)
+    stages, fused = _policy_fpn_features(model, masked_frame)
     if layer.startswith("stage"):
         stage_idx = int(layer.removeprefix("stage")) - 1
         if stage_idx < 0 or stage_idx >= len(stages):
@@ -450,7 +443,6 @@ def _policy_visuals_for_frame(
     need_trajectory: bool,
 ) -> Tuple[np.ndarray, torch.Tensor, Optional[TemporalState], Optional[np.ndarray], Optional[torch.Tensor]]:
     orig_h, orig_w = frame_bgr.shape[:2]
-    del prev_action
     proc = frame_bgr
     if resize_to is not None and (orig_h != resize_to or orig_w != resize_to):
         proc = cv2.resize(proc, (int(resize_to), int(resize_to)), interpolation=cv2.INTER_AREA)
@@ -461,7 +453,7 @@ def _policy_visuals_for_frame(
         x = x.contiguous(memory_format=torch.channels_last)
 
     trajectory_probs: Optional[np.ndarray] = None
-    next_action: Optional[torch.Tensor] = None
+    next_action: Optional[torch.Tensor] = prev_action
 
     with torch.inference_mode():
         with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_autocast and x.is_cuda):
@@ -469,7 +461,7 @@ def _policy_visuals_for_frame(
             masked_frame = model._apply_masks(frame_rgb)
             if masked_frame.is_cuda:
                 masked_frame = masked_frame.contiguous(memory_format=torch.channels_last)
-            stages, fused, detail64, temporal32 = _policy_fpn_features(model, masked_frame)
+            stages, fused = _policy_fpn_features(model, masked_frame)
 
             if layer.startswith("stage"):
                 stage_idx = int(layer.removeprefix("stage")) - 1
@@ -503,8 +495,12 @@ def _policy_visuals_for_frame(
             if bool(need_trajectory):
                 if hidden is None:
                     raise RuntimeError("Temporal readout was not computed for the policy trajectory.")
-                logits = model._readout_logits(fused, hidden, detail64, prev_action=None)[0].detach().float()
+                logits = model._readout_logits(fused, hidden, prev_action=prev_action)[0].detach().float()
                 trajectory_probs = torch.sigmoid(logits).reshape(1, -1).cpu().numpy().astype(np.float32)
+                thresholds = _button_thresholds(cfg, device=logits.device, dtype=logits.dtype)
+                next_action = (torch.sigmoid(logits) >= thresholds).to(
+                    dtype=fused.dtype
+                ).reshape(1, int(cfg.num_bin)).detach()
             elif state is None:
                 state = TemporalState()
 
@@ -930,8 +926,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # parser.add_argument("--input", default=r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\data\greenville\train\run_20260520_214455.mp4', help="Input video path. Defaults to the newest run in cfg.data_root.")
     # parser.add_argument("--input", default=r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\data\greenville\train\run_20260522_161244.mp4', help="Input video path. Defaults to the newest run in cfg.data_root.")
     # parser.add_argument("--input", default=r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\data\greenville\train\run_20260526_174504.mp4', help="Input video path. Defaults to the newest run in cfg.data_root.")
-    # parser.add_argument("--input", default=r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\data\greenville\train\run_20260526_175335.mp4', help="Input video path. Defaults to the newest run in cfg.data_root.")
-    parser.add_argument("--input", default=r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\data\greenville\train\run_20260526_180131.mp4', help="Input video path. Defaults to the newest run in cfg.data_root.")
+    parser.add_argument("--input", default=r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\data\greenville\train\run_20260526_175335.mp4', help="Input video path. Defaults to the newest run in cfg.data_root.")
+    # parser.add_argument("--input", default=r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\data\greenville\train\run_20260526_180131.mp4', help="Input video path. Defaults to the newest run in cfg.data_root.")
     parser.add_argument("--output", default=None, help="Output video path (.mp4). Default auto-names next to input.")
     parser.add_argument("--csv", default=None, help="CSV labels for the input video. Default auto-detects next to --input.")
     parser.add_argument(

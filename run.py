@@ -64,9 +64,10 @@ class RuntimeConfig(ModelConfig):
     print_prob_decimals: int = 3
 
     mouse_buttons_enabled: bool = False
-    # Previous-action conditioning is disabled; ConvGRU state is the only
-    # temporal context carried during runtime.
-    prev_action_feedback: bool = False
+    # Feed model outputs back as last_action to match closed-loop training.
+    # Soft mode uses probabilities for the model context while thresholds still
+    # decide which keys are actually pressed.
+    prev_action_feedback: bool = True
     prev_action_feedback_soft: bool = False
     gru_memory_frames: int = 80
     # data.py records at 512x512 INTER_LINEAR before DALI linear-resizes to
@@ -84,8 +85,12 @@ class RuntimeConfig(ModelConfig):
         self.button_threshold_min = float(np.clip(float(self.button_threshold_min), 0.0, 1.0))
         self.button_threshold_max = float(np.clip(float(self.button_threshold_max), self.button_threshold_min, 1.0))
         self.mouse_buttons_enabled = bool(self.mouse_buttons_enabled)
-        self.prev_action_feedback = False
-        self.prev_action_feedback_soft = False
+        self.prev_action_feedback = bool(self.prev_action_feedback)
+        self.prev_action_feedback_soft = bool(self.prev_action_feedback_soft)
+        if self.last_action_conditioning:
+            self.prev_action_feedback = True
+        if self.last_action_conditioning and self.prev_action_feedback_soft:
+            raise ValueError("Soft previous-action feedback is disabled for this architecture.")
         self.gru_memory_frames = max(1, int(self.gru_memory_frames))
         self.record_frame_size = max(1, int(self.record_frame_size))
 
@@ -244,7 +249,7 @@ def _coerce_config_types(cfg: RuntimeConfig) -> RuntimeConfig:
     cfg.action_decoder = str(getattr(cfg, "action_decoder", "mlp")).strip().lower()
     cfg.action_query_heads = int(getattr(cfg, "action_query_heads", 4))
     cfg.action_query_layers = int(getattr(cfg, "action_query_layers", 2))
-    cfg.last_action_conditioning = False
+    cfg.last_action_conditioning = bool(getattr(cfg, "last_action_conditioning", True))
     cfg.last_action_fusion = str(
         getattr(cfg, "last_action_fusion", "bounded_visual_residual")
     ).strip().lower()
@@ -253,12 +258,19 @@ def _coerce_config_types(cfg: RuntimeConfig) -> RuntimeConfig:
             "This runtime requires last_action_fusion='bounded_visual_residual', "
             f"got {cfg.last_action_fusion!r}."
         )
-    cfg.last_action_residual_cap = 0.0
-    cfg.last_action_prior_logit = 0.0
-    cfg.last_action_absence_prior_logit = 0.0
+    cfg.last_action_residual_cap = float(
+        np.clip(float(getattr(cfg, "last_action_residual_cap", 0.75)), 0.0, 5.0)
+    )
+    cfg.last_action_prior_logit = float(np.clip(float(getattr(cfg, "last_action_prior_logit", 1.5)), 0.0, 5.0))
+    cfg.last_action_absence_prior_logit = float(
+        np.clip(float(getattr(cfg, "last_action_absence_prior_logit", 0.0)), 0.0, 5.0)
+    )
     cfg.mouse_buttons_enabled = bool(cfg.mouse_buttons_enabled)
-    cfg.prev_action_feedback = False
-    cfg.prev_action_feedback_soft = False
+    if cfg.last_action_conditioning:
+        cfg.prev_action_feedback = True
+    cfg.prev_action_feedback_soft = bool(cfg.prev_action_feedback_soft)
+    if cfg.prev_action_feedback_soft:
+        raise ValueError("Soft previous-action feedback is disabled for this architecture.")
     cfg.gru_memory_frames = max(1, int(getattr(cfg, "gru_memory_frames", 80)))
     cfg.num_bin = len(cfg.key_names) + len(cfg.mouse_button_names)
     cfg.button_state_threshold = float(np.clip(float(cfg.button_state_threshold), 0.0, 1.0))
@@ -336,6 +348,8 @@ def _apply_checkpoint_config(cfg: RuntimeConfig, overrides: Dict) -> RuntimeConf
             continue
         if hasattr(cfg, key):
             setattr(cfg, key, value)
+    cfg.prev_action_feedback = bool(overrides.get("last_action_conditioning", False))
+    cfg.prev_action_feedback_soft = False
     cfg = _coerce_config_types(cfg)
     if not checkpoint_has_thresholds:
         derived = _derive_button_thresholds_from_csv(cfg)
@@ -364,7 +378,7 @@ def _raise_incompatible_checkpoint(ckpt_path: str, checkpoint_config: Dict, mode
     if checkpoint_architecture != ARCHITECTURE_VERSION:
         raise RuntimeError(
             f"Checkpoint {ckpt_path!r} uses architecture={checkpoint_architecture!r}, but this runtime requires "
-            f"{ARCHITECTURE_VERSION!r}. The action-conditioned readout was removed; retrain from scratch."
+            f"{ARCHITECTURE_VERSION!r}. Previous-action conditioning changed the model; retrain from scratch."
         )
     if _uses_removed_vector_gru(checkpoint_config, model_state):
         raise RuntimeError(
@@ -381,7 +395,7 @@ def _checkpoint_path(cfg: RuntimeConfig) -> str:
             raise FileNotFoundError(f"Checkpoint not found: {cfg.ckpt_path}")
         return cfg.ckpt_path
 
-    best_path = os.path.join(cfg.ckpt_dir, "model_best.pt")
+    best_path = os.path.join(cfg.ckpt_dir, "model_latest.pt")
     if os.path.exists(best_path):
         return best_path
     latest_path = os.path.join(cfg.ckpt_dir, "model_latest.pt")
@@ -525,7 +539,7 @@ def main() -> None:
         f"d_model={cfg.d_model}",
         "temporal=convgru",
         f"decoder={cfg.action_decoder}",
-        "input=masked_rgb",
+        "input=masked_rgb" + ("+last_action" if cfg.last_action_conditioning else ""),
     )
     print(
         "Button thresholds:",
@@ -540,9 +554,11 @@ def main() -> None:
         f"buttons_enabled={cfg.mouse_buttons_enabled}",
     )
     print(
-        "Runtime previous-action feedback:",
-        "enabled=False",
-        "temporal_context=convgru_only",
+        "Runtime last-action feedback:",
+        f"enabled={cfg.prev_action_feedback}",
+        "mode=hard-applied",
+        f"fusion={cfg.last_action_fusion}",
+        f"residual_cap={float(cfg.last_action_residual_cap):.2f}",
     )
 
     inference_dtype = torch.float32
@@ -557,6 +573,7 @@ def main() -> None:
     )
 
     temporal_state = TemporalState()
+    prev_action = torch.zeros((1, cfg.num_bin), device=device, dtype=inference_dtype)
     was_autopilot = False
 
     print("=" * 60)
@@ -569,10 +586,12 @@ def main() -> None:
 
             if autopilot and not was_autopilot:
                 temporal_state = TemporalState()
+                prev_action = torch.zeros((1, cfg.num_bin), device=device, dtype=inference_dtype)
                 print("Autopilot ENABLED - temporal state reset")
 
             if (not autopilot) and was_autopilot:
                 temporal_state = TemporalState()
+                prev_action = torch.zeros((1, cfg.num_bin), device=device, dtype=inference_dtype)
                 release_all()
                 print("Autopilot DISABLED - temporal state reset")
 
@@ -589,16 +608,26 @@ def main() -> None:
                         output, temporal_state = model.forward_step(
                             frame_batch,
                             temporal_state,
-                            prev_action=None,
+                            prev_action=prev_action if cfg.prev_action_feedback else None,
                         )
                         button_logits = output.button_logits
                     button_probs = torch.sigmoid(button_logits[0])
                     predicted_buttons = (button_probs >= thresholds).to(dtype=button_logits.dtype)
 
-                    controller.apply(
+                    applied_buttons = controller.apply(
                         predicted_buttons,
                         button_probs=button_probs,
                     )
+                    if cfg.prev_action_feedback:
+                        feedback_buttons = button_probs if cfg.prev_action_feedback_soft else applied_buttons
+                        prev_action = feedback_buttons.detach().reshape(1, cfg.num_bin).to(
+                            device=device,
+                            dtype=inference_dtype,
+                        )
+                        if cfg.prev_action_feedback_soft and not cfg.mouse_buttons_enabled:
+                            prev_action[:, len(cfg.key_names) :] = 0.0
+                    else:
+                        prev_action.zero_()
 
                 elapsed = time.perf_counter() - loop_start
                 remaining = float(cfg.decision_interval) - elapsed
