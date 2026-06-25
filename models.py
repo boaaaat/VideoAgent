@@ -693,10 +693,25 @@ class DrivingVideoPolicy(nn.Module):
             fused_frame.size(-1),
             device=fused_frame.device,
             dtype=fused_frame.dtype,
+            high_height=temporal32_frame.size(-2),
+            high_width=temporal32_frame.size(-1),
         )
-        h1 = self._zoneout(self.gru1(fused_frame, hidden_state[0]), hidden_state[0])
-        h2 = self._zoneout(self.gru2(h1, hidden_state[1]), hidden_state[1])
-        return h2, torch.stack((h1, h2), dim=0)
+        h32_prev, h1_prev, h2_prev = self._unpack_temporal_state(
+            hidden_state,
+            fused_frame.size(0),
+            fused_frame.size(-2),
+            fused_frame.size(-1),
+            temporal32_frame.size(-2),
+            temporal32_frame.size(-1),
+        )
+        h32 = self._zoneout(self.gru32(temporal32_frame, h32_prev), h32_prev)
+        h32_down = self.temporal32_to_16(h32)
+        if h32_down.shape[-2:] != fused_frame.shape[-2:]:
+            h32_down = F.interpolate(h32_down, size=fused_frame.shape[-2:], mode="bilinear", align_corners=False)
+        fused16 = self.temporal16_fusion(fused_frame + h32_down)
+        h1 = self._zoneout(self.gru1(fused16, h1_prev), h1_prev)
+        h2 = self._zoneout(self.gru2(h1, h2_prev), h2_prev)
+        return h2, self._pack_temporal_state(h32, h1, h2)
 
     def _pool_features(self, spatial_features: torch.Tensor) -> torch.Tensor:
         if spatial_features.size(1) != READOUT_CHANNELS:
@@ -946,10 +961,18 @@ class DrivingVideoPolicy(nn.Module):
         final_hidden = fused[:, 0]
         hidden_steps = [] if (return_sequence_logits or autoregressive_feedback) else None
         for index in range(steps):
-            final_hidden, hidden = self._temporal_step(fused[:, index], hidden)
+            final_hidden, hidden = self._temporal_step(fused[:, index], temporal32[:, index], hidden)
             if hidden_steps is not None:
                 hidden_steps.append(final_hidden)
         if hidden_steps is None:
+            final_prev_action = prev_action
+            if prev_action is not None and prev_action.dim() == 3:
+                expected = (batch, steps, self.cfg.num_bin)
+                if tuple(prev_action.shape) != expected:
+                    raise ValueError(
+                        f"Expected sequence previous actions {expected}, got {tuple(prev_action.shape)}."
+                    )
+                final_prev_action = prev_action[:, -1]
             final_logits, final_vision_logits = self._readout_logits(
                 fused[:, -1],
                 final_hidden,
@@ -961,6 +984,7 @@ class DrivingVideoPolicy(nn.Module):
             dense_logits = None
             dense_vision_logits = None
         else:
+            hidden_sequence = torch.stack(hidden_steps, dim=1)
             if autoregressive_feedback:
                 dense_logits, dense_vision_logits, next_feedback_action = self._autoregressive_sequence_logits(
                     fused,

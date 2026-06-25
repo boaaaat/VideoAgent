@@ -90,8 +90,6 @@ class TrainConfig(ModelConfig):
     weight_decay: float = 0.03
     grad_clip: float = 1.0
     amp_dtype: str = "bf16"
-    # Full-policy torch.compile has a large startup cost for the recurrent
-    # sequence path, so keep it opt-in for training runs.
     compile_model: bool = True
 
     sync_dataset: bool = True
