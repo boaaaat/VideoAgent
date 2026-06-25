@@ -27,9 +27,7 @@ READOUT_CHANNELS = 128
 DETAIL_CHANNELS = 64
 DEFAULT_SEQUENCE_LENGTH = 80
 DEFAULT_ACTION_NAMES = ("w", "a", "s", "d", "z", "c")
-ARCHITECTURE_VERSION = "fpn_convgru_attention_v17_32x32_temporal"
-DETAIL_INITIAL_RESIDUAL_GATE = 0.10
-TEMPORAL_STATE_LAYERS = 3
+ARCHITECTURE_VERSION = "fpn_convgru_attention_v13_no_action_context"
 
 
 def _as_int(name: str, value: object, minimum: int) -> int:
@@ -596,10 +594,6 @@ class DrivingVideoPolicy(nn.Module):
         final = self.control_head[-1]
         if isinstance(final, nn.Linear):
             nn.init.constant_(final.bias, -1.0)
-        context_final = self.action_context[-1]
-        if isinstance(context_final, nn.Linear):
-            nn.init.zeros_(context_final.weight)
-            nn.init.zeros_(context_final.bias)
         # Preserve the temporal-only policy at initialization. The gate can
         # learn a distinct signed detail residual for every action/channel,
         # but random high-resolution attention cannot damage the base readout.
@@ -874,50 +868,7 @@ class DrivingVideoPolicy(nn.Module):
             return self.control_head(features).squeeze(-1)
         raise ValueError(f"Expected action features [B,6,C] or [B,T,6,C], got {tuple(features.shape)}.")
 
-    def _validate_action_context(
-        self,
-        prev_action: torch.Tensor,
-        action_features: torch.Tensor,
-    ) -> torch.Tensor:
-        expected = tuple(action_features.shape[:-1])
-        if tuple(prev_action.shape) != expected:
-            raise ValueError(
-                "Previous action context must match action-feature batch/time/action dimensions; "
-                f"expected {expected}, got {tuple(prev_action.shape)}."
-            )
-        if prev_action.size(-1) != self.cfg.num_bin:
-            raise ValueError(
-                f"Expected {self.cfg.num_bin} previous-action values, got {prev_action.size(-1)}."
-            )
-        return prev_action.to(device=action_features.device, dtype=action_features.dtype)
-
-    def _fuse_action_context(
-        self,
-        vision_logits: torch.Tensor,
-        action_features: torch.Tensor,
-        prev_action: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        """Apply a bounded, visual-gated one-step action residual."""
-
-        if not self.cfg.last_action_conditioning or prev_action is None:
-            return vision_logits
-        context = self._validate_action_context(prev_action, action_features)
-        residual = self.action_context(context)
-        gate = torch.sigmoid(self.action_context_gate(action_features)).squeeze(-1)
-        cap = float(self.cfg.last_action_residual_cap)
-        return vision_logits + gate * cap * torch.tanh(residual)
-
-    def _action_state_codes(self, action: torch.Tensor) -> torch.Tensor:
-        """Encode one hard six-key state per batch row as an integer lookup key."""
-
-        if action.dim() != 2 or action.size(-1) != self.cfg.num_bin:
-            raise ValueError(
-                f"Expected hard action states [B,{self.cfg.num_bin}], got {tuple(action.shape)}."
-            )
-        bits = self._action_context_bits.to(device=action.device)
-        return ((action >= 0.5).to(dtype=torch.long) * bits.view(1, -1)).sum(dim=-1)
-
-    def _encode_frame(self, frame: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _encode_frame(self, frame: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         pre_stem, _stem, low, mid, deep = self.spatial_encoder(frame)
         fused, detail64, temporal32 = self.fpn(
             pre_stem,
@@ -1124,24 +1075,14 @@ class DrivingVideoPolicy(nn.Module):
             fused.size(-1),
             device=fused.device,
             dtype=fused.dtype,
-            high_height=temporal32.size(-2),
-            high_width=temporal32.size(-1),
         )
-        final_hidden, hidden, hidden_sequence = self._temporal_sequence(
-            fused,
-            temporal32,
-            hidden,
-            return_steps=return_sequence_logits or autoregressive_feedback,
-        )
-        if hidden_sequence is None:
-            final_prev_action = prev_action
-            if prev_action is not None and prev_action.dim() == 3:
-                expected = (batch, steps, self.cfg.num_bin)
-                if tuple(prev_action.shape) != expected:
-                    raise ValueError(
-                        f"Expected sequence previous actions {expected}, got {tuple(prev_action.shape)}."
-                    )
-                final_prev_action = prev_action[:, -1]
+        final_hidden = fused[:, 0]
+        hidden_steps = [] if (return_sequence_logits or autoregressive_feedback) else None
+        for index in range(steps):
+            final_hidden, hidden = self._temporal_step(fused[:, index], hidden)
+            if hidden_steps is not None:
+                hidden_steps.append(final_hidden)
+        if hidden_steps is None:
             final_logits, final_vision_logits = self._readout_logits(
                 fused[:, -1],
                 final_hidden,
