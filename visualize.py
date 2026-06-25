@@ -207,22 +207,21 @@ def _policy_encoder_input(
 def _policy_fpn_features(
     model: DrivingVideoPolicy,
     masked_frame: torch.Tensor,
-) -> Tuple[List[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[List[torch.Tensor], torch.Tensor, torch.Tensor]:
     stages = model.spatial_encoder.feature_stages(masked_frame)
     if len(stages) != 5:
         raise RuntimeError(f"Expected five encoder stages, got {len(stages)}.")
     # Stages are pre_stem@256, stem@128, low@64, mid@32, and deep@16. The FPN
-    # directly fuses pre_stem, low, mid, and deep into the 16x16 ConvGRU map,
-    # the 32x32 recurrent map, and the separate 64x64 current-frame detail map.
-    fused, detail64, temporal32 = model.fpn(
+    # directly fuses pre_stem, low, mid, and deep into the 16x16 ConvGRU map
+    # and the separate 64x64 current-frame detail map.
+    fused, detail64 = model.fpn(
         stages[0],
         stages[2],
         stages[3],
         stages[4],
         return_detail=True,
-        return_temporal32=True,
     )
-    return stages, fused, detail64, temporal32
+    return stages, fused, detail64
 
 
 def _compute_feature_map(
@@ -234,7 +233,7 @@ def _compute_feature_map(
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[TemporalState]]:
     del previous_frame_rgb
     masked_frame, current = _policy_encoder_input(model, frame_rgb)
-    stages, fused, _detail64, temporal32 = _policy_fpn_features(model, masked_frame)
+    stages, fused, _detail64 = _policy_fpn_features(model, masked_frame)
     if layer.startswith("stage"):
         stage_idx = int(layer.removeprefix("stage")) - 1
         if stage_idx < 0 or stage_idx >= len(stages):
@@ -250,10 +249,8 @@ def _compute_feature_map(
             fused.size(-1),
             device=fused.device,
             dtype=fused.dtype,
-            high_height=temporal32.size(-2),
-            high_width=temporal32.size(-1),
         )
-        hidden, next_hidden = model._temporal_step(fused, temporal32, hidden_state)
+        hidden, next_hidden = model._temporal_step(fused, hidden_state)
         return hidden, current, TemporalState(hidden_state=next_hidden.detach())
     raise ValueError(f"Unknown policy layer {layer!r}.")
 
@@ -468,7 +465,7 @@ def _policy_visuals_for_frame(
             masked_frame = model._apply_masks(frame_rgb)
             if masked_frame.is_cuda:
                 masked_frame = masked_frame.contiguous(memory_format=torch.channels_last)
-            stages, fused, detail64, temporal32 = _policy_fpn_features(model, masked_frame)
+            stages, fused, detail64 = _policy_fpn_features(model, masked_frame)
 
             if layer.startswith("stage"):
                 stage_idx = int(layer.removeprefix("stage")) - 1
@@ -491,10 +488,8 @@ def _policy_visuals_for_frame(
                     fused.size(-1),
                     device=fused.device,
                     dtype=fused.dtype,
-                    high_height=temporal32.size(-2),
-                    high_width=temporal32.size(-1),
                 )
-                hidden, next_hidden = model._temporal_step(fused, temporal32, hidden_state)
+                hidden, next_hidden = model._temporal_step(fused, hidden_state)
                 state = TemporalState(hidden_state=next_hidden.detach())
                 if layer == "tokens":
                     feat = hidden

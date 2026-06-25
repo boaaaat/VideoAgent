@@ -378,7 +378,7 @@ def _raise_incompatible_checkpoint(ckpt_path: str, checkpoint_config: Dict, mode
     if checkpoint_architecture != ARCHITECTURE_VERSION:
         raise RuntimeError(
             f"Checkpoint {ckpt_path!r} uses architecture={checkpoint_architecture!r}, but this runtime requires "
-            f"{ARCHITECTURE_VERSION!r}. Previous-action conditioning changed the model; retrain from scratch."
+            f"{ARCHITECTURE_VERSION!r}. Retrain from scratch or choose a compatible checkpoint."
         )
     if _uses_removed_vector_gru(checkpoint_config, model_state):
         raise RuntimeError(

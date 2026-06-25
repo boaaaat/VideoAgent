@@ -1140,8 +1140,7 @@ def print_startup_stats(
         f"architecture={ARCHITECTURE_VERSION}",
         f"parameters={parameter_count / 1_000_000:.4f}M",
         f"input=[B,{cfg.seq_len},3,{cfg.model_size},{cfg.model_size}]",
-        f"temporal=ConvGRU32({FUSED_CHANNELS}x{cfg.model_size // 8}x{cfg.model_size // 8})+"
-        f"2xConvGRU16({FUSED_CHANNELS}x{cfg.model_size // 16}x{cfg.model_size // 16})",
+        f"temporal=2xConvGRU16({FUSED_CHANNELS}x{cfg.model_size // 16}x{cfg.model_size // 16})",
         f"readout=6x{READOUT_CHANNELS}",
     )
     print(
@@ -1241,6 +1240,10 @@ def train(cfg: Optional[TrainConfig] = None) -> None:
     cfg = TrainConfig() if cfg is None else cfg
     if not torch.cuda.is_available():
         raise RuntimeError("DALI GPU video decode requires a CUDA-visible PyTorch device.")
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
     device = torch.device("cuda")
     torch.manual_seed(cfg.split_seed)
     random.seed(cfg.split_seed)
@@ -1285,7 +1288,7 @@ def train(cfg: Optional[TrainConfig] = None) -> None:
     base_model = base_model.to(memory_format=torch.channels_last)
     optimizer = torch.optim.AdamW(base_model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     start_epoch, global_step, best_validation_bce = maybe_resume(base_model, optimizer, cfg, device)
-    model = torch.compile(base_model) if cfg.compile_model else base_model
+    model = torch.compile(base_model, mode="reduce-overhead") if cfg.compile_model else base_model
     amp_dtype = torch.bfloat16 if cfg.amp_dtype == "bf16" else torch.float32
     pos_weight = compute_pos_weight(train_targets.labels, cfg.pos_weight_power, cfg.pos_weight_clamp).to(device)
     parameter_count = sum(parameter.numel() for parameter in base_model.parameters())
