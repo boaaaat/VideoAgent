@@ -27,9 +27,9 @@ READOUT_CHANNELS = 128
 DETAIL_CHANNELS = 64
 DEFAULT_SEQUENCE_LENGTH = 80
 DEFAULT_ACTION_NAMES = ("w", "a", "s", "d", "z", "c")
-ARCHITECTURE_VERSION = "fpn_convgru_attention_v17_32x32_temporal"
+ARCHITECTURE_VERSION = "fpn_convgru_attention_v18_32x32_16x16_temporal"
 DETAIL_INITIAL_RESIDUAL_GATE = 0.10
-TEMPORAL_STATE_LAYERS = 3
+TEMPORAL_STATE_LAYERS = 2
 
 
 def _as_int(name: str, value: object, minimum: int) -> int:
@@ -215,10 +215,10 @@ class PolicyOutput:
 
 @dataclass
 class TemporalState:
-    """Packed ConvGRU state with shape [3, B, FUSED_CHANNELS, H/8, W/8].
+    """Packed ConvGRU state with shape [2, B, FUSED_CHANNELS, H/8, W/8].
 
-    Layer 0 stores the 32x32 recurrent state. Layers 1 and 2 store the 16x16
-    recurrent states in the top-left H/16 x W/16 slice.
+    Layer 0 stores the 32x32 recurrent state. Layer 1 stores the 16x16
+    recurrent state in the top-left H/16 x W/16 slice.
     """
 
     hidden_state: Optional[torch.Tensor] = None
@@ -566,7 +566,6 @@ class DrivingVideoPolicy(nn.Module):
         self.temporal32_to_16 = DepthwiseSeparableConv(FUSED_CHANNELS, FUSED_CHANNELS, stride=2)
         self.temporal16_fusion = LightweightResidualBlock(FUSED_CHANNELS, FUSED_CHANNELS)
         self.gru1 = ConvGRUCell(FUSED_CHANNELS)
-        self.gru2 = ConvGRUCell(FUSED_CHANNELS)
         self.readout_fusion = nn.Sequential(
             ConvNormAct(2 * FUSED_CHANNELS, READOUT_CHANNELS, kernel_size=1),
             DepthwiseSeparableConv(READOUT_CHANNELS, READOUT_CHANNELS),
@@ -662,11 +661,10 @@ class DrivingVideoPolicy(nn.Module):
     def _pack_temporal_state(
         self,
         high32: torch.Tensor,
-        low16_1: torch.Tensor,
-        low16_2: torch.Tensor,
+        low16: torch.Tensor,
     ) -> torch.Tensor:
         batch, _, high_height, high_width = high32.shape
-        _, _, low_height, low_width = low16_1.shape
+        _, _, low_height, low_width = low16.shape
         packed = high32.new_zeros(
             TEMPORAL_STATE_LAYERS,
             batch,
@@ -675,8 +673,7 @@ class DrivingVideoPolicy(nn.Module):
             high_width,
         )
         packed[0] = high32
-        packed[1, :, :, :low_height, :low_width] = low16_1
-        packed[2, :, :, :low_height, :low_width] = low16_2
+        packed[1, :, :, :low_height, :low_width] = low16
         return packed
 
     def _unpack_temporal_state(
@@ -687,7 +684,7 @@ class DrivingVideoPolicy(nn.Module):
         low_width: int,
         high_height: int,
         high_width: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         expected = (
             TEMPORAL_STATE_LAYERS,
             int(batch_size),
@@ -698,9 +695,8 @@ class DrivingVideoPolicy(nn.Module):
         if tuple(hidden_state.shape) != expected:
             raise ValueError(f"Expected temporal state {expected}, got {tuple(hidden_state.shape)}.")
         high32 = hidden_state[0]
-        low16_1 = hidden_state[1, :, :, :low_height, :low_width].contiguous()
-        low16_2 = hidden_state[2, :, :, :low_height, :low_width].contiguous()
-        return high32.contiguous(), low16_1, low16_2
+        low16 = hidden_state[1, :, :, :low_height, :low_width].contiguous()
+        return high32.contiguous(), low16
 
     def _prepare_temporal_state(
         self,
@@ -753,23 +749,6 @@ class DrivingVideoPolicy(nn.Module):
                 high_width=high_width,
             )
             packed[1, :, :, :height, :width] = hidden
-            packed[2, :, :, :height, :width] = hidden
-            return packed
-        if hidden.dim() == 5 and hidden.size(0) == 2:
-            expected_legacy = (2, int(batch_size), FUSED_CHANNELS, int(height), int(width))
-            if tuple(hidden.shape) != expected_legacy:
-                raise ValueError(f"Expected legacy temporal state {expected_legacy}, got {tuple(hidden.shape)}.")
-            packed = self._initial_temporal_state(
-                batch_size,
-                height,
-                width,
-                device=device,
-                dtype=dtype,
-                high_height=high_height,
-                high_width=high_width,
-            )
-            packed[1, :, :, :height, :width] = hidden[0]
-            packed[2, :, :, :height, :width] = hidden[1]
             return packed
         expected = (
             TEMPORAL_STATE_LAYERS,
@@ -779,6 +758,35 @@ class DrivingVideoPolicy(nn.Module):
             int(high_width),
         )
         if tuple(hidden.shape) != expected:
+            if hidden.dim() == 5 and hidden.size(0) == 2:
+                expected_legacy = (2, int(batch_size), FUSED_CHANNELS, int(height), int(width))
+                if tuple(hidden.shape) == expected_legacy:
+                    packed = self._initial_temporal_state(
+                        batch_size,
+                        height,
+                        width,
+                        device=device,
+                        dtype=dtype,
+                        high_height=high_height,
+                        high_width=high_width,
+                    )
+                    packed[1, :, :, :height, :width] = hidden[-1]
+                    return packed
+            if hidden.dim() == 5 and hidden.size(0) == 3:
+                expected_previous = (3, int(batch_size), FUSED_CHANNELS, int(high_height), int(high_width))
+                if tuple(hidden.shape) == expected_previous:
+                    packed = self._initial_temporal_state(
+                        batch_size,
+                        height,
+                        width,
+                        device=device,
+                        dtype=dtype,
+                        high_height=high_height,
+                        high_width=high_width,
+                    )
+                    packed[0] = hidden[0]
+                    packed[1, :, :, :height, :width] = hidden[2, :, :, :height, :width]
+                    return packed
             raise ValueError(f"Expected temporal state {expected}, got {tuple(hidden.shape)}.")
         return hidden
 
@@ -811,7 +819,7 @@ class DrivingVideoPolicy(nn.Module):
             high_height=temporal32_frame.size(-2),
             high_width=temporal32_frame.size(-1),
         )
-        h32_prev, h1_prev, h2_prev = self._unpack_temporal_state(
+        h32_prev, h16_prev = self._unpack_temporal_state(
             hidden_state,
             fused_frame.size(0),
             fused_frame.size(-2),
@@ -824,9 +832,8 @@ class DrivingVideoPolicy(nn.Module):
         if h32_down.shape[-2:] != fused_frame.shape[-2:]:
             h32_down = F.interpolate(h32_down, size=fused_frame.shape[-2:], mode="bilinear", align_corners=False)
         fused16 = self.temporal16_fusion(fused_frame + h32_down)
-        h1 = self._zoneout(self.gru1(fused16, h1_prev), h1_prev)
-        h2 = self._zoneout(self.gru2(h1, h2_prev), h2_prev)
-        return h2, self._pack_temporal_state(h32, h1, h2)
+        h16 = self._zoneout(self.gru1(fused16, h16_prev), h16_prev)
+        return h16, self._pack_temporal_state(h32, h16)
 
     def _temporal_sequence(
         self,
@@ -854,7 +861,7 @@ class DrivingVideoPolicy(nn.Module):
 
         batch, steps, _, height, width = fused.shape
         high_height, high_width = temporal32.shape[-2:]
-        h32, h1, h2 = self._unpack_temporal_state(
+        h32, h16 = self._unpack_temporal_state(
             hidden_state,
             batch,
             height,
@@ -869,12 +876,11 @@ class DrivingVideoPolicy(nn.Module):
             if h32_down.shape[-2:] != fused.shape[-2:]:
                 h32_down = F.interpolate(h32_down, size=fused.shape[-2:], mode="bilinear", align_corners=False)
             fused16 = self.temporal16_fusion(fused[:, index] + h32_down)
-            h1 = self._zoneout(self.gru1(fused16, h1), h1)
-            h2 = self._zoneout(self.gru2(h1, h2), h2)
+            h16 = self._zoneout(self.gru1(fused16, h16), h16)
             if step_outputs is not None:
-                step_outputs.append(h2)
+                step_outputs.append(h16)
         hidden_sequence = torch.stack(step_outputs, dim=1) if step_outputs is not None else None
-        return h2, self._pack_temporal_state(h32, h1, h2), hidden_sequence
+        return h16, self._pack_temporal_state(h32, h16), hidden_sequence
 
     def _pool_features(self, spatial_features: torch.Tensor) -> torch.Tensor:
         if spatial_features.size(1) != READOUT_CHANNELS:
