@@ -1,9 +1,9 @@
-"""Stateful DALI trainer for the dense-supervision FPN + ConvGRU driving policy.
+"""DALI trainer for the dense-supervision CNN latent transformer policy.
 
 The DALI pipeline owns GPU video decode and resize. CSV labels are parsed once
 on the host, then joined to decoded 80-frame windows through the DALI sample
-label written into the file list. Stateful mode processes complete videos as
-contiguous chunks and detaches the ConvGRU state at every chunk boundary.
+label written into the file list. Each window is an independent causal
+transformer context with shifted previous-action tokens.
 """
 
 from __future__ import annotations
@@ -11,7 +11,6 @@ from __future__ import annotations
 import argparse
 import csv
 import glob
-import hashlib
 import math
 import os
 import random
@@ -36,11 +35,13 @@ from augmentations import augment_frames
 from models import (
     ARCHITECTURE_VERSION,
     FUSED_CHANNELS,
+    NUM_VISUAL_TOKENS,
     READOUT_CHANNELS,
+    TEMPORAL_HEADS,
+    TEMPORAL_LAYERS,
+    TOKENS_PER_STEP,
     DrivingVideoPolicy,
     ModelConfig,
-    PolicyOutput,
-    TemporalState,
 )
 
 
@@ -76,8 +77,6 @@ class TrainConfig(ModelConfig):
     train_seq_stride: int = 80
     val_seq_stride: int = 80
     action_offset: int = 1
-    streaming_state_training: bool = True
-    streaming_state_validation: bool = True
     dense_temporal_supervision: bool = True
 
     batch_size: int = 1
@@ -90,8 +89,6 @@ class TrainConfig(ModelConfig):
     weight_decay: float = 0.03
     grad_clip: float = 1.0
     amp_dtype: str = "bf16"
-    # Full-policy torch.compile has a large startup cost for the recurrent
-    # sequence path, so keep it opt-in for training runs.
     compile_model: bool = True
 
     sync_dataset: bool = True
@@ -107,8 +104,13 @@ class TrainConfig(ModelConfig):
     pos_weight_clamp: float = 8.0
     conflict_penalty_weight: float = 0.20
     vision_aux_loss_weight: float = 0.50
-    autoregressive_feedback_stream_prob: float = 0.25
-    recorded_feedback_stream_prob: float = 0.75
+    # Drop full previous-action tokens during teacher forcing so the causal
+    # transformer cannot solve the task by copying action persistence alone.
+    action_token_dropout_prob: float = 0.10
+    # Optional closed-loop scheduled sampling over independent 80-frame windows.
+    # It is expensive and can trigger a separate torch.compile graph, so keep it
+    # opt-in while action-token dropout provides the default regularization.
+    autoregressive_feedback_prob: float = 0.0
     fit_thresholds_from_val: bool = True
     threshold_min: float = 0.10
     threshold_max: float = 0.90
@@ -166,25 +168,16 @@ class TrainConfig(ModelConfig):
             "conflict_penalty_weight", self.conflict_penalty_weight, 0.0
         )
         self.vision_aux_loss_weight = _finite_float("vision_aux_loss_weight", self.vision_aux_loss_weight, 0.0)
-        self.autoregressive_feedback_stream_prob = _finite_float(
-            "autoregressive_feedback_stream_prob", self.autoregressive_feedback_stream_prob, 0.0, 1.0
+        self.action_token_dropout_prob = _finite_float(
+            "action_token_dropout_prob", self.action_token_dropout_prob, 0.0, 1.0
         )
-        self.recorded_feedback_stream_prob = _finite_float(
-            "recorded_feedback_stream_prob", self.recorded_feedback_stream_prob, 0.0, 1.0
+        self.autoregressive_feedback_prob = _finite_float(
+            "autoregressive_feedback_prob", self.autoregressive_feedback_prob, 0.0, 1.0
         )
         if not self.last_action_conditioning:
             self.vision_aux_loss_weight = 0.0
-            self.autoregressive_feedback_stream_prob = 0.0
-            self.recorded_feedback_stream_prob = 0.0
-        else:
-            feedback_probability = (
-                self.autoregressive_feedback_stream_prob + self.recorded_feedback_stream_prob
-            )
-            if not math.isclose(feedback_probability, 1.0, rel_tol=0.0, abs_tol=1e-8):
-                raise ValueError(
-                    "autoregressive_feedback_stream_prob and recorded_feedback_stream_prob must sum to 1.0, "
-                    f"got {feedback_probability:.6f}."
-                )
+            self.action_token_dropout_prob = 0.0
+            self.autoregressive_feedback_prob = 0.0
         self.threshold_min = _finite_float("threshold_min", self.threshold_min, 0.0, 1.0)
         self.threshold_max = _finite_float("threshold_max", self.threshold_max, 0.0, 1.0)
         if self.threshold_max < self.threshold_min:
@@ -195,14 +188,6 @@ class TrainConfig(ModelConfig):
         self.compile_model = bool(self.compile_model)
         self.sync_dataset = bool(self.sync_dataset)
         self.fit_thresholds_from_val = bool(self.fit_thresholds_from_val)
-        self.streaming_state_training = bool(self.streaming_state_training)
-        self.streaming_state_validation = bool(self.streaming_state_validation)
-        if self.last_action_conditioning and (
-            not self.streaming_state_training or not self.streaming_state_validation
-        ):
-            raise ValueError(
-                "Previous-action conditioning requires streaming state for both training and validation."
-            )
         if not bool(self.dense_temporal_supervision):
             raise ValueError("This trainer requires dense_temporal_supervision=True.")
         self.dense_temporal_supervision = True
@@ -241,24 +226,6 @@ class TrainConfig(ModelConfig):
         self.dali_dont_use_mmap = bool(self.dali_dont_use_mmap)
         self.dali_shuffle_seed = int(self.dali_shuffle_seed)
         self.split_seed = int(self.split_seed)
-        if self.streaming_state_training:
-            if self.batch_size != 1:
-                raise ValueError("streaming_state_training requires batch_size=1.")
-            if self.train_seq_stride != self.seq_len:
-                raise ValueError(
-                    "streaming_state_training requires train_seq_stride to equal seq_len "
-                    f"({self.seq_len}), got {self.train_seq_stride}."
-                )
-            self.dali_train_random_shuffle = False
-        if self.streaming_state_validation:
-            if self.batch_size != 1:
-                raise ValueError("streaming_state_validation requires batch_size=1.")
-            if self.val_seq_stride != self.seq_len:
-                raise ValueError(
-                    "streaming_state_validation requires val_seq_stride to equal seq_len "
-                    f"({self.seq_len}), got {self.val_seq_stride}."
-                )
-            self.dali_val_random_shuffle = False
 
         if (self.train_data_root is None) != (self.val_data_root is None):
             raise ValueError("train_data_root and val_data_root must be supplied together.")
@@ -270,12 +237,8 @@ class TrainConfig(ModelConfig):
         self.print_every = _positive_int("print_every", self.print_every)
         if self.max_train_batches is not None:
             self.max_train_batches = _positive_int("max_train_batches", self.max_train_batches)
-            if self.streaming_state_training:
-                raise ValueError("max_train_batches is incompatible with complete-video streaming training.")
         if self.max_val_batches is not None:
             self.max_val_batches = _positive_int("max_val_batches", self.max_val_batches)
-            if self.streaming_state_validation:
-                raise ValueError("max_val_batches is incompatible with complete-video streaming validation.")
         self.ckpt_dir = os.path.abspath(self.ckpt_dir)
 
 
@@ -530,8 +493,8 @@ def build_window_targets(
             label_windows.append(labels[target_start:target_end])
             # The target at timestep t is labels[start + t + action_offset].
             # Teacher-forced previous action is the immediately preceding
-            # target, labels[start + t + action_offset - 1], matching runtime
-            # autoregressive feedback at chunk boundaries.
+            # target, labels[start + t + action_offset - 1], matching the
+            # transformer's shifted-right action-token contract.
             previous_start = start + action_offset - 1
             previous = labels[previous_start : previous_start + int(cfg.seq_len)]
             previous_action_windows.append(previous)
@@ -545,52 +508,6 @@ def build_window_targets(
         previous_actions=torch.stack(previous_action_windows, dim=0),
         meta=meta,
     )
-
-
-def video_streams(meta: Sequence[WindowMeta]) -> List[List[int]]:
-    """Return sorted, contiguous window-index streams, one stream per video."""
-
-    by_video: Dict[str, List[int]] = {}
-    for index, item in enumerate(meta):
-        by_video.setdefault(item.video_path, []).append(index)
-
-    streams: List[List[int]] = []
-    for video_path in sorted(by_video):
-        indices = sorted(by_video[video_path], key=lambda index: meta[index].start_frame)
-        if not indices:
-            continue
-        first = meta[indices[0]]
-        if first.start_frame != 0:
-            raise RuntimeError(
-                f"Streaming video {video_path!r} must begin at frame 0, got {first.start_frame}."
-            )
-        for previous_index, current_index in zip(indices, indices[1:]):
-            previous = meta[previous_index]
-            current = meta[current_index]
-            if current.start_frame != previous.end_frame:
-                raise RuntimeError(
-                    "Streaming windows must be contiguous: "
-                    f"{video_path!r} has [{previous.start_frame}, {previous.end_frame}) followed by "
-                    f"[{current.start_frame}, {current.end_frame})."
-                )
-        streams.append(indices)
-    if not streams:
-        raise RuntimeError("No video streams were built from the training windows.")
-    return streams
-
-
-def streaming_window_order(
-    meta: Sequence[WindowMeta],
-    *,
-    seed: int,
-    shuffle_streams: bool,
-) -> List[int]:
-    """Shuffle complete video streams while preserving order inside every run."""
-
-    streams = video_streams(meta)
-    if shuffle_streams:
-        random.Random(int(seed)).shuffle(streams)
-    return [index for stream in streams for index in stream]
 
 
 def write_window_file_list(
@@ -663,12 +580,13 @@ def make_dali_iterator(
     batch_size: int,
     random_shuffle: bool,
     last_batch_policy,
+    seed: Optional[int] = None,
 ):
     pipeline = video_window_pipeline(
         batch_size=int(batch_size),
         num_threads=int(cfg.dali_num_threads),
         device_id=0,
-        seed=int(cfg.dali_shuffle_seed),
+        seed=int(cfg.dali_shuffle_seed if seed is None else seed),
         file_list=file_list,
         seq_len=int(cfg.seq_len),
         resize_size=int(cfg.model_size),
@@ -781,69 +699,36 @@ def print_metric_rows(prefix: str, rows: Iterable[Dict[str, float | str | int]])
         )
 
 
-@dataclass
-class StreamingStateEntry:
-    next_frame: int
-    temporal_state: TemporalState
-    feedback_mode: str
-    feedback_action: Optional[torch.Tensor] = None
-
-
-StreamingStateCache = Dict[str, StreamingStateEntry]
-
-
-def stream_feedback_mode(item: WindowMeta, *, epoch_index: int, cfg: TrainConfig) -> str:
-    """Pick one feedback distribution for a full stream, reproducibly per epoch."""
-
-    source = f"{cfg.dali_shuffle_seed}:{epoch_index}:{item.video_path}:action-feedback".encode("utf-8")
-    value = int.from_bytes(hashlib.sha256(source).digest()[:8], "little") / float(2**64)
-    return "autoregressive" if value < float(cfg.autoregressive_feedback_stream_prob) else "recorded"
-
-
-def stream_initial_state(
-    sample_ids: Sequence[int],
-    targets: WindowTargets,
-    cache: StreamingStateCache,
-) -> Tuple[Optional[StreamingStateEntry], WindowMeta, bool]:
-    """Return the state for the next contiguous chunk and whether it was carried."""
-
-    if len(sample_ids) != 1:
-        raise RuntimeError(
-            "Stateful ConvGRU training requires one DALI sample per batch; "
-            f"received {len(sample_ids)}."
-        )
-    item = targets.meta[int(sample_ids[0])]
-    cached = cache.get(item.video_path)
-    if cached is None:
-        if item.start_frame != 0:
-            raise RuntimeError(
-                f"Streaming state for {item.video_path!r} is missing before frame {item.start_frame}; "
-                "DALI window order is not a complete video stream."
-            )
-        return None, item, False
-
-    if item.start_frame != cached.next_frame:
-        raise RuntimeError(
-            f"Non-contiguous DALI stream for {item.video_path!r}: "
-            f"expected frame {cached.next_frame}, got {item.start_frame}."
-        )
-    return cached, item, True
-
-
-def stream_augmentation_generator(
-    item: WindowMeta,
-    *,
-    epoch_index: int,
+def apply_action_token_dropout(
+    previous_actions: torch.Tensor,
     cfg: TrainConfig,
-    device: torch.device,
-) -> torch.Generator:
-    """Return the same transform seed for every chunk in one video/epoch."""
+    *,
+    training: bool,
+) -> Tuple[torch.Tensor, float]:
+    """Randomly zero complete previous-action tokens during teacher forcing."""
 
-    source = f"{cfg.dali_shuffle_seed}:{epoch_index}:{item.video_path}".encode("utf-8")
-    seed = int.from_bytes(hashlib.sha256(source).digest()[:8], "little") % (2**63 - 1)
-    generator = torch.Generator(device=device)
-    generator.manual_seed(seed)
-    return generator
+    probability = float(cfg.action_token_dropout_prob)
+    if not training or probability <= 0.0:
+        return previous_actions, 0.0
+    if previous_actions.dim() != 3:
+        raise ValueError(f"Expected previous actions [B,T,A], got {tuple(previous_actions.shape)}.")
+    keep = torch.rand(
+        previous_actions.size(0),
+        previous_actions.size(1),
+        1,
+        device=previous_actions.device,
+    ) >= probability
+    # Preserve the first action token so each independent window still has a
+    # truthful initial controller state.
+    keep[:, 0] = True
+    dropped = 1.0 - float(keep.float().mean().item())
+    return previous_actions * keep.to(dtype=previous_actions.dtype), dropped
+
+
+def use_autoregressive_feedback(*, training: bool, cfg: TrainConfig) -> bool:
+    if not training or float(cfg.autoregressive_feedback_prob) <= 0.0:
+        return False
+    return random.random() < float(cfg.autoregressive_feedback_prob)
 
 
 def run_epoch(
@@ -860,8 +745,6 @@ def run_epoch(
     total_steps: int,
     global_step: int,
     description: str,
-    streaming_state: bool,
-    epoch_index: int,
 ) -> Tuple[Dict[str, object], int]:
     training = optimizer is not None
     model.train(training)
@@ -878,82 +761,45 @@ def run_epoch(
     thresholds = threshold_tensor(cfg, device=device)
     progress = tqdm(range(num_batches), desc=description, dynamic_ncols=True)
     iterator_it = iter(iterator)
-    state_cache: StreamingStateCache = {}
-    stream_resets = 0
-    stream_carried = 0
-    stream_total = 0
+    autoregressive_batches = 0
+    action_dropout_sum = 0.0
 
     for batch_index in progress:
-        frames, labels, previous_actions, sample_ids = load_batch(
+        frames, labels, previous_actions, _sample_ids = load_batch(
             iterator_it,
             targets,
             device=device,
             amp_dtype=amp_dtype,
         )
-        initial_state: Optional[TemporalState] = None
-        stream_item: Optional[WindowMeta] = None
-        stream_entry: Optional[StreamingStateEntry] = None
-        feedback_mode = "autoregressive"
-        feedback_action: Optional[torch.Tensor] = None
-        carried = False
-        if streaming_state:
-            stream_entry, stream_item, carried = stream_initial_state(sample_ids, targets, state_cache)
-            if stream_entry is not None:
-                initial_state = stream_entry.temporal_state
-                feedback_mode = stream_entry.feedback_mode
-                feedback_action = stream_entry.feedback_action
-            elif stream_item is not None:
-                feedback_mode = "autoregressive" if not training else stream_feedback_mode(
-                    stream_item,
-                    epoch_index=epoch_index,
-                    cfg=cfg,
-                )
-            stream_total += 1
-            stream_carried += int(carried)
-            stream_resets += int(not carried)
         if training:
-            generator = (
-                stream_augmentation_generator(
-                    stream_item,
-                    epoch_index=epoch_index,
-                    cfg=cfg,
-                    device=frames.device,
-                )
-                if streaming_state and stream_item is not None
-                else None
-            )
-            frames = augment_frames(frames, cfg, same_over_time=True, generator=generator)
+            frames = augment_frames(frames, cfg, same_over_time=True)
         with torch.set_grad_enabled(training):
             with torch.amp.autocast(
                 device_type="cuda",
                 dtype=amp_dtype,
                 enabled=amp_dtype == torch.bfloat16,
             ):
-                if streaming_state:
-                    use_autoregressive_feedback = feedback_mode == "autoregressive"
-                    model_prev_action = feedback_action if use_autoregressive_feedback else previous_actions
-                    output, next_state = model(
-                        frames,
-                        state=initial_state,
-                        return_aux=True,
-                        return_sequence_logits=True,
-                        prev_action=model_prev_action,
-                        feedback_thresholds=thresholds,
-                        autoregressive_feedback=use_autoregressive_feedback,
-                    )
-                    if stream_item is None:
-                        raise RuntimeError("Streaming state metadata was not resolved.")
-                    state_cache[stream_item.video_path] = StreamingStateEntry(
-                        next_frame=stream_item.end_frame,
-                        temporal_state=next_state,
-                        feedback_mode=feedback_mode,
-                        feedback_action=output.next_feedback_action if use_autoregressive_feedback else None,
-                    )
-                else:
+                closed_loop = use_autoregressive_feedback(training=training, cfg=cfg)
+                if closed_loop:
+                    autoregressive_batches += 1
                     output = model(
                         frames,
                         return_sequence_logits=True,
-                        prev_action=previous_actions,
+                        prev_action=previous_actions[:, 0],
+                        feedback_thresholds=thresholds,
+                        autoregressive_feedback=True,
+                    )
+                else:
+                    model_prev_actions, action_dropout = apply_action_token_dropout(
+                        previous_actions,
+                        cfg,
+                        training=training,
+                    )
+                    action_dropout_sum += action_dropout
+                    output = model(
+                        frames,
+                        return_sequence_logits=True,
+                        prev_action=model_prev_actions,
                     )
                 logits = output.sequence_button_logits
                 vision_logits = output.sequence_vision_button_logits
@@ -1019,7 +865,8 @@ def run_epoch(
                 conflict=f"{conflict_loss_sum / float(batch_index + 1):.4f}",
                 f1=f"{stats.macro_f1():.3f}",
                 vision_f1=f"{vision_stats.macro_f1():.3f}",
-                carry=f"{stream_carried / max(1, stream_total):.3f}" if streaming_state else "n/a",
+                action_drop=f"{action_dropout_sum / float(batch_index + 1):.3f}",
+                closed_loop=f"{autoregressive_batches}/{batch_index + 1}",
             )
     iterator.reset()
 
@@ -1032,12 +879,9 @@ def run_epoch(
         "rows": stats.rows(cfg.key_names),
         "vision_macro_f1": vision_stats.macro_f1(),
         "vision_rows": vision_stats.rows(cfg.key_names),
+        "action_token_dropout_rate": action_dropout_sum / max(1, num_batches),
+        "autoregressive_batches": autoregressive_batches,
     }
-    if streaming_state:
-        metrics["stream_chunks"] = stream_total
-        metrics["stream_resets"] = stream_resets
-        metrics["stream_carried"] = stream_carried
-        metrics["stream_carry_rate"] = stream_carried / max(1, stream_total)
     if fitter is not None:
         fitted_thresholds = fitter.fit(cfg.threshold_min, cfg.threshold_max, cfg.num_bin)
         calibrated_stats = fitter.statistics(fitted_thresholds, cfg.num_bin)
@@ -1140,9 +984,10 @@ def print_startup_stats(
         f"architecture={ARCHITECTURE_VERSION}",
         f"parameters={parameter_count / 1_000_000:.4f}M",
         f"input=[B,{cfg.seq_len},3,{cfg.model_size},{cfg.model_size}]",
-        f"temporal=ConvGRU32({FUSED_CHANNELS}x{cfg.model_size // 8}x{cfg.model_size // 8})+"
-        f"ConvGRU16({FUSED_CHANNELS}x{cfg.model_size // 16}x{cfg.model_size // 16})",
-        f"readout=6x{READOUT_CHANNELS}",
+        f"frame_fusion={FUSED_CHANNELS}x64x64",
+        f"tokens={cfg.seq_len}x{TOKENS_PER_STEP}={cfg.seq_len * TOKENS_PER_STEP}",
+        f"visual_tokens_per_frame={NUM_VISUAL_TOKENS}",
+        f"transformer={TEMPORAL_LAYERS}x{READOUT_CHANNELS}/heads={TEMPORAL_HEADS}",
     )
     print(
         "  Actions:",
@@ -1193,20 +1038,11 @@ def print_startup_stats(
         f"train_shuffle={cfg.dali_train_random_shuffle}",
     )
     print(
-        "  Streaming:",
-        f"train={cfg.streaming_state_training}",
-        f"validation={cfg.streaming_state_validation}",
-        f"chunk_stride={cfg.seq_len}",
-        "state=detached_at_chunk_boundary",
-        "stream_order=shuffled_videos/ordered_chunks"
-        if cfg.streaming_state_training
-        else "stream_order=fresh_windows",
-    )
-    print(
         "  Supervision:",
         f"dense_causal={cfg.dense_temporal_supervision}",
         f"targets_per_window={cfg.seq_len}",
         f"action_offset=+{int(cfg.action_offset)}",
+        "window_state=independent_transformer_context",
     )
     print(
         "  Loss:",
@@ -1219,10 +1055,10 @@ def print_startup_stats(
     print(
         "  Previous action:",
         f"conditioning={cfg.last_action_conditioning}",
-        f"residual_cap={cfg.last_action_residual_cap:.3f}",
-        f"train=ground_truth:{cfg.recorded_feedback_stream_prob:.2f}/"
-        f"autoregressive:{cfg.autoregressive_feedback_stream_prob:.2f}",
-        "validation=autoregressive",
+        f"teacher_forcing={1.0 - float(cfg.autoregressive_feedback_prob):.2f}",
+        f"closed_loop_train={float(cfg.autoregressive_feedback_prob):.2f}",
+        f"token_dropout={float(cfg.action_token_dropout_prob):.3f}",
+        "validation=teacher_forced",
     )
     print(
         "  Train class stats:",
@@ -1242,6 +1078,10 @@ def train(cfg: Optional[TrainConfig] = None) -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("DALI GPU video decode requires a CUDA-visible PyTorch device.")
     device = torch.device("cuda")
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+    torch.set_float32_matmul_precision("high")
     torch.manual_seed(cfg.split_seed)
     random.seed(cfg.split_seed)
     os.makedirs(cfg.ckpt_dir, exist_ok=True)
@@ -1252,19 +1092,11 @@ def train(cfg: Optional[TrainConfig] = None) -> None:
     val_targets = build_window_targets(val_pairs, cfg, stride=cfg.val_seq_stride)
     train_file_list = os.path.join(cfg.ckpt_dir, "train_windows.txt")
     val_file_list = os.path.join(cfg.ckpt_dir, "val_windows.txt")
-    val_order = (
-        streaming_window_order(
-            val_targets.meta,
-            seed=cfg.dali_shuffle_seed,
-            shuffle_streams=False,
-        )
-        if cfg.streaming_state_validation
-        else list(range(len(val_targets.meta)))
-    )
-    write_window_file_list(val_targets.meta, val_file_list, indices=val_order)
+    write_window_file_list(train_targets.meta, train_file_list)
+    write_window_file_list(val_targets.meta, val_file_list)
 
     train_batches = _batch_count(train_targets, cfg.batch_size, partial=False)
-    val_batch_size = 1 if cfg.streaming_state_validation else min(cfg.batch_size, len(val_targets.meta))
+    val_batch_size = min(cfg.batch_size, len(val_targets.meta))
     val_batches = _batch_count(val_targets, val_batch_size, partial=True)
     if cfg.max_train_batches is not None:
         train_batches = min(train_batches, cfg.max_train_batches)
@@ -1283,7 +1115,15 @@ def train(cfg: Optional[TrainConfig] = None) -> None:
 
     base_model: torch.nn.Module = DrivingVideoPolicy(cfg).to(device)
     base_model = base_model.to(memory_format=torch.channels_last)
-    optimizer = torch.optim.AdamW(base_model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    try:
+        optimizer = torch.optim.AdamW(
+            base_model.parameters(),
+            lr=cfg.lr,
+            weight_decay=cfg.weight_decay,
+            fused=True,
+        )
+    except (RuntimeError, TypeError):
+        optimizer = torch.optim.AdamW(base_model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     start_epoch, global_step, best_validation_bce = maybe_resume(base_model, optimizer, cfg, device)
     model = torch.compile(base_model) if cfg.compile_model else base_model
     amp_dtype = torch.bfloat16 if cfg.amp_dtype == "bf16" else torch.float32
@@ -1303,22 +1143,13 @@ def train(cfg: Optional[TrainConfig] = None) -> None:
     total_steps = max(1, int(math.ceil(train_batches / float(cfg.grad_accum))) * cfg.num_epochs)
 
     for epoch in range(start_epoch, cfg.num_epochs):
-        train_order = (
-            streaming_window_order(
-                train_targets.meta,
-                seed=cfg.dali_shuffle_seed + epoch,
-                shuffle_streams=True,
-            )
-            if cfg.streaming_state_training
-            else list(range(len(train_targets.meta)))
-        )
-        write_window_file_list(train_targets.meta, train_file_list, indices=train_order)
         train_iterator = make_dali_iterator(
             train_file_list,
             cfg,
             batch_size=cfg.batch_size,
             random_shuffle=cfg.dali_train_random_shuffle,
             last_batch_policy=LastBatchPolicy.DROP,
+            seed=cfg.dali_shuffle_seed + epoch,
         )
         train_metrics, global_step = run_epoch(
             model=model,
@@ -1333,8 +1164,6 @@ def train(cfg: Optional[TrainConfig] = None) -> None:
             total_steps=total_steps,
             global_step=global_step,
             description=f"Epoch {epoch + 1}/{cfg.num_epochs} train",
-            streaming_state=cfg.streaming_state_training,
-            epoch_index=epoch,
         )
         del train_iterator
         with torch.inference_mode():
@@ -1351,8 +1180,6 @@ def train(cfg: Optional[TrainConfig] = None) -> None:
                 total_steps=total_steps,
                 global_step=global_step,
                 description=f"Epoch {epoch + 1}/{cfg.num_epochs} val",
-                streaming_state=cfg.streaming_state_validation,
-                epoch_index=epoch,
             )
 
         fitted = val_metrics.get("fitted_thresholds")
@@ -1369,16 +1196,12 @@ def train(cfg: Optional[TrainConfig] = None) -> None:
             f"train_conflict={float(train_metrics['conflict_penalty']):.4f} "
             f"train_f1={float(train_metrics['macro_f1']):.4f} "
             f"train_vision_f1={float(train_metrics['vision_macro_f1']):.4f} "
-            f"train_stream={int(train_metrics.get('stream_resets', 0))}reset/"
-            f"{int(train_metrics.get('stream_carried', 0))}carried/"
-            f"{float(train_metrics.get('stream_carry_rate', 0.0)):.3f} "
+            f"train_action_drop={float(train_metrics['action_token_dropout_rate']):.3f} "
+            f"train_closed_loop={int(train_metrics['autoregressive_batches'])} "
             f"val_loss={float(val_metrics['loss']):.4f} "
             f"val_conflict={float(val_metrics['conflict_penalty']):.4f} "
             f"val_f1={score:.4f} "
-            f"val_vision_f1={float(val_metrics['vision_macro_f1']):.4f} "
-            f"val_stream={int(val_metrics.get('stream_resets', 0))}reset/"
-            f"{int(val_metrics.get('stream_carried', 0))}carried/"
-            f"{float(val_metrics.get('stream_carry_rate', 0.0)):.3f}"
+            f"val_vision_f1={float(val_metrics['vision_macro_f1']):.4f}"
         )
         print(
             f"Validation best_bce={best_validation_bce:.4f} "
@@ -1407,7 +1230,7 @@ def train(cfg: Optional[TrainConfig] = None) -> None:
 
 
 def parse_args() -> TrainConfig:
-    parser = argparse.ArgumentParser(description="Train the six-action FPN/ConvGRU driving policy with DALI.")
+    parser = argparse.ArgumentParser(description="Train the six-action CNN latent transformer driving policy with DALI.")
     add = parser.add_argument
     add("--data-root", default=None)
     add("--train-data-root", default=None)
@@ -1424,10 +1247,6 @@ def parse_args() -> TrainConfig:
     add("--seq-len", type=int, default=None)
     add("--train-seq-stride", type=int, default=None)
     add("--val-seq-stride", type=int, default=None)
-    add("--streaming-state-training", dest="streaming_state_training", action="store_true", default=None)
-    add("--no-streaming-state-training", dest="streaming_state_training", action="store_false")
-    add("--streaming-state-validation", dest="streaming_state_validation", action="store_true", default=None)
-    add("--no-streaming-state-validation", dest="streaming_state_validation", action="store_false")
     add(
         "--action-offset",
         "--prediction-horizon",
@@ -1447,9 +1266,8 @@ def parse_args() -> TrainConfig:
     add("--pos-weight-clamp", type=float, default=None)
     add("--conflict-penalty-weight", type=float, default=None)
     add("--vision-aux-loss-weight", type=float, default=None)
-    add("--last-action-residual-cap", type=float, default=None)
-    add("--autoregressive-feedback-stream-prob", type=float, default=None)
-    add("--recorded-feedback-stream-prob", type=float, default=None)
+    add("--action-token-dropout-prob", type=float, default=None)
+    add("--autoregressive-feedback-prob", type=float, default=None)
     add("--threshold-min", type=float, default=None)
     add("--threshold-max", type=float, default=None)
     add("--fit-thresholds-from-val", dest="fit_thresholds_from_val", action="store_true", default=None)
