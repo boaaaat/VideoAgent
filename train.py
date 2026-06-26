@@ -90,15 +90,21 @@ class TrainConfig(ModelConfig):
     weight_decay: float = 0.03
     grad_clip: float = 1.0
     amp_dtype: str = "bf16"
+    # Full-policy torch.compile has a large startup cost for the recurrent
+    # sequence path, so keep it opt-in for training runs.
     compile_model: bool = True
 
+    sync_dataset: bool = True
     train_data_root: Optional[str] = None
     val_data_root: Optional[str] = None
     train_split: float = 0.9
     split_seed: int = 1337
 
-    pos_weight_power: float = 0.6
-    pos_weight_clamp: float = 25.0
+    # Keep rare controls visible without letting a handful of false positives
+    # dominate the objective.  The previous 25x cap made z/c calibration very
+    # unstable and encouraged the low-precision predictions seen in validation.
+    pos_weight_power: float = 0.5
+    pos_weight_clamp: float = 8.0
     conflict_penalty_weight: float = 0.20
     vision_aux_loss_weight: float = 0.50
     autoregressive_feedback_stream_prob: float = 0.25
@@ -166,14 +172,19 @@ class TrainConfig(ModelConfig):
         self.recorded_feedback_stream_prob = _finite_float(
             "recorded_feedback_stream_prob", self.recorded_feedback_stream_prob, 0.0, 1.0
         )
-        feedback_probability = (
-            self.autoregressive_feedback_stream_prob + self.recorded_feedback_stream_prob
-        )
-        if not math.isclose(feedback_probability, 1.0, rel_tol=0.0, abs_tol=1e-8):
-            raise ValueError(
-                "autoregressive_feedback_stream_prob and recorded_feedback_stream_prob must sum to 1.0, "
-                f"got {feedback_probability:.6f}."
+        if not self.last_action_conditioning:
+            self.vision_aux_loss_weight = 0.0
+            self.autoregressive_feedback_stream_prob = 0.0
+            self.recorded_feedback_stream_prob = 0.0
+        else:
+            feedback_probability = (
+                self.autoregressive_feedback_stream_prob + self.recorded_feedback_stream_prob
             )
+            if not math.isclose(feedback_probability, 1.0, rel_tol=0.0, abs_tol=1e-8):
+                raise ValueError(
+                    "autoregressive_feedback_stream_prob and recorded_feedback_stream_prob must sum to 1.0, "
+                    f"got {feedback_probability:.6f}."
+                )
         self.threshold_min = _finite_float("threshold_min", self.threshold_min, 0.0, 1.0)
         self.threshold_max = _finite_float("threshold_max", self.threshold_max, 0.0, 1.0)
         if self.threshold_max < self.threshold_min:
@@ -182,6 +193,7 @@ class TrainConfig(ModelConfig):
         if self.amp_dtype not in {"bf16", "fp32", "float32"}:
             raise ValueError("amp_dtype must be bf16 or fp32.")
         self.compile_model = bool(self.compile_model)
+        self.sync_dataset = bool(self.sync_dataset)
         self.fit_thresholds_from_val = bool(self.fit_thresholds_from_val)
         self.streaming_state_training = bool(self.streaming_state_training)
         self.streaming_state_validation = bool(self.streaming_state_validation)
@@ -356,6 +368,20 @@ class ThresholdFitter:
             fitted.append(float(candidates[int(f1.argmax().item())].item()))
         return tuple(fitted)
 
+    def statistics(self, thresholds: Sequence[float], num_actions: int) -> BinaryStats:
+        """Evaluate the collected validation set using its fitted thresholds."""
+
+        if len(thresholds) != num_actions:
+            raise ValueError(f"Expected {num_actions} thresholds, got {len(thresholds)}.")
+        stats = BinaryStats(num_actions, torch.device("cpu"))
+        if not self.probabilities:
+            return stats
+        probabilities = torch.cat(self.probabilities, dim=0)
+        targets = torch.cat(self.targets, dim=0)
+        threshold_tensor = torch.tensor(list(thresholds), dtype=probabilities.dtype).view(1, -1)
+        stats.update(probabilities >= threshold_tensor, targets)
+        return stats
+
 
 def find_runs(data_root: str, video_ext: str, csv_ext: str) -> List[Tuple[str, str]]:
     video_paths = sorted(glob.glob(os.path.join(data_root, f"*{video_ext}")))
@@ -376,6 +402,59 @@ def split_runs(
         return ordered, []
     split = max(1, min(len(ordered) - 1, round(len(ordered) * float(train_split))))
     return ordered[:split], ordered[split:]
+
+
+def sync_dataset_roots_for_training(cfg: TrainConfig) -> None:
+    """Mirror the configured dataset to the local WSL cache before DALI reads it."""
+
+    if not cfg.sync_dataset:
+        return
+
+    from dataset_wsl_sync import default_target_root, sync_dataset_for_training
+
+    target_root = default_target_root()
+
+    if cfg.train_data_root is not None and cfg.val_data_root is not None:
+        cfg.train_data_root = sync_dataset_for_training(
+            data_root=str(cfg.train_data_root),
+            target_root=str(target_root / "train"),
+            video_ext=cfg.video_ext,
+            csv_ext=cfg.csv_ext,
+        )
+        cfg.val_data_root = sync_dataset_for_training(
+            data_root=str(cfg.val_data_root),
+            target_root=str(target_root / "val"),
+            video_ext=cfg.video_ext,
+            csv_ext=cfg.csv_ext,
+        )
+        cfg.data_root = str(target_root)
+        return
+
+    data_root = str(cfg.data_root)
+    detected_train = os.path.join(data_root, "train")
+    detected_val = os.path.join(data_root, "val")
+    if os.path.isdir(detected_train) and os.path.isdir(detected_val):
+        sync_dataset_for_training(
+            data_root=detected_train,
+            target_root=str(target_root / "train"),
+            video_ext=cfg.video_ext,
+            csv_ext=cfg.csv_ext,
+        )
+        sync_dataset_for_training(
+            data_root=detected_val,
+            target_root=str(target_root / "val"),
+            video_ext=cfg.video_ext,
+            csv_ext=cfg.csv_ext,
+        )
+        cfg.data_root = str(target_root)
+        return
+
+    cfg.data_root = sync_dataset_for_training(
+        data_root=data_root,
+        target_root=None,
+        video_ext=cfg.video_ext,
+        csv_ext=cfg.csv_ext,
+    )
 
 
 def resolve_run_pairs(cfg: TrainConfig) -> Tuple[List[Tuple[str, str]], List[Tuple[str, str]]]:
@@ -450,9 +529,9 @@ def build_window_targets(
             target_end = target_start + int(cfg.seq_len)
             label_windows.append(labels[target_start:target_end])
             # The target at timestep t is labels[start + t + action_offset].
-            # Teacher-forced previous action must be the immediately preceding
-            # target, labels[start + t + action_offset - 1], matching the
-            # runtime autoregressive feedback at every chunk boundary.
+            # Teacher-forced previous action is the immediately preceding
+            # target, labels[start + t + action_offset - 1], matching runtime
+            # autoregressive feedback at chunk boundaries.
             previous_start = start + action_offset - 1
             previous = labels[previous_start : previous_start + int(cfg.seq_len)]
             previous_action_windows.append(previous)
@@ -960,7 +1039,16 @@ def run_epoch(
         metrics["stream_carried"] = stream_carried
         metrics["stream_carry_rate"] = stream_carried / max(1, stream_total)
     if fitter is not None:
-        metrics["fitted_thresholds"] = fitter.fit(cfg.threshold_min, cfg.threshold_max, cfg.num_bin)
+        fitted_thresholds = fitter.fit(cfg.threshold_min, cfg.threshold_max, cfg.num_bin)
+        calibrated_stats = fitter.statistics(fitted_thresholds, cfg.num_bin)
+        # The previous code reported F1 using the prior epoch's thresholds, then
+        # printed thresholds fitted from the current epoch.  Report the latter
+        # so per-class validation metrics describe the checkpoint being saved.
+        metrics["fitted_thresholds"] = fitted_thresholds
+        metrics["previous_threshold_macro_f1"] = metrics["macro_f1"]
+        metrics["previous_threshold_rows"] = metrics["rows"]
+        metrics["macro_f1"] = calibrated_stats.macro_f1()
+        metrics["rows"] = calibrated_stats.rows(cfg.key_names)
     return metrics, global_step
 
 
@@ -971,7 +1059,7 @@ def checkpoint_payload(
     *,
     epoch: int,
     global_step: int,
-    best_score: float,
+    best_validation_bce: float,
 ) -> Dict[str, object]:
     return {
         "architecture_version": ARCHITECTURE_VERSION,
@@ -980,7 +1068,7 @@ def checkpoint_payload(
         "config": asdict(cfg),
         "epoch": int(epoch),
         "global_step": int(global_step),
-        "best_score": float(best_score),
+        "best_validation_bce": float(best_validation_bce),
     }
 
 
@@ -988,16 +1076,16 @@ def maybe_resume(
     model: torch.nn.Module, optimizer: torch.optim.Optimizer, cfg: TrainConfig, device: torch.device
 ) -> Tuple[int, int, float]:
     if not cfg.resume:
-        return 0, 0, float("-inf")
+        return 0, 0, math.inf
     path = cfg.resume_path or os.path.join(cfg.ckpt_dir, "model_latest.pt")
     if not os.path.isfile(path):
-        return 0, 0, float("-inf")
+        return 0, 0, math.inf
     state = torch.load(path, map_location=device)
     if not isinstance(state, dict) or state.get("architecture_version") != ARCHITECTURE_VERSION:
         if cfg.resume_path is not None:
             raise RuntimeError(f"Checkpoint {path!r} does not use {ARCHITECTURE_VERSION}.")
         print(f"Skipping incompatible checkpoint: {path}")
-        return 0, 0, float("-inf")
+        return 0, 0, math.inf
     config = state.get("config")
     if not isinstance(config, dict) or list(config.get("key_names", [])) != list(cfg.key_names):
         raise RuntimeError(f"Checkpoint {path!r} has a different action schema.")
@@ -1008,11 +1096,18 @@ def maybe_resume(
                 "for dense temporal supervision. Start from scratch instead."
             )
         print(f"Skipping final-frame-only checkpoint: {path}")
-        return 0, 0, float("-inf")
+        return 0, 0, math.inf
     model.load_state_dict(state["model_state"], strict=True)
     optimizer.load_state_dict(state["optimizer_state"])
     print(f"Resumed from {path} at epoch {state.get('epoch', 0)}.")
-    return int(state.get("epoch", 0)), int(state.get("global_step", 0)), float(state.get("best_score", -math.inf))
+    # Older checkpoints selected by macro F1 have no comparable best BCE.  On
+    # resume, treat the next validation pass as the first candidate instead of
+    # comparing a loss to an old F1 value.
+    return (
+        int(state.get("epoch", 0)),
+        int(state.get("global_step", 0)),
+        float(state.get("best_validation_bce", math.inf)),
+    )
 
 
 def _batch_count(targets: WindowTargets, batch_size: int, *, partial: bool) -> int:
@@ -1057,6 +1152,10 @@ def print_startup_stats(
     )
     print(
         "  Data:",
+        f"sync_dataset={cfg.sync_dataset}",
+        f"data_root={cfg.data_root}",
+        f"train_data_root={cfg.train_data_root}",
+        f"val_data_root={cfg.val_data_root}",
         f"videos_total={total_videos}",
         f"train_videos={len(train_pairs)}",
         f"val_videos={len(val_pairs)}",
@@ -1147,6 +1246,7 @@ def train(cfg: Optional[TrainConfig] = None) -> None:
     random.seed(cfg.split_seed)
     os.makedirs(cfg.ckpt_dir, exist_ok=True)
 
+    sync_dataset_roots_for_training(cfg)
     train_pairs, val_pairs = resolve_run_pairs(cfg)
     train_targets = build_window_targets(train_pairs, cfg, stride=cfg.train_seq_stride)
     val_targets = build_window_targets(val_pairs, cfg, stride=cfg.val_seq_stride)
@@ -1184,7 +1284,7 @@ def train(cfg: Optional[TrainConfig] = None) -> None:
     base_model: torch.nn.Module = DrivingVideoPolicy(cfg).to(device)
     base_model = base_model.to(memory_format=torch.channels_last)
     optimizer = torch.optim.AdamW(base_model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-    start_epoch, global_step, best_score = maybe_resume(base_model, optimizer, cfg, device)
+    start_epoch, global_step, best_validation_bce = maybe_resume(base_model, optimizer, cfg, device)
     model = torch.compile(base_model) if cfg.compile_model else base_model
     amp_dtype = torch.bfloat16 if cfg.amp_dtype == "bf16" else torch.float32
     pos_weight = compute_pos_weight(train_targets.labels, cfg.pos_weight_power, cfg.pos_weight_clamp).to(device)
@@ -1259,9 +1359,10 @@ def train(cfg: Optional[TrainConfig] = None) -> None:
         if isinstance(fitted, tuple) and len(fitted) == cfg.num_bin:
             cfg.button_state_thresholds = tuple(float(item) for item in fitted)
         score = float(val_metrics["macro_f1"])
-        is_best = score > best_score
+        validation_bce = float(val_metrics["bce_loss"])
+        is_best = validation_bce < best_validation_bce
         if is_best:
-            best_score = score
+            best_validation_bce = validation_bce
         print(
             f"Epoch {epoch + 1}/{cfg.num_epochs}: "
             f"train_loss={float(train_metrics['loss']):.4f} "
@@ -1280,8 +1381,9 @@ def train(cfg: Optional[TrainConfig] = None) -> None:
             f"{float(val_metrics.get('stream_carry_rate', 0.0)):.3f}"
         )
         print(
-            f"Validation best_macro_f1={best_score:.4f} "
-            f"current_macro_f1={score:.4f} "
+            f"Validation best_bce={best_validation_bce:.4f} "
+            f"current_bce={validation_bce:.4f} "
+            f"calibrated_macro_f1={score:.4f} "
             f"new_best={is_best}"
         )
         print_metric_rows("Validation controls:", val_metrics["rows"])
@@ -1295,7 +1397,7 @@ def train(cfg: Optional[TrainConfig] = None) -> None:
             cfg,
             epoch=epoch + 1,
             global_step=global_step,
-            best_score=best_score,
+            best_validation_bce=best_validation_bce,
         )
         torch.save(payload, os.path.join(cfg.ckpt_dir, "model_latest.pt"))
         if is_best:
@@ -1314,6 +1416,8 @@ def parse_args() -> TrainConfig:
     add("--resume", dest="resume", action="store_true", default=None)
     add("--no-resume", dest="resume", action="store_false")
     add("--resume-path", default=None)
+    add("--sync-dataset", dest="sync_dataset", action="store_true", default=None)
+    add("--no-sync-dataset", dest="sync_dataset", action="store_false")
     add("--num-epochs", type=int, default=None)
     add("--batch-size", type=int, default=None)
     add("--target-effective-batch", type=int, default=None)
