@@ -65,7 +65,8 @@ class RuntimeConfig(ModelConfig):
 
     mouse_buttons_enabled: bool = False
     # Feed model outputs back as last_action to match closed-loop training.
-    # Soft mode is kept disabled because the model was trained on hard states.
+    # Soft mode uses probabilities for the model context while thresholds still
+    # decide which keys are actually pressed.
     prev_action_feedback: bool = True
     prev_action_feedback_soft: bool = False
     gru_memory_frames: int = 80
@@ -260,16 +261,15 @@ def _coerce_config_types(cfg: RuntimeConfig) -> RuntimeConfig:
     cfg.last_action_residual_cap = float(
         np.clip(float(getattr(cfg, "last_action_residual_cap", 0.75)), 0.0, 5.0)
     )
-    cfg.last_action_prior_logit = float(np.clip(float(getattr(cfg, "last_action_prior_logit", 0.0)), 0.0, 5.0))
+    cfg.last_action_prior_logit = float(np.clip(float(getattr(cfg, "last_action_prior_logit", 1.5)), 0.0, 5.0))
     cfg.last_action_absence_prior_logit = float(
         np.clip(float(getattr(cfg, "last_action_absence_prior_logit", 0.0)), 0.0, 5.0)
     )
     cfg.mouse_buttons_enabled = bool(cfg.mouse_buttons_enabled)
-    cfg.prev_action_feedback = bool(getattr(cfg, "prev_action_feedback", False))
     if cfg.last_action_conditioning:
         cfg.prev_action_feedback = True
-    cfg.prev_action_feedback_soft = bool(getattr(cfg, "prev_action_feedback_soft", False))
-    if cfg.last_action_conditioning and cfg.prev_action_feedback_soft:
+    cfg.prev_action_feedback_soft = bool(cfg.prev_action_feedback_soft)
+    if cfg.prev_action_feedback_soft:
         raise ValueError("Soft previous-action feedback is disabled for this architecture.")
     cfg.gru_memory_frames = max(1, int(getattr(cfg, "gru_memory_frames", 80)))
     cfg.num_bin = len(cfg.key_names) + len(cfg.mouse_button_names)
