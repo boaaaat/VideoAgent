@@ -12,6 +12,7 @@ from typing import Dict, List, Literal, Optional, Tuple
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 from tqdm.auto import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -24,7 +25,21 @@ from models import (  # noqa: E402
 )
 
 
-FeatureLayer = Literal["stage1", "stage2", "stage3", "stage4", "stage5", "spatial", "tokens"]
+FeatureLayer = Literal[
+    "stage1",
+    "stage2",
+    "stage3",
+    "stage4",
+    "stage5",
+    "stem",
+    "low",
+    "mid",
+    "deep",
+    "fused",
+    "spatial",
+    "projected",
+    "tokens",
+]
 ModelKind = Literal["auto", "policy"]
 LoadedModelKind = Literal["policy"]
 VisualModel = DrivingVideoPolicy
@@ -204,18 +219,65 @@ def _policy_encoder_input(
     return masked_frame, frame_rgb.detach()
 
 
-def _policy_fpn_features(
+def _canonical_layer_name(layer: FeatureLayer) -> str:
+    aliases = {
+        "stage1": "stem",
+        "stage2": "low",
+        "stage3": "mid",
+        "stage4": "deep",
+        "stage5": "deep",
+        "spatial": "fused",
+    }
+    return aliases.get(str(layer), str(layer))
+
+
+def _latent_token_maps(projected: torch.Tensor, visual_tokens: torch.Tensor) -> torch.Tensor:
+    if projected.dim() != 4:
+        raise ValueError(f"Expected projected map [B,D,H,W], got {tuple(projected.shape)}.")
+    if visual_tokens.dim() != 3:
+        raise ValueError(f"Expected visual tokens [B,M,D], got {tuple(visual_tokens.shape)}.")
+    projected_norm = F.normalize(projected.float(), dim=1)
+    tokens_norm = F.normalize(visual_tokens.float(), dim=-1)
+    return torch.einsum("bmd,bdhw->bmhw", tokens_norm, projected_norm).to(dtype=projected.dtype)
+
+
+def _policy_feature_map(
     model: DrivingVideoPolicy,
     masked_frame: torch.Tensor,
-) -> Tuple[List[torch.Tensor], torch.Tensor]:
-    stages = model.spatial_encoder.feature_stages(masked_frame)
-    if len(stages) != 5:
-        raise RuntimeError(f"Expected five encoder stages, got {len(stages)}.")
-    # Stages are pre_stem@256, stem@128, low@64, mid@32, and deep@16. Stem is
-    # retained as the backbone transition to low@64; the FPN directly fuses
-    # pre_stem, low, mid, and deep into the map consumed by ConvGRU.
-    fused = model.fpn(stages[0], stages[2], stages[3], stages[4])
-    return stages, fused
+    layer: FeatureLayer,
+) -> torch.Tensor:
+    name = _canonical_layer_name(layer)
+    encoder = model.policy.frame_encoder
+
+    stem = encoder.stem(masked_frame)
+    if name == "stem":
+        return stem
+
+    low = encoder.stage1(stem)
+    if name == "low":
+        return low
+
+    mid = encoder.stage2(low)
+    if name == "mid":
+        return mid
+
+    deep = encoder.stage3(mid)
+    if name == "deep":
+        return deep
+
+    p1 = encoder.p1(low)
+    p2 = encoder.p2(mid)
+    p3 = F.interpolate(encoder.p3(deep), size=p2.shape[-2:], mode="bilinear", align_corners=False)
+    fused = encoder.fuse(torch.cat([p1, p2, p3], dim=1))
+    if name == "fused":
+        return fused
+
+    projected = encoder.tokenizer.proj(fused)
+    if name == "projected":
+        return projected
+    if name == "tokens":
+        return _latent_token_maps(projected, encoder.tokenizer(fused))
+    raise ValueError(f"Unknown policy layer {layer!r}.")
 
 
 def _compute_feature_map(
@@ -227,28 +289,7 @@ def _compute_feature_map(
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[TemporalState]]:
     del previous_frame_rgb
     masked_frame, current = _policy_encoder_input(model, frame_rgb)
-    stages, fused = _policy_fpn_features(model, masked_frame)
-    if layer.startswith("stage"):
-        stage_idx = int(layer.removeprefix("stage")) - 1
-        if stage_idx < 0 or stage_idx >= len(stages):
-            raise ValueError(f"Policy encoder has {len(stages)} stages; cannot show {layer!r}.")
-        return stages[stage_idx], current, policy_state
-    if layer == "spatial":
-        return fused, current, policy_state
-    if layer == "tokens":
-        hidden_state = model._prepare_temporal_state(
-            policy_state,
-            fused.size(0),
-            fused.size(-2),
-            fused.size(-1),
-            device=fused.device,
-            dtype=fused.dtype,
-            high_height=temporal32.size(-2),
-            high_width=temporal32.size(-1),
-        )
-        hidden, next_hidden = model._temporal_step(fused, temporal32, hidden_state)
-        return hidden, current, TemporalState(hidden_state=next_hidden.detach())
-    raise ValueError(f"Unknown policy layer {layer!r}.")
+    return _policy_feature_map(model, masked_frame, layer), current, policy_state
 
 
 def _feature_to_heat_color(
@@ -306,7 +347,7 @@ def _feature_heatmap_for_frame(
         x = x.contiguous(memory_format=torch.channels_last)
 
     with torch.inference_mode():
-        with torch.amp.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_autocast and x.is_cuda):
+        with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_autocast and x.is_cuda):
             feat, current_frame_rgb, policy_state = _compute_feature_map(
                 model,
                 x,
@@ -461,46 +502,17 @@ def _policy_visuals_for_frame(
             masked_frame = model._apply_masks(frame_rgb)
             if masked_frame.is_cuda:
                 masked_frame = masked_frame.contiguous(memory_format=torch.channels_last)
-            stages, fused = _policy_fpn_features(model, masked_frame)
-
-            if layer.startswith("stage"):
-                stage_idx = int(layer.removeprefix("stage")) - 1
-                if stage_idx < 0 or stage_idx >= len(stages):
-                    raise ValueError(f"Policy encoder has {len(stages)} stages; cannot show {layer!r}.")
-                feat = stages[stage_idx]
-            elif layer == "spatial":
-                feat = fused
-            elif layer == "tokens":
-                feat = None
-            else:
-                raise ValueError(f"Unknown policy layer {layer!r}.")
-
-            hidden: Optional[torch.Tensor] = None
-            if bool(need_trajectory) or layer == "tokens":
-                hidden_state = model._prepare_temporal_state(
-                    state,
-                    fused.size(0),
-                    fused.size(-2),
-                    fused.size(-1),
-                    device=fused.device,
-                    dtype=fused.dtype,
-                    high_height=temporal32.size(-2),
-                    high_width=temporal32.size(-1),
-                )
-                hidden, next_hidden = model._temporal_step(fused, temporal32, hidden_state)
-                state = TemporalState(hidden_state=next_hidden.detach())
-                if layer == "tokens":
-                    feat = hidden
+            feat = _policy_feature_map(model, masked_frame, layer)
 
             if bool(need_trajectory):
-                if hidden is None:
-                    raise RuntimeError("Temporal readout was not computed for the policy trajectory.")
-                logits = model._readout_logits(fused, hidden, prev_action=prev_action)[0].detach().float()
-                trajectory_probs = torch.sigmoid(logits).reshape(1, -1).cpu().numpy().astype(np.float32)
+                if prev_action is None:
+                    prev_action = torch.zeros((1, int(cfg.num_bin)), device=device, dtype=x.dtype)
+                output, state = model.forward_step(x, state, prev_action=prev_action)
+                logits = output.button_logits[0].detach().float()
+                probabilities = torch.sigmoid(logits)
+                trajectory_probs = probabilities.reshape(1, -1).cpu().numpy().astype(np.float32)
                 thresholds = _button_thresholds(cfg, device=logits.device, dtype=logits.dtype)
-                next_action = (torch.sigmoid(logits) >= thresholds).to(
-                    dtype=fused.dtype
-                ).reshape(1, int(cfg.num_bin)).detach()
+                next_action = (probabilities >= thresholds).to(dtype=x.dtype).reshape(1, int(cfg.num_bin)).detach()
             elif state is None:
                 state = TemporalState()
 
@@ -934,7 +946,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--model-kind",
         choices=["auto", "policy"],
         default="auto",
-        help="Current FPN/ConvGRU policy checkpoint format.",
+        help="Current CNN latent transformer policy checkpoint format.",
     )
     parser.add_argument(
         "--ckpt-path",
@@ -948,11 +960,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--layer",
-        choices=["stage1", "stage2", "stage3", "stage4", "stage5", "spatial", "tokens"],
-        default="stage1",
+        choices=[
+            "stem",
+            "low",
+            "mid",
+            "deep",
+            "fused",
+            "projected",
+            "tokens",
+            "stage1",
+            "stage2",
+            "stage3",
+            "stage4",
+            "stage5",
+            "spatial",
+        ],
+        default="stem",
         help=(
-            "Feature map to visualize: pre-stem/encoder stages (stage1-stage5), FPN output "
-            "(spatial), or the second ConvGRU hidden map (tokens)."
+            "Feature map to visualize: CNN stages (stem/low/mid/deep), 64x64 fused map, "
+            "256-channel projected map, or learned latent-token similarity map. "
+            "stage1-stage5 and spatial are accepted as old CLI aliases."
         ),
     )
     parser.add_argument("--mode", choices=["heat", "overlay", "side_by_side", "triple"], default="side_by_side")

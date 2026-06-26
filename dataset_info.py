@@ -21,6 +21,7 @@ IGNORED_COLUMNS = {"timestamp", "dt", "delta_x", "delta_y"}
 @dataclass
 class ClipInfo:
     clip_id: str
+    split: str
     csv_path: Path
     video_path: Optional[Path]
     rows: int
@@ -36,6 +37,14 @@ class ClipInfo:
     max_abs_delta_y: float
 
 
+@dataclass(frozen=True)
+class ScanScope:
+    name: str
+    root: Path
+    key_prefix: str
+    recursive: bool
+
+
 def default_dataset_dir() -> Path:
     candidates = (Path(game_data_root(selected_game)), Path("data"))
     for candidate in candidates:
@@ -46,18 +55,21 @@ def default_dataset_dir() -> Path:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Summarize a dataset of run_*.mp4 and run_*.csv clips."
+        description="Summarize run_*.mp4/run_*.csv datasets, including train/val split folders."
     )
     parser.add_argument(
         "dataset_dir",
         nargs="?",
         default=str(default_dataset_dir()),
-        help="Directory containing the dataset clips. Defaults to data/<selected_game> when present.",
+        help=(
+            "Dataset root or split folder. If train/ and val/ exist under this path, "
+            "both splits are scanned automatically. Defaults to data/<selected_game> when present."
+        ),
     )
     parser.add_argument(
         "--recursive",
         action="store_true",
-        help="Search subdirectories recursively.",
+        help="Search below each detected dataset or split folder recursively.",
     )
     parser.add_argument(
         "--top",
@@ -142,7 +154,44 @@ def find_all_files(root: Path, recursive: bool) -> Tuple[Dict[str, List[Path]], 
     return csvs, videos
 
 
-def scan_csv(clip_id: str, csv_path: Path, video_path: Optional[Path]) -> ClipInfo:
+def has_run_files(root: Path) -> bool:
+    return any(root.glob("run_*.csv")) or any(root.glob("run_*.mp4"))
+
+
+def discover_scan_scopes(root: Path, recursive: bool) -> List[ScanScope]:
+    split_dirs = [
+        (name, root / name)
+        for name in ("train", "val")
+        if (root / name).is_dir()
+    ]
+    scopes: List[ScanScope] = []
+
+    if has_run_files(root) or not split_dirs:
+        # If split folders exist, keep the root scan shallow so recursive mode
+        # does not double-count train/val clips through the flat scope.
+        scopes.append(
+            ScanScope(
+                name="dataset",
+                root=root,
+                key_prefix="",
+                recursive=bool(recursive and not split_dirs),
+            )
+        )
+
+    for split_name, split_root in split_dirs:
+        scopes.append(
+            ScanScope(
+                name=split_name,
+                root=split_root,
+                key_prefix=split_name,
+                recursive=recursive,
+            )
+        )
+
+    return scopes
+
+
+def scan_csv(clip_id: str, split: str, csv_path: Path, video_path: Optional[Path]) -> ClipInfo:
     rows = 0
     min_timestamp: Optional[float] = None
     max_timestamp: Optional[float] = None
@@ -205,6 +254,7 @@ def scan_csv(clip_id: str, csv_path: Path, video_path: Optional[Path]) -> ClipIn
 
     return ClipInfo(
         clip_id=clip_id,
+        split=split,
         csv_path=csv_path,
         video_path=video_path,
         rows=rows,
@@ -252,8 +302,51 @@ def path_bytes(paths: Iterable[Path]) -> int:
     return total
 
 
+def merge_scoped_files(
+    scopes: Sequence[ScanScope],
+) -> Tuple[Dict[str, List[Path]], Dict[str, List[Path]], Dict[str, str], Dict[str, Path]]:
+    csvs: Dict[str, List[Path]] = {}
+    videos: Dict[str, List[Path]] = {}
+    key_splits: Dict[str, str] = {}
+    scope_roots: Dict[str, Path] = {}
+
+    for scope in scopes:
+        scope_roots[scope.name] = scope.root
+        scoped_csvs, scoped_videos = find_all_files(scope.root, scope.recursive)
+        for local_key, paths in scoped_csvs.items():
+            clip_id = f"{scope.key_prefix}/{local_key}" if scope.key_prefix else local_key
+            csvs.setdefault(clip_id, []).extend(paths)
+            key_splits[clip_id] = scope.name
+        for local_key, paths in scoped_videos.items():
+            clip_id = f"{scope.key_prefix}/{local_key}" if scope.key_prefix else local_key
+            videos.setdefault(clip_id, []).extend(paths)
+            key_splits[clip_id] = scope.name
+
+    return csvs, videos, key_splits, scope_roots
+
+
+def action_summary_for_clips(clip_infos: Sequence[ClipInfo]) -> Dict[str, Dict[str, float | int]]:
+    total_rows = sum(clip.rows for clip in clip_infos)
+    action_frame_totals: Counter = Counter()
+    action_clip_totals: Counter = Counter()
+    for clip in clip_infos:
+        action_frame_totals.update(clip.action_frames)
+        for action in clip.action_frames:
+            action_clip_totals[action] += 1
+
+    return {
+        action: {
+            "active_frames": active_frames,
+            "active_frame_pct": (active_frames / total_rows * 100.0) if total_rows else 0.0,
+            "clips_with_action": action_clip_totals[action],
+        }
+        for action, active_frames in sorted(action_frame_totals.items())
+    }
+
+
 def build_summary(root: Path, recursive: bool, top_n: int) -> Dict[str, object]:
-    csvs, videos = find_all_files(root, recursive)
+    scopes = discover_scan_scopes(root, recursive)
+    csvs, videos, key_splits, scope_roots = merge_scoped_files(scopes)
     all_clip_ids = sorted(set(csvs) | set(videos))
     paired_clip_ids = sorted(set(csvs) & set(videos))
     csv_only_clip_ids = sorted(set(csvs) - set(videos))
@@ -264,18 +357,14 @@ def build_summary(root: Path, recursive: bool, top_n: int) -> Dict[str, object]:
 
     clip_infos: List[ClipInfo] = []
     schema_counts: Counter = Counter()
-    action_frame_totals: Counter = Counter()
-    action_clip_totals: Counter = Counter()
 
     for clip_id in sorted(csvs):
         csv_path = csvs[clip_id][0]
         video_path = videos.get(clip_id, [None])[0]
-        clip = scan_csv(clip_id, csv_path, video_path)
+        split = key_splits.get(clip_id, "dataset")
+        clip = scan_csv(clip_id, split, csv_path, video_path)
         clip_infos.append(clip)
         schema_counts[clip.schema] += 1
-        action_frame_totals.update(clip.action_frames)
-        for action in clip.action_frames:
-            action_clip_totals[action] += 1
 
     total_rows = sum(clip.rows for clip in clip_infos)
     durations = [clip.duration_seconds for clip in clip_infos if clip.duration_seconds > 0]
@@ -299,14 +388,7 @@ def build_summary(root: Path, recursive: bool, top_n: int) -> Dict[str, object]:
     all_csv_paths = [paths[0] for paths in csvs.values()]
     all_video_paths = [paths[0] for paths in videos.values()]
 
-    actions_summary = {}
-    for action in sorted(action_frame_totals):
-        active_frames = action_frame_totals[action]
-        actions_summary[action] = {
-            "active_frames": active_frames,
-            "active_frame_pct": (active_frames / total_rows * 100.0) if total_rows else 0.0,
-            "clips_with_action": action_clip_totals[action],
-        }
+    actions_summary = action_summary_for_clips(clip_infos)
 
     schema_breakdown = [
         {
@@ -316,9 +398,49 @@ def build_summary(root: Path, recursive: bool, top_n: int) -> Dict[str, object]:
         for schema, count in schema_counts.most_common()
     ]
 
+    split_summaries: Dict[str, Dict[str, object]] = {}
+    for split in sorted(scope_roots):
+        split_clip_ids = sorted(clip_id for clip_id in all_clip_ids if key_splits.get(clip_id) == split)
+        split_csv_ids = sorted(clip_id for clip_id in csvs if key_splits.get(clip_id) == split)
+        split_video_ids = sorted(clip_id for clip_id in videos if key_splits.get(clip_id) == split)
+        split_paired_ids = sorted(set(split_csv_ids) & set(split_video_ids))
+        split_clip_infos = [clip for clip in clip_infos if clip.split == split]
+        split_rows = sum(clip.rows for clip in split_clip_infos)
+        split_durations = [clip.duration_seconds for clip in split_clip_infos if clip.duration_seconds > 0]
+        split_csv_paths = [csvs[clip_id][0] for clip_id in split_csv_ids]
+        split_video_paths = [videos[clip_id][0] for clip_id in split_video_ids]
+        split_summaries[split] = {
+            "dataset_dir": str(scope_roots[split].resolve()),
+            "clip_ids": len(split_clip_ids),
+            "paired_clips": len(split_paired_ids),
+            "csv_clips": len(split_csv_ids),
+            "video_clips": len(split_video_ids),
+            "csv_only_clips": len(set(split_csv_ids) - set(split_video_ids)),
+            "video_only_clips": len(set(split_video_ids) - set(split_csv_ids)),
+            "total_rows": split_rows,
+            "total_seconds": sum(split_durations),
+            "total_hours": sum(split_durations) / 3600.0,
+            "total_size_bytes": path_bytes(split_csv_paths) + path_bytes(split_video_paths),
+            "video_size_bytes": path_bytes(split_video_paths),
+            "csv_size_bytes": path_bytes(split_csv_paths),
+            "actions": action_summary_for_clips(split_clip_infos),
+        }
+
     return {
         "dataset_dir": str(root.resolve()),
         "recursive": recursive,
+        "layout": {
+            "mode": "split" if any(scope.name in {"train", "val"} for scope in scopes) else "flat",
+            "scopes": [
+                {
+                    "name": scope.name,
+                    "dataset_dir": str(scope.root.resolve()),
+                    "recursive": scope.recursive,
+                }
+                for scope in scopes
+            ],
+        },
+        "splits": split_summaries,
         "files": {
             "clip_ids": len(all_clip_ids),
             "paired_clips": len(paired_clip_ids),
@@ -364,6 +486,7 @@ def build_summary(root: Path, recursive: bool, top_n: int) -> Dict[str, object]:
         "top_clips": [
             {
                 "clip_id": clip.clip_id,
+                "split": clip.split,
                 "duration_seconds": clip.duration_seconds,
                 "rows": clip.rows,
                 "fps_estimate": clip.fps_estimate,
@@ -384,6 +507,8 @@ def build_summary(root: Path, recursive: bool, top_n: int) -> Dict[str, object]:
 
 
 def print_text_summary(summary: Dict[str, object]) -> None:
+    layout = summary["layout"]
+    splits = summary["splits"]
     files = summary["files"]
     labels = summary["labels"]
     duration = summary["duration"]
@@ -393,8 +518,21 @@ def print_text_summary(summary: Dict[str, object]) -> None:
     date_range = summary["date_range"]
 
     print(f"Dataset: {summary['dataset_dir']}")
+    print(f"Layout: {layout['mode']}")
     print(f"Recursive scan: {'yes' if summary['recursive'] else 'no'}")
     print()
+
+    if splits:
+        print("Splits")
+        for name, split in splits.items():
+            print(
+                f"  {name:<8} clips={split['paired_clips']:>4} "
+                f"csv={split['csv_clips']:>4} video={split['video_clips']:>4} "
+                f"rows={split['total_rows']:>8} "
+                f"time={format_seconds(split['total_seconds'])} "
+                f"size={format_bytes(split['total_size_bytes'])}"
+            )
+        print()
 
     print("Files")
     print(f"  clip ids:          {files['clip_ids']}")
@@ -468,7 +606,7 @@ def print_text_summary(summary: Dict[str, object]) -> None:
         for clip in top_clips:
             fps_text = f"{clip['fps_estimate']:.2f} fps" if clip["fps_estimate"] else "fps n/a"
             print(
-                f"  {clip['clip_id']}: {format_seconds(clip['duration_seconds'])}, "
+                f"  {clip['clip_id']} [{clip['split']}]: {format_seconds(clip['duration_seconds'])}, "
                 f"{clip['rows']} rows, {fps_text}"
             )
 

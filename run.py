@@ -64,11 +64,10 @@ class RuntimeConfig(ModelConfig):
     print_prob_decimals: int = 3
 
     mouse_buttons_enabled: bool = False
-    # Feed model outputs back as last_action to match closed-loop training.
-    # Soft mode is kept disabled because the model was trained on hard states.
+    # Feed applied outputs back as the next previous-action token.
+    # Soft mode is disabled because the model is trained on hard action states.
     prev_action_feedback: bool = True
     prev_action_feedback_soft: bool = False
-    gru_memory_frames: int = 80
     # data.py records at 512x512 INTER_LINEAR before DALI linear-resizes to
     # model_size; runtime capture must mirror that two-stage path.
     record_frame_size: int = 512
@@ -90,7 +89,6 @@ class RuntimeConfig(ModelConfig):
             self.prev_action_feedback = True
         if self.last_action_conditioning and self.prev_action_feedback_soft:
             raise ValueError("Soft previous-action feedback is disabled for this architecture.")
-        self.gru_memory_frames = max(1, int(self.gru_memory_frames))
         self.record_frame_size = max(1, int(self.record_frame_size))
 
 
@@ -245,9 +243,7 @@ def _coerce_config_types(cfg: RuntimeConfig) -> RuntimeConfig:
     cfg.sequence_output_tail_frames = max(0, int(getattr(cfg, "sequence_output_tail_frames", 0)))
     if cfg.sequence_output_tail_frames > cfg.seq_len:
         cfg.sequence_output_tail_frames = cfg.seq_len
-    cfg.action_decoder = str(getattr(cfg, "action_decoder", "mlp")).strip().lower()
-    cfg.action_query_heads = int(getattr(cfg, "action_query_heads", 4))
-    cfg.action_query_layers = int(getattr(cfg, "action_query_layers", 2))
+    cfg.action_decoder = str(getattr(cfg, "action_decoder", "causal_transformer")).strip().lower()
     cfg.last_action_conditioning = bool(getattr(cfg, "last_action_conditioning", True))
     cfg.last_action_fusion = str(
         getattr(cfg, "last_action_fusion", "bounded_visual_residual")
@@ -257,13 +253,6 @@ def _coerce_config_types(cfg: RuntimeConfig) -> RuntimeConfig:
             "This runtime requires last_action_fusion='bounded_visual_residual', "
             f"got {cfg.last_action_fusion!r}."
         )
-    cfg.last_action_residual_cap = float(
-        np.clip(float(getattr(cfg, "last_action_residual_cap", 0.75)), 0.0, 5.0)
-    )
-    cfg.last_action_prior_logit = float(np.clip(float(getattr(cfg, "last_action_prior_logit", 0.0)), 0.0, 5.0))
-    cfg.last_action_absence_prior_logit = float(
-        np.clip(float(getattr(cfg, "last_action_absence_prior_logit", 0.0)), 0.0, 5.0)
-    )
     cfg.mouse_buttons_enabled = bool(cfg.mouse_buttons_enabled)
     cfg.prev_action_feedback = bool(getattr(cfg, "prev_action_feedback", False))
     if cfg.last_action_conditioning:
@@ -271,7 +260,6 @@ def _coerce_config_types(cfg: RuntimeConfig) -> RuntimeConfig:
     cfg.prev_action_feedback_soft = bool(getattr(cfg, "prev_action_feedback_soft", False))
     if cfg.last_action_conditioning and cfg.prev_action_feedback_soft:
         raise ValueError("Soft previous-action feedback is disabled for this architecture.")
-    cfg.gru_memory_frames = max(1, int(getattr(cfg, "gru_memory_frames", 80)))
     cfg.num_bin = len(cfg.key_names) + len(cfg.mouse_button_names)
     cfg.button_state_threshold = float(np.clip(float(cfg.button_state_threshold), 0.0, 1.0))
     cfg.use_checkpoint_button_thresholds = bool(getattr(cfg, "use_checkpoint_button_thresholds", False))
@@ -348,7 +336,7 @@ def _apply_checkpoint_config(cfg: RuntimeConfig, overrides: Dict) -> RuntimeConf
             continue
         if hasattr(cfg, key):
             setattr(cfg, key, value)
-    cfg.prev_action_feedback = bool(overrides.get("last_action_conditioning", False))
+    cfg.prev_action_feedback = bool(getattr(cfg, "last_action_conditioning", True))
     cfg.prev_action_feedback_soft = False
     cfg = _coerce_config_types(cfg)
     if not checkpoint_has_thresholds:
@@ -358,34 +346,14 @@ def _apply_checkpoint_config(cfg: RuntimeConfig, overrides: Dict) -> RuntimeConf
     return cfg
 
 
-def _uses_removed_vector_gru(checkpoint_config: Dict, model_state: Dict) -> bool:
-    if str(checkpoint_config.get("temporal_architecture", "")).strip().lower() == "vector_gru":
-        return True
-    vector_prefixes = (
-        "vector_pool.",
-        "frame_fc1.",
-        "frame_fc2.",
-        "temporal_rnn.",
-        "temporal_fusion.",
-    )
-    return any(str(key).startswith(vector_prefixes) for key in model_state)
-
-
-def _raise_incompatible_checkpoint(ckpt_path: str, checkpoint_config: Dict, model_state: Dict) -> None:
+def _raise_incompatible_checkpoint(ckpt_path: str, checkpoint_config: Dict) -> None:
     checkpoint_architecture = str(
         checkpoint_config.get("architecture_version", "")
     ).strip()
     if checkpoint_architecture != ARCHITECTURE_VERSION:
         raise RuntimeError(
             f"Checkpoint {ckpt_path!r} uses architecture={checkpoint_architecture!r}, but this runtime requires "
-            f"{ARCHITECTURE_VERSION!r}. The ConvGRU architecture changed; retrain from scratch."
-        )
-    if _uses_removed_vector_gru(checkpoint_config, model_state):
-        raise RuntimeError(
-            f"Checkpoint {ckpt_path!r} was trained with the removed vector_gru architecture. "
-            "It cannot be loaded by the restored spatial ConvGRU/action-query model. "
-            "Train a fresh checkpoint with the current train.py, or point RuntimeConfig.ckpt_path "
-            "at a compatible spatial ConvGRU checkpoint."
+            f"{ARCHITECTURE_VERSION!r}. Train a fresh CNN latent transformer checkpoint."
         )
 
 
@@ -395,12 +363,12 @@ def _checkpoint_path(cfg: RuntimeConfig) -> str:
             raise FileNotFoundError(f"Checkpoint not found: {cfg.ckpt_path}")
         return cfg.ckpt_path
 
-    best_path = os.path.join(cfg.ckpt_dir, "model_latest.pt")
-    if os.path.exists(best_path):
-        return best_path
     latest_path = os.path.join(cfg.ckpt_dir, "model_latest.pt")
     if os.path.exists(latest_path):
         return latest_path
+    best_path = os.path.join(cfg.ckpt_dir, "model_best.pt")
+    if os.path.exists(best_path):
+        return best_path
     raise FileNotFoundError(f"Expected checkpoint at {best_path!r} or {latest_path!r}.")
 
 
@@ -416,12 +384,17 @@ def load_checkpoint(
 
     checkpoint_config = dict(state["config"])
     model_state = state["model_state"]
-    _raise_incompatible_checkpoint(ckpt_path, checkpoint_config, model_state)
+    _raise_incompatible_checkpoint(ckpt_path, checkpoint_config)
 
     cfg = _apply_checkpoint_config(cfg, checkpoint_config)
     cfg = _coerce_config_types(cfg)
     cfg.ckpt_path = ckpt_path
-    print(f"Checkpoint: epoch={state.get('epoch')} step={state.get('global_step')} best={state.get('best_score')}")
+    print(
+        "Checkpoint:",
+        f"epoch={state.get('epoch')}",
+        f"step={state.get('global_step')}",
+        f"best_bce={state.get('best_validation_bce')}",
+    )
     return cfg, model_state
 
 
@@ -530,16 +503,16 @@ def main() -> None:
     except RuntimeError as exc:
         raise RuntimeError(
             f"Checkpoint {cfg.ckpt_path!r} is not compatible with the current model "
-            f"(decoder={cfg.action_decoder}). Train a fresh checkpoint or choose a compatible one."
+            f"(architecture={ARCHITECTURE_VERSION}). Train a fresh checkpoint or choose a compatible one."
         ) from exc
     print(
         "Model:",
         f"size={cfg.model_size}",
         f"prediction_offset=+{int(cfg.prediction_horizon_offsets[0])}",
         f"d_model={cfg.d_model}",
-        "temporal=convgru",
+        "temporal=causal_transformer",
         f"decoder={cfg.action_decoder}",
-        "input=masked_rgb" + ("+last_action" if cfg.last_action_conditioning else ""),
+        "input=masked_rgb" + ("+prev_action_token" if cfg.last_action_conditioning else ""),
     )
     print(
         "Button thresholds:",
@@ -554,11 +527,10 @@ def main() -> None:
         f"buttons_enabled={cfg.mouse_buttons_enabled}",
     )
     print(
-        "Runtime last-action feedback:",
+        "Runtime previous-action feedback:",
         f"enabled={cfg.prev_action_feedback}",
         "mode=hard-applied",
-        f"fusion={cfg.last_action_fusion}",
-        f"residual_cap={float(cfg.last_action_residual_cap):.2f}",
+        f"context_len={int(cfg.seq_len)}",
     )
 
     inference_dtype = torch.float32
