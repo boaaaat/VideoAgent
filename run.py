@@ -62,6 +62,7 @@ class RuntimeConfig(ModelConfig):
     command_horizon: int = 1
     print_every: int = 2
     print_prob_decimals: int = 3
+    runtime_amp: bool = True
 
     mouse_buttons_enabled: bool = False
     # Feed applied outputs back as the next previous-action token.
@@ -76,6 +77,7 @@ class RuntimeConfig(ModelConfig):
         super().__post_init__()
         self.decision_interval = float(self.decision_interval)
         self.command_horizon = max(1, int(self.command_horizon))
+        self.runtime_amp = bool(self.runtime_amp)
         self.pos_weight_power = max(0.0, float(self.pos_weight_power))
         self.pos_weight_clamp = max(1.0, float(self.pos_weight_clamp))
         self.button_threshold_from_pos_weight = bool(self.button_threshold_from_pos_weight)
@@ -239,6 +241,7 @@ def _coerce_config_types(cfg: RuntimeConfig) -> RuntimeConfig:
         if len(cfg.prediction_horizon_offsets) != 1:
             raise ValueError(f"Single-horizon checkpoints must provide exactly one prediction offset, got {cfg.prediction_horizon_offsets}.")
     cfg.command_horizon = 1
+    cfg.runtime_amp = bool(getattr(cfg, "runtime_amp", True))
     cfg.d_model = int(cfg.d_model)
     cfg.sequence_output_tail_frames = max(0, int(getattr(cfg, "sequence_output_tail_frames", 0)))
     if cfg.sequence_output_tail_frames > cfg.seq_len:
@@ -534,6 +537,10 @@ def main() -> None:
     )
 
     inference_dtype = torch.float32
+    runtime_amp_enabled = device.type == "cuda" and bool(cfg.runtime_amp)
+    runtime_amp_dtype = torch.float32
+    if runtime_amp_enabled:
+        runtime_amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
     model.eval()
     controller = ActionController(cfg)
@@ -549,6 +556,11 @@ def main() -> None:
     was_autopilot = False
 
     print("=" * 60)
+    print(
+        "Runtime inference:",
+        "state_cache=visual_tokens",
+        f"amp={'off' if not runtime_amp_enabled else str(runtime_amp_dtype).replace('torch.', '')}",
+    )
     print("Running. Press '1' to toggle autopilot, '2' to disable, Ctrl+C to quit.")
     print("=" * 60)
 
@@ -577,12 +589,18 @@ def main() -> None:
                         frame = frame.to(dtype=inference_dtype)
                     with torch.inference_mode():
                         frame_batch = frame.unsqueeze(0)
-                        output, temporal_state = model.forward_step(
-                            frame_batch,
-                            temporal_state,
-                            prev_action=prev_action if cfg.prev_action_feedback else None,
-                        )
-                        button_logits = output.button_logits
+                        with torch.amp.autocast(
+                            device_type=device.type,
+                            dtype=runtime_amp_dtype,
+                            enabled=runtime_amp_enabled,
+                        ):
+                            output, temporal_state = model.forward_step(
+                                frame_batch,
+                                temporal_state,
+                                prev_action=prev_action if cfg.prev_action_feedback else None,
+                                return_vision_aux=False,
+                            )
+                        button_logits = output.button_logits.float()
                     button_probs = torch.sigmoid(button_logits[0])
                     predicted_buttons = (button_probs >= thresholds).to(dtype=button_logits.dtype)
 

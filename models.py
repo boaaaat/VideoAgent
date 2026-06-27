@@ -206,13 +206,14 @@ class PolicyOutput:
 class TemporalState:
     """Rolling transformer context for online inference.
 
-    hidden_state is retained only so older call sites using a keyword argument
-    can still construct the dataclass; the transformer does not consume it.
+    visual_tokens is the fast streaming cache. frames and hidden_state are
+    retained so older call sites can still construct the dataclass.
     """
 
     frames: Optional[torch.Tensor] = None
     prev_actions: Optional[torch.Tensor] = None
     hidden_state: Optional[torch.Tensor] = None
+    visual_tokens: Optional[torch.Tensor] = None
 
 
 class BlurPool2d(nn.Module):
@@ -655,6 +656,61 @@ class DrivingVideoPolicy(nn.Module):
             raise ValueError(f"Invalid TemporalState action shape {tuple(actions.shape)}.")
         return frames[:, -max_prefix:], actions[:, -max_prefix:]
 
+    def _state_visual_prefix(
+        self,
+        state: Optional[TemporalState],
+        batch: int,
+        current_steps: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        max_prefix = max(0, self.context_len - int(current_steps))
+        empty_visual = torch.empty(
+            batch,
+            0,
+            NUM_VISUAL_TOKENS,
+            READOUT_CHANNELS,
+            device=device,
+            dtype=dtype,
+        )
+        empty_actions = torch.empty(batch, 0, self.cfg.num_bin, device=device, dtype=dtype)
+        if max_prefix <= 0 or state is None or state.prev_actions is None:
+            return empty_visual, empty_actions
+
+        actions = state.prev_actions.to(device=device, dtype=dtype)
+        if state.visual_tokens is not None:
+            visual = state.visual_tokens.to(device=device, dtype=dtype)
+            if visual.dim() != 4 or actions.dim() != 3:
+                raise ValueError(
+                    "TemporalState must contain visual_tokens [B,T,6,256] and prev_actions [B,T,6], "
+                    f"got {tuple(visual.shape)} and {tuple(actions.shape)}."
+                )
+            if visual.size(0) != batch or actions.size(0) != batch:
+                raise ValueError(
+                    f"TemporalState batch size must be {batch}, got visual={visual.size(0)} actions={actions.size(0)}."
+                )
+            if visual.size(1) != actions.size(1):
+                raise ValueError(
+                    f"TemporalState visual/action lengths differ: {visual.size(1)} vs {actions.size(1)}."
+                )
+            if visual.size(2) != NUM_VISUAL_TOKENS or visual.size(3) != READOUT_CHANNELS:
+                raise ValueError(f"Invalid TemporalState visual token shape {tuple(visual.shape)}.")
+            if actions.size(2) != self.cfg.num_bin:
+                raise ValueError(f"Invalid TemporalState action shape {tuple(actions.shape)}.")
+            return visual[:, -max_prefix:], actions[:, -max_prefix:]
+
+        prefix_frames, prefix_actions = self._state_prefix(
+            state,
+            batch,
+            current_steps,
+            device=device,
+            dtype=dtype,
+        )
+        if prefix_frames.size(1) == 0:
+            return empty_visual, empty_actions
+        return self.policy.encode_visual_tokens(prefix_frames), prefix_actions.to(dtype=dtype)
+
     def _make_state(
         self,
         frames: torch.Tensor,
@@ -728,6 +784,7 @@ class DrivingVideoPolicy(nn.Module):
         state: Optional[TemporalState] = None,
         *,
         prev_action: Optional[torch.Tensor] = None,
+        return_vision_aux: bool = True,
     ) -> Tuple[PolicyOutput, TemporalState]:
         """Run one RGB frame with a rolling causal context."""
 
@@ -735,32 +792,35 @@ class DrivingVideoPolicy(nn.Module):
             raise ValueError(f"Expected frame [B,3,H,W], got {tuple(frame.shape)}.")
         frame = self._prepare_frames(frame).unsqueeze(1)
         batch = frame.size(0)
+        current_visual = self.policy.encode_visual_tokens(frame)
         action = self._sequence_prev_actions(
             prev_action,
             batch,
             1,
             device=frame.device,
-            dtype=frame.dtype,
+            dtype=current_visual.dtype,
         )
-        prefix_frames, prefix_actions = self._state_prefix(
+        prefix_visual, prefix_actions = self._state_visual_prefix(
             state,
             batch,
             1,
             device=frame.device,
-            dtype=frame.dtype,
+            dtype=current_visual.dtype,
         )
-        frames = torch.cat([prefix_frames, frame], dim=1)
+        visual_tokens = torch.cat([prefix_visual, current_visual], dim=1)
         actions = torch.cat([prefix_actions, action], dim=1)
-        visual_tokens = self.policy.encode_visual_tokens(frames)
-        logits, vision_logits = self._logits_with_zero_action_aux(
-            visual_tokens,
-            actions,
-            current_steps=1,
+        logits = self.policy.logits_from_visual(visual_tokens, actions)[:, -1]
+        vision_logits = None
+        if return_vision_aux:
+            zero_actions = torch.zeros_like(actions)
+            vision_logits = self.policy.logits_from_visual(visual_tokens, zero_actions)[:, -1]
+        next_state = TemporalState(
+            prev_actions=actions[:, -self.context_len :].detach(),
+            visual_tokens=visual_tokens[:, -self.context_len :].detach(),
         )
-        next_state = self._make_state(frames, actions, keep_cache=True)
         output = PolicyOutput(
-            button_logits=logits[:, -1],
-            vision_button_logits=vision_logits[:, -1],
+            button_logits=logits,
+            vision_button_logits=vision_logits,
         )
         return output, next_state
 
