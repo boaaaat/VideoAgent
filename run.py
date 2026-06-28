@@ -533,7 +533,7 @@ def main() -> None:
         "Runtime previous-action feedback:",
         f"enabled={cfg.prev_action_feedback}",
         "mode=hard-applied",
-        f"context_len={int(cfg.seq_len)}",
+        f"context_len={int(model.context_len)}",
     )
 
     inference_dtype = torch.float32

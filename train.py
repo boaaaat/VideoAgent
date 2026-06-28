@@ -1,7 +1,7 @@
 """DALI trainer for the dense-supervision CNN latent transformer policy.
 
 The DALI pipeline owns GPU video decode and resize. CSV labels are parsed once
-on the host, then joined to decoded 80-frame windows through the DALI sample
+on the host, then joined to decoded fixed-length windows through the DALI sample
 label written into the file list. Each window is an independent causal
 transformer context with shifted previous-action tokens.
 """
@@ -34,6 +34,7 @@ from nvidia.dali.plugin.pytorch import DALIGenericIterator, LastBatchPolicy
 from augmentations import augment_frames
 from models import (
     ARCHITECTURE_VERSION,
+    DEFAULT_SEQUENCE_LENGTH,
     FUSED_CHANNELS,
     NUM_VISUAL_TOKENS,
     READOUT_CHANNELS,
@@ -74,8 +75,8 @@ def _finite_float(name: str, value: object, minimum: float, maximum: Optional[fl
 class TrainConfig(ModelConfig):
     """Training settings. The inherited model config fixes the six action names."""
 
-    train_seq_stride: int = 80
-    val_seq_stride: int = 80
+    train_seq_stride: int = DEFAULT_SEQUENCE_LENGTH
+    val_seq_stride: int = DEFAULT_SEQUENCE_LENGTH
     action_offset: int = 1
     dense_temporal_supervision: bool = True
 
@@ -102,15 +103,17 @@ class TrainConfig(ModelConfig):
     # unstable and encouraged the low-precision predictions seen in validation.
     pos_weight_power: float = 0.5
     pos_weight_clamp: float = 8.0
+    main_policy_loss_weight: float = 1.0
     conflict_penalty_weight: float = 0.20
-    vision_aux_loss_weight: float = 0.50
+    vision_aux_loss_weight: float = 0.5
     # Drop full previous-action tokens during teacher forcing so the causal
     # transformer cannot solve the task by copying action persistence alone.
-    action_token_dropout_prob: float = 0.10
-    # Optional closed-loop scheduled sampling over independent 80-frame windows.
+    action_token_dropout_prob: float = 0.4
+    # Optional closed-loop scheduled sampling over independent fixed-length windows.
     # It is expensive and can trigger a separate torch.compile graph, so keep it
     # opt-in while action-token dropout provides the default regularization.
     autoregressive_feedback_prob: float = 0.0
+    autoregressive_validation: bool = True
     fit_thresholds_from_val: bool = True
     threshold_min: float = 0.10
     threshold_max: float = 0.90
@@ -164,6 +167,9 @@ class TrainConfig(ModelConfig):
         self.train_split = _finite_float("train_split", self.train_split, 0.05, 0.95)
         self.pos_weight_power = _finite_float("pos_weight_power", self.pos_weight_power, 0.0)
         self.pos_weight_clamp = _finite_float("pos_weight_clamp", self.pos_weight_clamp, 1.0)
+        self.main_policy_loss_weight = _finite_float(
+            "main_policy_loss_weight", self.main_policy_loss_weight, 0.0
+        )
         self.conflict_penalty_weight = _finite_float(
             "conflict_penalty_weight", self.conflict_penalty_weight, 0.0
         )
@@ -174,10 +180,12 @@ class TrainConfig(ModelConfig):
         self.autoregressive_feedback_prob = _finite_float(
             "autoregressive_feedback_prob", self.autoregressive_feedback_prob, 0.0, 1.0
         )
+        self.autoregressive_validation = bool(self.autoregressive_validation)
         if not self.last_action_conditioning:
             self.vision_aux_loss_weight = 0.0
             self.action_token_dropout_prob = 0.0
             self.autoregressive_feedback_prob = 0.0
+            self.autoregressive_validation = False
         self.threshold_min = _finite_float("threshold_min", self.threshold_min, 0.0, 1.0)
         self.threshold_max = _finite_float("threshold_max", self.threshold_max, 0.0, 1.0)
         if self.threshold_max < self.threshold_min:
@@ -501,7 +509,7 @@ def build_window_targets(
             meta.append(WindowMeta(video_path, start, start + int(cfg.seq_len)))
     if not label_windows:
         raise RuntimeError(
-            "No valid 80-frame windows were created. Check CSV lengths, seq_len, and prediction_horizon."
+            "No valid sequence windows were created. Check CSV lengths, seq_len, and prediction_horizon."
         )
     return WindowTargets(
         labels=torch.stack(label_windows, dim=0),
@@ -745,11 +753,17 @@ def run_epoch(
     total_steps: int,
     global_step: int,
     description: str,
+    force_autoregressive_feedback: bool = False,
+    fit_thresholds: Optional[bool] = None,
 ) -> Tuple[Dict[str, object], int]:
     training = optimizer is not None
+    if force_autoregressive_feedback and training:
+        raise ValueError("Forced autoregressive feedback is only supported for validation/eval epochs.")
     model.train(training)
     if training:
         optimizer.zero_grad(set_to_none=True)
+    if fit_thresholds is None:
+        fit_thresholds = (not training and cfg.fit_thresholds_from_val)
 
     loss_sum = 0.0
     bce_loss_sum = 0.0
@@ -757,7 +771,7 @@ def run_epoch(
     conflict_loss_sum = 0.0
     stats = BinaryStats(cfg.num_bin, device)
     vision_stats = BinaryStats(cfg.num_bin, device)
-    fitter = ThresholdFitter() if (not training and cfg.fit_thresholds_from_val) else None
+    fitter = ThresholdFitter() if bool(fit_thresholds) else None
     thresholds = threshold_tensor(cfg, device=device)
     progress = tqdm(range(num_batches), desc=description, dynamic_ncols=True)
     iterator_it = iter(iterator)
@@ -779,7 +793,7 @@ def run_epoch(
                 dtype=amp_dtype,
                 enabled=amp_dtype == torch.bfloat16,
             ):
-                closed_loop = use_autoregressive_feedback(training=training, cfg=cfg)
+                closed_loop = force_autoregressive_feedback or use_autoregressive_feedback(training=training, cfg=cfg)
                 if closed_loop:
                     autoregressive_batches += 1
                     output = model(
@@ -819,7 +833,7 @@ def run_epoch(
                 )
                 conflict_loss = conflicting_action_penalty(logits, cfg)
                 loss = (
-                    bce_loss
+                    float(cfg.main_policy_loss_weight) * bce_loss
                     + float(cfg.vision_aux_loss_weight) * vision_bce_loss
                     + float(cfg.conflict_penalty_weight) * conflict_loss
                 )
@@ -947,10 +961,32 @@ def maybe_resume(
     # Older checkpoints selected by macro F1 have no comparable best BCE.  On
     # resume, treat the next validation pass as the first candidate instead of
     # comparing a loss to an old F1 value.
+    best_validation_bce = float(state.get("best_validation_bce", math.inf))
+
+    def checkpoint_int(name: str, fallback: int) -> int:
+        value = config.get(name, fallback)
+        return int(fallback if value is None else value)
+
+    checkpoint_validation_contract = (
+        checkpoint_int("seq_len", int(cfg.seq_len)),
+        checkpoint_int("val_seq_stride", int(cfg.val_seq_stride)),
+        checkpoint_int("action_offset", int(cfg.action_offset)),
+    )
+    current_validation_contract = (
+        int(cfg.seq_len),
+        int(cfg.val_seq_stride),
+        int(cfg.action_offset),
+    )
+    if checkpoint_validation_contract != current_validation_contract:
+        print(
+            "Validation contract changed since checkpoint; resetting best validation BCE "
+            f"from {best_validation_bce:.4f}."
+        )
+        best_validation_bce = math.inf
     return (
         int(state.get("epoch", 0)),
         int(state.get("global_step", 0)),
-        float(state.get("best_validation_bce", math.inf)),
+        best_validation_bce,
     )
 
 
@@ -1049,6 +1085,7 @@ def print_startup_stats(
         "BCEWithLogits",
         f"pos_weight_power={cfg.pos_weight_power:.3f}",
         f"pos_weight_clamp={cfg.pos_weight_clamp:.3f}",
+        f"main_policy_weight={cfg.main_policy_loss_weight:.3f}",
         f"conflict_weight={cfg.conflict_penalty_weight:.3f}",
         f"vision_aux_weight={cfg.vision_aux_loss_weight:.3f}",
     )
@@ -1058,7 +1095,7 @@ def print_startup_stats(
         f"teacher_forcing={1.0 - float(cfg.autoregressive_feedback_prob):.2f}",
         f"closed_loop_train={float(cfg.autoregressive_feedback_prob):.2f}",
         f"token_dropout={float(cfg.action_token_dropout_prob):.3f}",
-        "validation=teacher_forced",
+        f"validation={'teacher_forced+closed_loop' if cfg.autoregressive_validation else 'teacher_forced'}",
     )
     print(
         "  Train class stats:",
@@ -1185,11 +1222,36 @@ def train(cfg: Optional[TrainConfig] = None) -> None:
         fitted = val_metrics.get("fitted_thresholds")
         if isinstance(fitted, tuple) and len(fitted) == cfg.num_bin:
             cfg.button_state_thresholds = tuple(float(item) for item in fitted)
+        closed_loop_val_metrics: Optional[Dict[str, object]] = None
+        if cfg.autoregressive_validation:
+            with torch.inference_mode():
+                closed_loop_val_metrics, _ = run_epoch(
+                    model=model,
+                    iterator=val_iterator,
+                    num_batches=val_batches,
+                    targets=val_targets,
+                    cfg=cfg,
+                    device=device,
+                    amp_dtype=amp_dtype,
+                    pos_weight=pos_weight,
+                    optimizer=None,
+                    total_steps=total_steps,
+                    global_step=global_step,
+                    description=f"Epoch {epoch + 1}/{cfg.num_epochs} val closed-loop",
+                    force_autoregressive_feedback=True,
+                    fit_thresholds=False,
+                )
         score = float(val_metrics["macro_f1"])
         validation_bce = float(val_metrics["bce_loss"])
         is_best = validation_bce < best_validation_bce
         if is_best:
             best_validation_bce = validation_bce
+        closed_loop_summary = ""
+        if closed_loop_val_metrics is not None:
+            closed_loop_summary = (
+                f" val_closed_loop_bce={float(closed_loop_val_metrics['bce_loss']):.4f} "
+                f"val_closed_loop_f1={float(closed_loop_val_metrics['macro_f1']):.4f}"
+            )
         print(
             f"Epoch {epoch + 1}/{cfg.num_epochs}: "
             f"train_loss={float(train_metrics['loss']):.4f} "
@@ -1202,6 +1264,7 @@ def train(cfg: Optional[TrainConfig] = None) -> None:
             f"val_conflict={float(val_metrics['conflict_penalty']):.4f} "
             f"val_f1={score:.4f} "
             f"val_vision_f1={float(val_metrics['vision_macro_f1']):.4f}"
+            f"{closed_loop_summary}"
         )
         print(
             f"Validation best_bce={best_validation_bce:.4f} "
@@ -1211,6 +1274,16 @@ def train(cfg: Optional[TrainConfig] = None) -> None:
         )
         print_metric_rows("Validation controls:", val_metrics["rows"])
         print_metric_rows("Validation vision-only controls:", val_metrics["vision_rows"])
+        if closed_loop_val_metrics is not None:
+            print(
+                f"Closed-loop validation: "
+                f"loss={float(closed_loop_val_metrics['loss']):.4f} "
+                f"bce={float(closed_loop_val_metrics['bce_loss']):.4f} "
+                f"conflict={float(closed_loop_val_metrics['conflict_penalty']):.4f} "
+                f"f1={float(closed_loop_val_metrics['macro_f1']):.4f} "
+                f"closed_loop={int(closed_loop_val_metrics['autoregressive_batches'])}/{val_batches}"
+            )
+            print_metric_rows("Closed-loop validation controls:", closed_loop_val_metrics["rows"])
         if fitted is not None:
             print("Validation thresholds:", dict(zip(cfg.key_names, cfg.button_state_thresholds)))
 
@@ -1264,10 +1337,13 @@ def parse_args() -> TrainConfig:
     add("--train-split", type=float, default=None)
     add("--pos-weight-power", type=float, default=None)
     add("--pos-weight-clamp", type=float, default=None)
+    add("--main-policy-loss-weight", type=float, default=None)
     add("--conflict-penalty-weight", type=float, default=None)
     add("--vision-aux-loss-weight", type=float, default=None)
     add("--action-token-dropout-prob", type=float, default=None)
     add("--autoregressive-feedback-prob", type=float, default=None)
+    add("--autoregressive-validation", dest="autoregressive_validation", action="store_true", default=None)
+    add("--no-autoregressive-validation", dest="autoregressive_validation", action="store_false")
     add("--threshold-min", type=float, default=None)
     add("--threshold-max", type=float, default=None)
     add("--fit-thresholds-from-val", dest="fit_thresholds_from_val", action="store_true", default=None)

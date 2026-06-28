@@ -71,7 +71,7 @@ def default_output_path(video_path: str) -> str:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Visualize the policy input mask from models.py on a video's first frame.")
-    parser.add_argument("--video", default=None, help="Video to read. Defaults to the first run_*.mp4 in cfg.data_root.")
+    parser.add_argument("--video", default=r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\data\greenville\train\run_20260521_144430.mp4', help="Video to read. Defaults to the first run_*.mp4 in cfg.data_root.")
     parser.add_argument("--data-root", default=None, help="Data root used when --video is omitted.")
     parser.add_argument("--model-size", type=int, default=None, help="Square resize size before applying the mask.")
     parser.add_argument("--selected-game", default=None, help="Game config name. Defaults to action_space.selected_game.")

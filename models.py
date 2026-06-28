@@ -26,13 +26,15 @@ DEEP_CHANNELS = 192
 FUSED_CHANNELS = 128
 READOUT_CHANNELS = 256
 DEFAULT_MODEL_SIZE = 256
-DEFAULT_SEQUENCE_LENGTH = 80
+FUSED_SPATIAL_SIZE = DEFAULT_MODEL_SIZE // 4
+DEFAULT_CONTEXT_LENGTH = 60
+DEFAULT_SEQUENCE_LENGTH = 60
 DEFAULT_ACTION_NAMES = ("w", "a", "s", "d", "z", "c")
-NUM_VISUAL_TOKENS = 6
+NUM_VISUAL_TOKENS = 32
 TOKENS_PER_STEP = NUM_VISUAL_TOKENS + 1
 TEMPORAL_HEADS = 8
 TEMPORAL_LAYERS = 8
-ARCHITECTURE_VERSION = "cnn_latent_causal_transformer_v1"
+ARCHITECTURE_VERSION = "cnn_latent_causal_transformer_v4_ctx60_stem_fusion_spatial_pos"
 
 
 def _as_int(name: str, value: object, minimum: int) -> int:
@@ -112,8 +114,8 @@ class ModelConfig:
         if self.model_size != DEFAULT_MODEL_SIZE:
             raise ValueError(f"model_size must be {DEFAULT_MODEL_SIZE}, got {self.model_size}.")
         self.seq_len = _as_int("seq_len", self.seq_len, 1)
-        if self.seq_len > DEFAULT_SEQUENCE_LENGTH:
-            raise ValueError(f"seq_len must be <= {DEFAULT_SEQUENCE_LENGTH}, got {self.seq_len}.")
+        if self.seq_len > DEFAULT_CONTEXT_LENGTH:
+            raise ValueError(f"seq_len must be <= {DEFAULT_CONTEXT_LENGTH}, got {self.seq_len}.")
         self.train_seq_stride = _as_int("train_seq_stride", self.train_seq_stride, 1)
         self.val_seq_stride = _as_int("val_seq_stride", self.val_seq_stride, 1)
         self.sequence_output_tail_frames = _as_int(
@@ -295,6 +297,8 @@ class SpatialLatentTokenizer(nn.Module):
     ):
         super().__init__()
         self.proj = nn.Conv2d(cin, d_model, kernel_size=1)
+        self.spatial_pos_y = nn.Parameter(torch.zeros(1, d_model, FUSED_SPATIAL_SIZE, 1))
+        self.spatial_pos_x = nn.Parameter(torch.zeros(1, d_model, 1, FUSED_SPATIAL_SIZE))
         self.latents = nn.Parameter(torch.randn(1, num_latents, d_model) * 0.02)
         self.attn = nn.MultiheadAttention(d_model, num_heads, batch_first=True)
         self.ln = nn.LayerNorm(d_model)
@@ -303,12 +307,21 @@ class SpatialLatentTokenizer(nn.Module):
             nn.GELU(),
             nn.Linear(4 * d_model, d_model),
         )
+        nn.init.trunc_normal_(self.spatial_pos_y, std=0.02)
+        nn.init.trunc_normal_(self.spatial_pos_x, std=0.02)
+
+    def _spatial_pos(self, height: int, width: int, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        pos = self.spatial_pos_y + self.spatial_pos_x
+        if pos.size(-2) != height or pos.size(-1) != width:
+            pos = F.interpolate(pos, size=(height, width), mode="bilinear", align_corners=False)
+        return pos.to(device=device, dtype=dtype)
 
     def forward(self, fmap: torch.Tensor) -> torch.Tensor:
         if fmap.dim() != 4:
             raise ValueError(f"Expected feature map [B,C,H,W], got {tuple(fmap.shape)}.")
         batch = fmap.size(0)
         x = self.proj(fmap)
+        x = x + self._spatial_pos(x.size(-2), x.size(-1), device=x.device, dtype=x.dtype)
         x = x.flatten(2).transpose(1, 2)
         q = self.latents.to(dtype=x.dtype).expand(batch, -1, -1)
         y, _ = self.attn(q, x, x, need_weights=False)
@@ -356,6 +369,11 @@ class FrameEncoder(nn.Module):
         self.stage2 = DownStage(LOW_CHANNELS, MID_CHANNELS, n_blocks=2)
         self.stage3 = DownStage(MID_CHANNELS, DEEP_CHANNELS, n_blocks=4)
 
+        self.p0 = nn.Sequential(
+            nn.Conv2d(STEM_CHANNELS, 64, kernel_size=1),
+            ConvGNAct(64, 64, 3, 2, 1),
+            ConvGNAct(64, 64, 3, 2, 1),
+        )
         self.p1 = nn.Sequential(
             nn.Conv2d(LOW_CHANNELS, 64, kernel_size=1),
             ConvGNAct(64, 64, 3, 2, 1),
@@ -363,7 +381,7 @@ class FrameEncoder(nn.Module):
         self.p2 = nn.Conv2d(MID_CHANNELS, 64, kernel_size=1)
         self.p3 = nn.Conv2d(DEEP_CHANNELS, 64, kernel_size=1)
         self.fuse = nn.Sequential(
-            ConvGNAct(64 * 3, FUSED_CHANNELS, 3, 1, 1),
+            ConvGNAct(64 * 4, FUSED_CHANNELS, 3, 1, 1),
             ConvNeXtBlock2D(FUSED_CHANNELS),
         )
         self.tokenizer = SpatialLatentTokenizer(
@@ -385,10 +403,11 @@ class FrameEncoder(nn.Module):
         b2 = self.stage2(b1)
         b3 = self.stage3(b2)
 
+        p0 = self.p0(x)
         p1 = self.p1(b1)
         p2 = self.p2(b2)
-        p3 = F.interpolate(self.p3(b3), scale_factor=2, mode="bilinear", align_corners=False)
-        fused = self.fuse(torch.cat([p1, p2, p3], dim=1))
+        p3 = F.interpolate(self.p3(b3), size=p2.shape[-2:], mode="bilinear", align_corners=False)
+        fused = self.fuse(torch.cat([p0, p1, p2, p3], dim=1))
         return self.tokenizer(fused)
 
 
@@ -397,7 +416,7 @@ class GreenvilleBCFormer(nn.Module):
 
     def __init__(
         self,
-        context_len: int = DEFAULT_SEQUENCE_LENGTH,
+        context_len: int = DEFAULT_CONTEXT_LENGTH,
         num_visual_tokens: int = NUM_VISUAL_TOKENS,
         d_model: int = READOUT_CHANNELS,
         n_heads: int = TEMPORAL_HEADS,
@@ -516,6 +535,8 @@ def apply_static_masks(frames: torch.Tensor, *, clone: bool = True) -> torch.Ten
     height, width = frames.shape[-2:]
     output = frames.clone() if clone else frames
     output[..., int(height * 0.96) :, :] = 0.0
+    output[..., int(height * 0.75) : int(height * 0.97), int(width * 0.33) : int(width * 0.45)] = 0.0
+    output[..., int(height * 0.75) : int(height * 0.97), int(width * 0.56) : int(width * 0.67)] = 0.0
     output[..., int(height * 0.05) : int(height * 0.20), int(width * 0.75) :] = 0.0
     output[..., : int(height * 0.10), : int(width * 0.10)] = 0.0
     return output
@@ -528,7 +549,7 @@ class DrivingVideoPolicy(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.policy = GreenvilleBCFormer(
-            context_len=DEFAULT_SEQUENCE_LENGTH,
+            context_len=DEFAULT_CONTEXT_LENGTH,
             num_visual_tokens=NUM_VISUAL_TOKENS,
             d_model=READOUT_CHANNELS,
             n_heads=TEMPORAL_HEADS,

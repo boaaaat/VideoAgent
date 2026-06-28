@@ -265,10 +265,11 @@ def _policy_feature_map(
     if name == "deep":
         return deep
 
+    p0 = encoder.p0(stem)
     p1 = encoder.p1(low)
     p2 = encoder.p2(mid)
     p3 = F.interpolate(encoder.p3(deep), size=p2.shape[-2:], mode="bilinear", align_corners=False)
-    fused = encoder.fuse(torch.cat([p1, p2, p3], dim=1))
+    fused = encoder.fuse(torch.cat([p0, p1, p2, p3], dim=1))
     if name == "fused":
         return fused
 
@@ -975,9 +976,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "stage5",
             "spatial",
         ],
-        default="stem",
+        default="low",
         help=(
-            "Feature map to visualize: CNN stages (stem/low/mid/deep), 64x64 fused map, "
+            "Feature map to visualize: CNN stages (stem/low/mid/deep), 256/128/64/32-to-64 fused map, "
             "256-channel projected map, or learned latent-token similarity map. "
             "stage1-stage5 and spatial are accepted as old CLI aliases."
         ),
