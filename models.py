@@ -537,6 +537,7 @@ def apply_static_masks(frames: torch.Tensor, *, clone: bool = True) -> torch.Ten
     output[..., int(height * 0.96) :, :] = 0.0
     output[..., int(height * 0.75) : int(height * 0.97), int(width * 0.33) : int(width * 0.45)] = 0.0
     output[..., int(height * 0.75) : int(height * 0.97), int(width * 0.56) : int(width * 0.67)] = 0.0
+    output[..., int(height * 0.08) : int(height * 0.14), int(width * 0.66) : int(width * 0.79)] = 0.0
     output[..., int(height * 0.05) : int(height * 0.20), int(width * 0.75) :] = 0.0
     output[..., : int(height * 0.10), : int(width * 0.10)] = 0.0
     return output

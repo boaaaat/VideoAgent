@@ -938,8 +938,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # parser.add_argument("--input", default=r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\data\greenville\train\run_20260520_121714.mp4', help="Input video path. Defaults to the newest run in cfg.data_root.")
     # parser.add_argument("--input", default=r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\data\greenville\train\run_20260520_214455.mp4', help="Input video path. Defaults to the newest run in cfg.data_root.")
     # parser.add_argument("--input", default=r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\data\greenville\train\run_20260522_161244.mp4', help="Input video path. Defaults to the newest run in cfg.data_root.")
-    # parser.add_argument("--input", default=r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\data\greenville\train\run_20260526_174504.mp4', help="Input video path. Defaults to the newest run in cfg.data_root.")
-    parser.add_argument("--input", default=r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\data\greenville\train\run_20260526_175335.mp4', help="Input video path. Defaults to the newest run in cfg.data_root.")
+    parser.add_argument("--input", default=r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\data\greenville\train\run_20260526_174504.mp4', help="Input video path. Defaults to the newest run in cfg.data_root.")
+    # parser.add_argument("--input", default=r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\data\greenville\train\run_20260526_175335.mp4', help="Input video path. Defaults to the newest run in cfg.data_root.")
     # parser.add_argument("--input", default=r'C:\Users\Abhil\Desktop\Github_Projects\VideoAgent\data\greenville\train\run_20260526_180131.mp4', help="Input video path. Defaults to the newest run in cfg.data_root.")
     parser.add_argument("--output", default=None, help="Output video path (.mp4). Default auto-names next to input.")
     parser.add_argument("--csv", default=None, help="CSV labels for the input video. Default auto-detects next to --input.")
@@ -976,7 +976,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "stage5",
             "spatial",
         ],
-        default="low",
+        default="stem",
         help=(
             "Feature map to visualize: CNN stages (stem/low/mid/deep), 256/128/64/32-to-64 fused map, "
             "256-channel projected map, or learned latent-token similarity map. "

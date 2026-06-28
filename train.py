@@ -108,11 +108,11 @@ class TrainConfig(ModelConfig):
     vision_aux_loss_weight: float = 0.5
     # Drop full previous-action tokens during teacher forcing so the causal
     # transformer cannot solve the task by copying action persistence alone.
-    action_token_dropout_prob: float = 0.4
+    action_token_dropout_prob: float = 0.3
     # Optional closed-loop scheduled sampling over independent fixed-length windows.
     # It is expensive and can trigger a separate torch.compile graph, so keep it
     # opt-in while action-token dropout provides the default regularization.
-    autoregressive_feedback_prob: float = 0.0
+    autoregressive_feedback_prob: float = 0.25
     autoregressive_validation: bool = True
     fit_thresholds_from_val: bool = True
     threshold_min: float = 0.10
@@ -1226,7 +1226,9 @@ def train(cfg: Optional[TrainConfig] = None) -> None:
         if cfg.autoregressive_validation:
             with torch.inference_mode():
                 closed_loop_val_metrics, _ = run_epoch(
-                    model=model,
+                    # Forced autoregressive validation unrolls through a different
+                    # graph shape; keep it eager to avoid torch.compile overhead.
+                    model=base_model,
                     iterator=val_iterator,
                     num_batches=val_batches,
                     targets=val_targets,
