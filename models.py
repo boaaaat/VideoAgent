@@ -454,6 +454,12 @@ class GreenvilleBCFormer(nn.Module):
             nn.GELU(),
             nn.Linear(d_model, len(DEFAULT_ACTION_NAMES)),
         )
+        self.vision_head = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, len(DEFAULT_ACTION_NAMES)),
+        )
 
     def _causal_mask(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         mask = torch.full((seq_len, seq_len), float("-inf"), device=device, dtype=dtype)
@@ -517,10 +523,15 @@ class GreenvilleBCFormer(nn.Module):
         batch, steps = visual_tokens.shape[:2]
         return x.reshape(batch, steps, self.tokens_per_step, self.d_model)
 
-    def logits_from_visual(self, visual_tokens: torch.Tensor, prev_actions: torch.Tensor) -> torch.Tensor:
+    def action_states_from_visual(self, visual_tokens: torch.Tensor, prev_actions: torch.Tensor) -> torch.Tensor:
         x = self.temporal_features_from_visual(visual_tokens, prev_actions)
-        action_states = x[:, :, -1, :]
-        return self.head(action_states)
+        return x[:, :, -1, :]
+
+    def logits_from_visual(self, visual_tokens: torch.Tensor, prev_actions: torch.Tensor) -> torch.Tensor:
+        return self.head(self.action_states_from_visual(visual_tokens, prev_actions))
+
+    def vision_logits_from_visual(self, visual_tokens: torch.Tensor, prev_actions: torch.Tensor) -> torch.Tensor:
+        return self.vision_head(self.action_states_from_visual(visual_tokens, prev_actions))
 
     def forward(self, frames: torch.Tensor, prev_actions: torch.Tensor) -> torch.Tensor:
         visual_tokens = self.encode_visual_tokens(frames)
@@ -769,7 +780,7 @@ class DrivingVideoPolicy(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         logits = self.policy.logits_from_visual(visual_tokens, actions)
         zero_actions = torch.zeros_like(actions)
-        vision_logits = self.policy.logits_from_visual(visual_tokens, zero_actions)
+        vision_logits = self.policy.vision_logits_from_visual(visual_tokens, zero_actions)
         return logits[:, -current_steps:], vision_logits[:, -current_steps:]
 
     def _autoregressive_logits(
@@ -835,7 +846,7 @@ class DrivingVideoPolicy(nn.Module):
         vision_logits = None
         if return_vision_aux:
             zero_actions = torch.zeros_like(actions)
-            vision_logits = self.policy.logits_from_visual(visual_tokens, zero_actions)[:, -1]
+            vision_logits = self.policy.vision_logits_from_visual(visual_tokens, zero_actions)[:, -1]
         next_state = TemporalState(
             prev_actions=actions[:, -self.context_len :].detach(),
             visual_tokens=visual_tokens[:, -self.context_len :].detach(),
@@ -900,7 +911,7 @@ class DrivingVideoPolicy(nn.Module):
             )
             all_actions = torch.cat([prefix_actions, current_actions], dim=1)
             zero_actions = torch.zeros_like(all_actions)
-            vision_logits = self.policy.logits_from_visual(visual_tokens, zero_actions)[:, -steps:]
+            vision_logits = self.policy.vision_logits_from_visual(visual_tokens, zero_actions)[:, -steps:]
         else:
             current_actions = self._sequence_prev_actions(
                 prev_action,

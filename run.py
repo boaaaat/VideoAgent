@@ -100,6 +100,66 @@ MOUSE_NAME_MAP = {
     "right_click": "right",
     "middle_click": "middle",
 }
+KEY_NAME_TO_VK = {
+    "Key.backspace": 0x08,
+    "Key.tab": 0x09,
+    "Key.enter": 0x0D,
+    "Key.shift": 0x10,
+    "Key.shift_l": 0xA0,
+    "Key.shift_r": 0xA1,
+    "Key.ctrl": 0x11,
+    "Key.ctrl_l": 0xA2,
+    "Key.ctrl_r": 0xA3,
+    "Key.alt": 0x12,
+    "Key.alt_l": 0xA4,
+    "Key.alt_r": 0xA5,
+    "Key.esc": 0x1B,
+    "Key.space": 0x20,
+    "Key.left": 0x25,
+    "Key.up": 0x26,
+    "Key.right": 0x27,
+    "Key.down": 0x28,
+}
+
+
+def _key_name_to_vk(key_name: str) -> Optional[int]:
+    key_name = str(key_name)
+    if len(key_name) == 1:
+        char = key_name.upper()
+        if "A" <= char <= "Z" or "0" <= char <= "9":
+            return ord(char)
+    return KEY_NAME_TO_VK.get(key_name)
+
+
+def _is_key_down(key_name: str) -> bool:
+    vk_code = _key_name_to_vk(key_name)
+    if vk_code is None:
+        return False
+    try:
+        return bool(ctypes.windll.user32.GetAsyncKeyState(int(vk_code)) & 0x8000)
+    except Exception:
+        return False
+
+
+def merge_keyboard_feedback(action: torch.Tensor, cfg: RuntimeConfig) -> torch.Tensor:
+    """OR currently held keyboard keys into the previous-action token."""
+
+    if not cfg.key_names:
+        return action
+    merged = action.clone()
+    key_values = torch.tensor(
+        [1.0 if _is_key_down(key_name) else 0.0 for key_name in cfg.key_names],
+        device=merged.device,
+        dtype=merged.dtype,
+    )
+    key_count = len(cfg.key_names)
+    if merged.dim() == 1:
+        merged[:key_count] = torch.maximum(merged[:key_count], key_values)
+    elif merged.dim() == 2:
+        merged[:, :key_count] = torch.maximum(merged[:, :key_count], key_values.view(1, key_count))
+    else:
+        raise ValueError(f"Expected action token [A] or [B,A], got {tuple(merged.shape)}.")
+    return merged
 
 
 def release_all() -> None:
@@ -366,12 +426,12 @@ def _checkpoint_path(cfg: RuntimeConfig) -> str:
             raise FileNotFoundError(f"Checkpoint not found: {cfg.ckpt_path}")
         return cfg.ckpt_path
 
+    best_path = os.path.join(cfg.ckpt_dir, "model_latest.pt")
+    if os.path.exists(best_path):
+        return best_path
     latest_path = os.path.join(cfg.ckpt_dir, "model_latest.pt")
     if os.path.exists(latest_path):
         return latest_path
-    best_path = os.path.join(cfg.ckpt_dir, "model_best.pt")
-    if os.path.exists(best_path):
-        return best_path
     raise FileNotFoundError(f"Expected checkpoint at {best_path!r} or {latest_path!r}.")
 
 
@@ -399,6 +459,25 @@ def load_checkpoint(
         f"best_bce={state.get('best_validation_bce')}",
     )
     return cfg, model_state
+
+
+def fill_missing_vision_head_state(model: torch.nn.Module, model_state: Dict) -> bool:
+    current_state = model.state_dict()
+    missing = [
+        key
+        for key in current_state
+        if key.startswith("policy.vision_head.") and key not in model_state
+    ]
+    if not missing:
+        return False
+    for key in missing:
+        source_key = key.replace("policy.vision_head.", "policy.head.", 1)
+        source = model_state.get(source_key)
+        if source is not None and tuple(source.shape) == tuple(current_state[key].shape):
+            model_state[key] = source.detach().clone()
+        else:
+            model_state[key] = current_state[key].detach().clone()
+    return True
 
 
 class ActionController:
@@ -501,6 +580,7 @@ def main() -> None:
     RUNTIME_CFG = cfg
 
     model = DrivingVideoPolicy(cfg).to(device)
+    initialized_vision_head = fill_missing_vision_head_state(model, model_state)
     try:
         model.load_state_dict(model_state)
     except RuntimeError as exc:
@@ -508,6 +588,8 @@ def main() -> None:
             f"Checkpoint {cfg.ckpt_path!r} is not compatible with the current model "
             f"(architecture={ARCHITECTURE_VERSION}). Train a fresh checkpoint or choose a compatible one."
         ) from exc
+    if initialized_vision_head:
+        print("Initialized missing vision_head weights from the checkpoint main policy head.")
     print(
         "Model:",
         f"size={cfg.model_size}",
@@ -532,7 +614,7 @@ def main() -> None:
     print(
         "Runtime previous-action feedback:",
         f"enabled={cfg.prev_action_feedback}",
-        "mode=hard-applied",
+        "mode=hard-applied+keyboard",
         f"context_len={int(model.context_len)}",
     )
 
@@ -587,6 +669,11 @@ def main() -> None:
                     frame = frame_cpu.to(device, non_blocking=True)
                     if frame.dtype != inference_dtype:
                         frame = frame.to(dtype=inference_dtype)
+                    feedback_input = (
+                        merge_keyboard_feedback(prev_action, cfg)
+                        if cfg.prev_action_feedback
+                        else None
+                    )
                     with torch.inference_mode():
                         frame_batch = frame.unsqueeze(0)
                         with torch.amp.autocast(
@@ -597,7 +684,7 @@ def main() -> None:
                             output, temporal_state = model.forward_step(
                                 frame_batch,
                                 temporal_state,
-                                prev_action=prev_action if cfg.prev_action_feedback else None,
+                                prev_action=feedback_input,
                                 return_vision_aux=False,
                             )
                         button_logits = output.button_logits.float()
@@ -610,6 +697,7 @@ def main() -> None:
                     )
                     if cfg.prev_action_feedback:
                         feedback_buttons = button_probs if cfg.prev_action_feedback_soft else applied_buttons
+                        feedback_buttons = merge_keyboard_feedback(feedback_buttons, cfg)
                         prev_action = feedback_buttons.detach().reshape(1, cfg.num_bin).to(
                             device=device,
                             dtype=inference_dtype,

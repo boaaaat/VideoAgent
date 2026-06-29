@@ -71,6 +71,16 @@ def _finite_float(name: str, value: object, minimum: float, maximum: Optional[fl
     return result
 
 
+def _parse_threshold_sequence(value: str) -> Tuple[float, ...]:
+    parts = [item.strip() for item in str(value).split(",")]
+    if not parts or any(not item for item in parts):
+        raise argparse.ArgumentTypeError("threshold list must be comma-separated floats")
+    try:
+        return tuple(float(item) for item in parts)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("threshold list must be comma-separated floats") from exc
+
+
 @dataclass
 class TrainConfig(ModelConfig):
     """Training settings. The inherited model config fixes the six action names."""
@@ -108,12 +118,14 @@ class TrainConfig(ModelConfig):
     vision_aux_loss_weight: float = 0.5
     # Drop full previous-action tokens during teacher forcing so the causal
     # transformer cannot solve the task by copying action persistence alone.
-    action_token_dropout_prob: float = 0.3
+    action_token_dropout_prob: float = 0.2
     # Optional closed-loop scheduled sampling over independent fixed-length windows.
     # It is expensive and can trigger a separate torch.compile graph, so keep it
     # opt-in while action-token dropout provides the default regularization.
-    autoregressive_feedback_prob: float = 0.25
+    autoregressive_feedback_prob: float = 0.5
     autoregressive_validation: bool = True
+    autoregressive_feedback_threshold: float = 0.5
+    autoregressive_feedback_thresholds: Optional[Sequence[float]] = None
     fit_thresholds_from_val: bool = True
     threshold_min: float = 0.10
     threshold_max: float = 0.90
@@ -181,6 +193,24 @@ class TrainConfig(ModelConfig):
             "autoregressive_feedback_prob", self.autoregressive_feedback_prob, 0.0, 1.0
         )
         self.autoregressive_validation = bool(self.autoregressive_validation)
+        self.autoregressive_feedback_threshold = _finite_float(
+            "autoregressive_feedback_threshold", self.autoregressive_feedback_threshold, 0.0, 1.0
+        )
+        if self.autoregressive_feedback_thresholds is None:
+            self.autoregressive_feedback_thresholds = tuple(
+                0.35 if name in {"z", "c"} else float(self.autoregressive_feedback_threshold)
+                for name in self.key_names
+            )
+        else:
+            feedback_thresholds = tuple(float(item) for item in self.autoregressive_feedback_thresholds)
+            if len(feedback_thresholds) != self.num_bin:
+                raise ValueError(
+                    "autoregressive_feedback_thresholds must contain "
+                    f"{self.num_bin} values, got {len(feedback_thresholds)}."
+                )
+            for idx, threshold in enumerate(feedback_thresholds):
+                _finite_float(f"autoregressive_feedback_thresholds[{idx}]", threshold, 0.0, 1.0)
+            self.autoregressive_feedback_thresholds = feedback_thresholds
         if not self.last_action_conditioning:
             self.vision_aux_loss_weight = 0.0
             self.action_token_dropout_prob = 0.0
@@ -691,8 +721,8 @@ def warmup_cosine_lr(
     return float(min_lr) + (float(base_lr) - float(min_lr)) * cosine
 
 
-def threshold_tensor(cfg: TrainConfig, *, device: torch.device) -> torch.Tensor:
-    return torch.tensor(list(cfg.button_state_thresholds), device=device, dtype=torch.float32)
+def action_threshold_tensor(thresholds: Sequence[float], *, device: torch.device) -> torch.Tensor:
+    return torch.tensor(list(thresholds), device=device, dtype=torch.float32)
 
 
 def print_metric_rows(prefix: str, rows: Iterable[Dict[str, float | str | int]]) -> None:
@@ -755,6 +785,8 @@ def run_epoch(
     description: str,
     force_autoregressive_feedback: bool = False,
     fit_thresholds: Optional[bool] = None,
+    metric_thresholds: Optional[Sequence[float]] = None,
+    feedback_thresholds: Optional[Sequence[float]] = None,
 ) -> Tuple[Dict[str, object], int]:
     training = optimizer is not None
     if force_autoregressive_feedback and training:
@@ -772,7 +804,23 @@ def run_epoch(
     stats = BinaryStats(cfg.num_bin, device)
     vision_stats = BinaryStats(cfg.num_bin, device)
     fitter = ThresholdFitter() if bool(fit_thresholds) else None
-    thresholds = threshold_tensor(cfg, device=device)
+    vision_fitter = ThresholdFitter() if bool(fit_thresholds) else None
+    metric_threshold_values = (
+        tuple(float(item) for item in cfg.button_state_thresholds)
+        if metric_thresholds is None
+        else tuple(float(item) for item in metric_thresholds)
+    )
+    feedback_threshold_values = (
+        tuple(float(item) for item in cfg.autoregressive_feedback_thresholds)
+        if feedback_thresholds is None
+        else tuple(float(item) for item in feedback_thresholds)
+    )
+    if len(metric_threshold_values) != cfg.num_bin:
+        raise ValueError(f"Expected {cfg.num_bin} metric thresholds, got {len(metric_threshold_values)}.")
+    if len(feedback_threshold_values) != cfg.num_bin:
+        raise ValueError(f"Expected {cfg.num_bin} feedback thresholds, got {len(feedback_threshold_values)}.")
+    thresholds = action_threshold_tensor(metric_threshold_values, device=device)
+    feedback_thresholds_tensor = action_threshold_tensor(feedback_threshold_values, device=device)
     progress = tqdm(range(num_batches), desc=description, dynamic_ncols=True)
     iterator_it = iter(iterator)
     autoregressive_batches = 0
@@ -800,7 +848,7 @@ def run_epoch(
                         frames,
                         return_sequence_logits=True,
                         prev_action=previous_actions[:, 0],
-                        feedback_thresholds=thresholds,
+                        feedback_thresholds=feedback_thresholds_tensor,
                         autoregressive_feedback=True,
                     )
                 else:
@@ -867,6 +915,8 @@ def run_epoch(
             vision_stats.update(vision_prediction, flat_labels > 0.5)
             if fitter is not None:
                 fitter.update(flat_logits, flat_labels)
+            if vision_fitter is not None:
+                vision_fitter.update(flat_vision_logits, flat_labels)
         loss_sum += float(loss.detach().item())
         bce_loss_sum += float(bce_loss.detach().item())
         vision_bce_loss_sum += float(vision_bce_loss.detach().item())
@@ -895,6 +945,8 @@ def run_epoch(
         "vision_rows": vision_stats.rows(cfg.key_names),
         "action_token_dropout_rate": action_dropout_sum / max(1, num_batches),
         "autoregressive_batches": autoregressive_batches,
+        "metric_thresholds": metric_threshold_values,
+        "feedback_thresholds": feedback_threshold_values,
     }
     if fitter is not None:
         fitted_thresholds = fitter.fit(cfg.threshold_min, cfg.threshold_max, cfg.num_bin)
@@ -907,6 +959,14 @@ def run_epoch(
         metrics["previous_threshold_rows"] = metrics["rows"]
         metrics["macro_f1"] = calibrated_stats.macro_f1()
         metrics["rows"] = calibrated_stats.rows(cfg.key_names)
+    if vision_fitter is not None:
+        vision_fitted_thresholds = vision_fitter.fit(cfg.threshold_min, cfg.threshold_max, cfg.num_bin)
+        calibrated_vision_stats = vision_fitter.statistics(vision_fitted_thresholds, cfg.num_bin)
+        metrics["vision_fitted_thresholds"] = vision_fitted_thresholds
+        metrics["previous_threshold_vision_macro_f1"] = metrics["vision_macro_f1"]
+        metrics["previous_threshold_vision_rows"] = metrics["vision_rows"]
+        metrics["vision_macro_f1"] = calibrated_vision_stats.macro_f1()
+        metrics["vision_rows"] = calibrated_vision_stats.rows(cfg.key_names)
     return metrics, global_step
 
 
@@ -928,6 +988,25 @@ def checkpoint_payload(
         "global_step": int(global_step),
         "best_validation_bce": float(best_validation_bce),
     }
+
+
+def fill_missing_vision_head_state(model: torch.nn.Module, model_state: Dict[str, torch.Tensor]) -> bool:
+    current_state = model.state_dict()
+    missing = [
+        key
+        for key in current_state
+        if key.startswith("policy.vision_head.") and key not in model_state
+    ]
+    if not missing:
+        return False
+    for key in missing:
+        source_key = key.replace("policy.vision_head.", "policy.head.", 1)
+        source = model_state.get(source_key)
+        if source is not None and tuple(source.shape) == tuple(current_state[key].shape):
+            model_state[key] = source.detach().clone()
+        else:
+            model_state[key] = current_state[key].detach().clone()
+    return True
 
 
 def maybe_resume(
@@ -955,9 +1034,18 @@ def maybe_resume(
             )
         print(f"Skipping final-frame-only checkpoint: {path}")
         return 0, 0, math.inf
-    model.load_state_dict(state["model_state"], strict=True)
-    optimizer.load_state_dict(state["optimizer_state"])
+    model_state = state["model_state"]
+    initialized_vision_head = fill_missing_vision_head_state(model, model_state)
+    model.load_state_dict(model_state, strict=True)
+    try:
+        optimizer.load_state_dict(state["optimizer_state"])
+    except ValueError as exc:
+        if not initialized_vision_head:
+            raise
+        print(f"Skipping optimizer state after adding vision_head: {exc}")
     print(f"Resumed from {path} at epoch {state.get('epoch', 0)}.")
+    if initialized_vision_head:
+        print("Initialized missing vision_head weights from the checkpoint main policy head.")
     # Older checkpoints selected by macro F1 have no comparable best BCE.  On
     # resume, treat the next validation pass as the first candidate instead of
     # comparing a loss to an old F1 value.
@@ -1030,6 +1118,7 @@ def print_startup_stats(
         f"order={action_names}",
         f"action_offset=+{int(cfg.action_offset)}",
         f"thresholds={list(cfg.button_state_thresholds)}",
+        f"feedback_thresholds={list(cfg.autoregressive_feedback_thresholds)}",
     )
     print(
         "  Data:",
@@ -1241,7 +1330,9 @@ def train(cfg: Optional[TrainConfig] = None) -> None:
                     global_step=global_step,
                     description=f"Epoch {epoch + 1}/{cfg.num_epochs} val closed-loop",
                     force_autoregressive_feedback=True,
-                    fit_thresholds=False,
+                    fit_thresholds=cfg.fit_thresholds_from_val,
+                    metric_thresholds=cfg.autoregressive_feedback_thresholds,
+                    feedback_thresholds=cfg.autoregressive_feedback_thresholds,
                 )
         score = float(val_metrics["macro_f1"])
         validation_bce = float(val_metrics["bce_loss"])
@@ -1288,6 +1379,23 @@ def train(cfg: Optional[TrainConfig] = None) -> None:
             print_metric_rows("Closed-loop validation controls:", closed_loop_val_metrics["rows"])
         if fitted is not None:
             print("Validation thresholds:", dict(zip(cfg.key_names, cfg.button_state_thresholds)))
+        vision_fitted = val_metrics.get("vision_fitted_thresholds")
+        if isinstance(vision_fitted, tuple) and len(vision_fitted) == cfg.num_bin:
+            print("Vision validation thresholds:", dict(zip(cfg.key_names, vision_fitted)))
+        if closed_loop_val_metrics is not None:
+            print(
+                "Autoregressive feedback thresholds:",
+                dict(zip(cfg.key_names, cfg.autoregressive_feedback_thresholds)),
+            )
+            closed_loop_fitted = closed_loop_val_metrics.get("fitted_thresholds")
+            if isinstance(closed_loop_fitted, tuple) and len(closed_loop_fitted) == cfg.num_bin:
+                print("Closed-loop validation thresholds:", dict(zip(cfg.key_names, closed_loop_fitted)))
+            closed_loop_vision_fitted = closed_loop_val_metrics.get("vision_fitted_thresholds")
+            if isinstance(closed_loop_vision_fitted, tuple) and len(closed_loop_vision_fitted) == cfg.num_bin:
+                print(
+                    "Closed-loop vision validation thresholds:",
+                    dict(zip(cfg.key_names, closed_loop_vision_fitted)),
+                )
 
         payload = checkpoint_payload(
             base_model,
@@ -1344,6 +1452,8 @@ def parse_args() -> TrainConfig:
     add("--vision-aux-loss-weight", type=float, default=None)
     add("--action-token-dropout-prob", type=float, default=None)
     add("--autoregressive-feedback-prob", type=float, default=None)
+    add("--autoregressive-feedback-threshold", type=float, default=None)
+    add("--autoregressive-feedback-thresholds", type=_parse_threshold_sequence, default=None)
     add("--autoregressive-validation", dest="autoregressive_validation", action="store_true", default=None)
     add("--no-autoregressive-validation", dest="autoregressive_validation", action="store_false")
     add("--threshold-min", type=float, default=None)
