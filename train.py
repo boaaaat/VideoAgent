@@ -147,8 +147,8 @@ class TrainConfig(ModelConfig):
     aug_cutout_count: int = 1
 
     dali_num_threads: int = 6
-    dali_prefetch_queue_depth: int = 1
-    dali_reader_prefetch_queue_depth: int = 1
+    dali_prefetch_queue_depth: int = 4
+    dali_reader_prefetch_queue_depth: int = 4
     dali_read_ahead: bool = False
     dali_dont_use_mmap: bool = False
     dali_train_random_shuffle: bool = True

@@ -26,8 +26,8 @@ MID_CHANNELS = 96
 DEEP_CHANNELS = 192
 FUSED_CHANNELS = 128
 READOUT_CHANNELS = 256
-DEFAULT_MODEL_SIZE = 512
-FUSED_SPATIAL_SIZE = DEFAULT_MODEL_SIZE // 4
+DEFAULT_MODEL_SIZE = 256
+FUSED_SPATIAL_SIZE = 128
 DEFAULT_CONTEXT_LENGTH = 40
 DEFAULT_SEQUENCE_LENGTH = 40
 DEFAULT_ACTION_NAMES = ("w", "a", "s", "d", "z", "c")
@@ -36,7 +36,7 @@ NUM_VISUAL_TOKENS = TOKEN_GRID_SIZE * TOKEN_GRID_SIZE
 TOKENS_PER_STEP = NUM_VISUAL_TOKENS
 TEMPORAL_HEADS = 8
 TEMPORAL_LAYERS = 6
-ARCHITECTURE_VERSION = "cnn_grid_causal_transformer_v5_ctx40_512_fusion128_late_action"
+ARCHITECTURE_VERSION = "cnn_grid_causal_transformer_v5_ctx40_256_fusion128_late_action"
 
 
 def _as_int(name: str, value: object, minimum: int) -> int:
@@ -370,12 +370,8 @@ class FrameEncoder(nn.Module):
         self.p0 = nn.Sequential(
             nn.Conv2d(STEM_CHANNELS, 64, kernel_size=1),
             ConvGNAct(64, 64, 3, 2, 1),
-            ConvGNAct(64, 64, 3, 2, 1),
         )
-        self.p1 = nn.Sequential(
-            nn.Conv2d(LOW_CHANNELS, 64, kernel_size=1),
-            ConvGNAct(64, 64, 3, 2, 1),
-        )
+        self.p1 = nn.Conv2d(LOW_CHANNELS, 64, kernel_size=1)
         self.p2 = nn.Conv2d(MID_CHANNELS, 64, kernel_size=1)
         self.p3 = nn.Conv2d(DEEP_CHANNELS, 64, kernel_size=1)
         self.fuse = nn.Sequential(
@@ -402,8 +398,9 @@ class FrameEncoder(nn.Module):
 
         p0 = self.p0(x)
         p1 = self.p1(b1)
-        p2 = self.p2(b2)
-        p3 = F.interpolate(self.p3(b3), size=p2.shape[-2:], mode="bilinear", align_corners=False)
+        target_size = p1.shape[-2:]
+        p2 = F.interpolate(self.p2(b2), size=target_size, mode="bilinear", align_corners=False)
+        p3 = F.interpolate(self.p3(b3), size=target_size, mode="bilinear", align_corners=False)
         fused = self.fuse(torch.cat([p0, p1, p2, p3], dim=1))
         return x, b1, b2, b3, fused
 
