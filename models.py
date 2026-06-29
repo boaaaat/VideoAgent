@@ -36,7 +36,7 @@ NUM_VISUAL_TOKENS = TOKEN_GRID_SIZE * TOKEN_GRID_SIZE
 TOKENS_PER_STEP = NUM_VISUAL_TOKENS
 TEMPORAL_HEADS = 8
 TEMPORAL_LAYERS = 6
-ARCHITECTURE_VERSION = "cnn_grid_causal_transformer_v5_ctx40_512_fusion128_late_action"
+ARCHITECTURE_VERSION = "cnn_grid_causal_transformer_v6_ctx40_512_fusion128_feedback_action"
 
 
 def _as_int(name: str, value: object, minimum: int) -> int:
@@ -542,7 +542,7 @@ class GreenvilleBCFormer(nn.Module):
 
     def action_residual(self, prev_actions: Optional[torch.Tensor], *, dtype: torch.dtype) -> torch.Tensor:
         if not self.last_action_conditioning or prev_actions is None:
-            raise ValueError("Previous actions are required to compute late action residuals.")
+            raise ValueError("Feedback actions are required to compute action residuals.")
         residual = self.action_residual_mlp(prev_actions.to(dtype=dtype))
         return float(self.last_action_residual_cap) * torch.tanh(residual)
 
@@ -560,7 +560,7 @@ class GreenvilleBCFormer(nn.Module):
             return vision_logits, vision_logits
         expected_actions = (visual_tokens.size(0), visual_tokens.size(1), len(DEFAULT_ACTION_NAMES))
         if tuple(prev_actions.shape) != expected_actions:
-            raise ValueError(f"Expected previous actions {expected_actions}, got {tuple(prev_actions.shape)}.")
+            raise ValueError(f"Expected feedback actions {expected_actions}, got {tuple(prev_actions.shape)}.")
         logits = vision_logits + self.action_residual(prev_actions, dtype=vision_logits.dtype)
         return logits, vision_logits
 
@@ -667,15 +667,15 @@ class DrivingVideoPolicy(nn.Module):
         if prev_action.dim() == 3:
             expected = (batch, steps, self.cfg.num_bin)
             if tuple(prev_action.shape) != expected:
-                raise ValueError(f"Expected sequence previous actions {expected}, got {tuple(prev_action.shape)}.")
+                raise ValueError(f"Expected sequence feedback actions {expected}, got {tuple(prev_action.shape)}.")
             return prev_action
         if prev_action.dim() == 2 and steps == 1:
             expected = (batch, self.cfg.num_bin)
             if tuple(prev_action.shape) != expected:
-                raise ValueError(f"Expected previous action {expected}, got {tuple(prev_action.shape)}.")
+                raise ValueError(f"Expected feedback action {expected}, got {tuple(prev_action.shape)}.")
             return prev_action.unsqueeze(1)
         raise ValueError(
-            "Previous actions must be [B,T,6], or [B,6] only for single-step/non-sequence calls; "
+            "Feedback actions must be [B,T,6], or [B,6] only for single-step/non-sequence calls; "
             f"got {tuple(prev_action.shape)}."
         )
 

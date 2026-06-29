@@ -65,7 +65,7 @@ class RuntimeConfig(ModelConfig):
     runtime_amp: bool = True
 
     mouse_buttons_enabled: bool = False
-    # Feed applied outputs back as the next previous-action residual input.
+    # Feed applied outputs back as the next residual feedback input.
     # Soft mode is disabled because the model is trained on hard action states.
     prev_action_feedback: bool = True
     prev_action_feedback_soft: bool = False
@@ -142,7 +142,7 @@ def _is_key_down(key_name: str) -> bool:
 
 
 def merge_keyboard_feedback(action: torch.Tensor, cfg: RuntimeConfig) -> torch.Tensor:
-    """OR currently held keyboard keys into the previous-action residual input."""
+    """OR currently held keyboard keys into the residual feedback input."""
 
     if not cfg.key_names:
         return action
@@ -288,14 +288,15 @@ def _coerce_config_types(cfg: RuntimeConfig) -> RuntimeConfig:
     cfg.train_seq_stride = int(cfg.train_seq_stride)
     cfg.val_seq_stride = int(cfg.val_seq_stride)
     cfg.model_size = int(cfg.model_size)
-    cfg.prediction_horizon = 1
+    cfg.action_offset = max(1, int(getattr(cfg, "action_offset", 1)))
+    cfg.prediction_horizon = cfg.action_offset
     offsets = getattr(cfg, "prediction_horizon_offsets", None)
     if offsets is None:
-        cfg.prediction_horizon_offsets = (1,)
+        cfg.prediction_horizon_offsets = (cfg.action_offset,)
     else:
         cfg.prediction_horizon_offsets = tuple(int(offset) for offset in offsets)
         if not cfg.prediction_horizon_offsets:
-            cfg.prediction_horizon_offsets = (1,)
+            cfg.prediction_horizon_offsets = (cfg.action_offset,)
         if any(offset <= 0 for offset in cfg.prediction_horizon_offsets):
             raise ValueError(f"prediction_horizon_offsets must be positive, got {cfg.prediction_horizon_offsets}.")
         if len(cfg.prediction_horizon_offsets) != 1:
