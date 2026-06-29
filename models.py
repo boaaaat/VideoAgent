@@ -24,7 +24,7 @@ class ModelConfig:
 
     model_size: int = 256
     seq_len: int = 80
-    train_seq_stride: int = 40
+    train_seq_stride: int = 80
     val_seq_stride: int = 80
     prediction_dt: float = 1.0 / 20.0
     prediction_horizon: int = 5
@@ -34,8 +34,7 @@ class ModelConfig:
 
     d_model: int = 192
     frame_spatial_pool: int = 16
-    # Kept for checkpoint/config compatibility; the spatial encoder now works
-    # directly at d_model width, so this value is unused by the model.
+    # Full-resolution stem width for the frame CNN.
     frame_spatial_channels: int = 32
     spatial_layers: int = 2
     spatial_heads: int = 4
@@ -154,54 +153,77 @@ class ResidualConvBlock(nn.Module):
 
 
 class FrameCNN(nn.Module):
-    """Stride-16 conv backbone with FPN-style lateral fusion from the stride-4
-    and stride-8 stages, so thin structures (lane lines, road edges) seen at
-    high resolution survive into the d_model-wide spatial token grid."""
+    """High-resolution conv backbone that preserves a stride-1, 32-channel
+    stem before fusing the full/128/64/32 feature hierarchy into a residual
+    64x64 feature map for pooling into the spatial token grid."""
 
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         d = int(cfg.d_model)
-        widths = [
-            max(32, d // 4),
-            max(48, d // 2),
-            max(96, (3 * d) // 4),
-            d,
-        ]
+        stem_channels = max(1, int(cfg.frame_spatial_channels))
+        width128 = max(48, d // 4)
+        width64 = max(64, d // 2)
+        width32 = d
         drop = cfg.dropout * 0.2
 
-        def stage(in_channels: int, out_channels: int, *, extra_residual: bool) -> nn.Sequential:
-            blocks: List[nn.Module] = [
-                ConvBlock(in_channels, out_channels, stride=2, dropout=drop),
-                ResidualConvBlock(out_channels, dropout=drop),
-            ]
-            if extra_residual:
-                blocks.append(ResidualConvBlock(out_channels, dropout=drop))
-            return nn.Sequential(*blocks)
+        self.stem = nn.Sequential(
+            ConvBlock(7, stem_channels, stride=1, dropout=drop),
+            ResidualConvBlock(stem_channels, dropout=drop),
+        )
+        self.down128 = self._make_down_stage(stem_channels, width128, dropout=drop)
+        self.down64 = self._make_down_stage(width128, width64, dropout=drop, extra_residual=True)
+        self.down32 = self._make_down_stage(width64, width32, dropout=drop, extra_residual=True)
 
-        self.stage1 = stage(7, widths[0], extra_residual=False)
-        self.stage2 = stage(widths[0], widths[1], extra_residual=True)
-        self.stage3 = stage(widths[1], widths[2], extra_residual=True)
-        self.stage4 = stage(widths[2], widths[3], extra_residual=True)
-        self.lateral4 = self._make_lateral(widths[1], d, num_down=2, dropout=drop)
-        self.lateral8 = self._make_lateral(widths[2], d, num_down=1, dropout=drop)
-        self.post_fuse = ResidualConvBlock(d, dropout=drop)
+        self.full_to64 = self._make_spatial_down(stem_channels, num_down=2, dropout=drop)
+        self.s128_to64 = self._make_spatial_down(width128, num_down=1, dropout=drop)
+        fuse_channels = stem_channels + width128 + width64 + width32
+        self.fuse64 = nn.Sequential(
+            ConvBlock(fuse_channels, d, stride=1, dropout=drop),
+            ResidualConvBlock(d, dropout=drop),
+            ResidualConvBlock(d, dropout=drop),
+        )
         self.pool_size = int(cfg.frame_spatial_pool)
 
     @staticmethod
-    def _make_lateral(in_channels: int, out_channels: int, *, num_down: int, dropout: float) -> nn.Sequential:
+    def _make_down_stage(
+        in_channels: int,
+        out_channels: int,
+        *,
+        dropout: float,
+        extra_residual: bool = False,
+    ) -> nn.Sequential:
+        blocks: List[nn.Module] = [
+            ConvBlock(in_channels, out_channels, stride=2, dropout=dropout),
+            ResidualConvBlock(out_channels, dropout=dropout),
+        ]
+        if extra_residual:
+            blocks.append(ResidualConvBlock(out_channels, dropout=dropout))
+        return nn.Sequential(*blocks)
+
+    @staticmethod
+    def _make_spatial_down(in_channels: int, *, num_down: int, dropout: float) -> nn.Sequential:
         layers: List[nn.Module] = []
         for _ in range(num_down):
             layers.append(ConvBlock(in_channels, in_channels, stride=2, dropout=dropout))
-        layers.append(nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False))
-        layers.append(nn.GroupNorm(_group_count(out_channels), out_channels))
         return nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.stage1(x)
-        s2 = self.stage2(x)
-        s3 = self.stage3(s2)
-        s4 = self.stage4(s3)
-        x = self.post_fuse(s4 + self.lateral4(s2) + self.lateral8(s3))
+        s256 = self.stem(x)
+        s128 = self.down128(s256)
+        s64 = self.down64(s128)
+        s32 = self.down32(s64)
+
+        target_size = s64.shape[-2:]
+        x = torch.cat(
+            [
+                self.full_to64(s256),
+                self.s128_to64(s128),
+                s64,
+                F.interpolate(s32, size=target_size, mode="bilinear", align_corners=False),
+            ],
+            dim=1,
+        )
+        x = self.fuse64(x)
         x = F.adaptive_avg_pool2d(x, output_size=(self.pool_size, self.pool_size))
         return x.flatten(2).transpose(1, 2).contiguous()
 

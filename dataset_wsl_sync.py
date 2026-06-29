@@ -22,7 +22,7 @@ def is_wsl() -> bool:
 
 def default_target_root() -> Path:
     if is_wsl():
-        return Path.home() / "ai" / "dataset"
+        return Path.home() / "ai" / "data"
     return Path("./dataset")
 
 
@@ -37,15 +37,23 @@ class SyncStats:
 
 
 def find_run_pairs(data_root: Path, video_ext: str, csv_ext: str, max_videos: Optional[int]) -> List[Tuple[Path, Path]]:
-    video_paths = sorted(data_root.glob(f"run_*{video_ext}"))
+    split_roots = [data_root / "train", data_root / "val"]
+    search_roots = [path for path in split_roots if path.is_dir()]
+    if not search_roots:
+        search_roots = [data_root]
+
     pairs: List[Tuple[Path, Path]] = []
 
-    for video_path in video_paths:
-        csv_path = video_path.with_suffix(csv_ext)
-        if csv_path.exists():
-            pairs.append((video_path, csv_path))
-            if max_videos is not None and len(pairs) >= max_videos:
-                break
+    for search_root in search_roots:
+        video_paths = sorted(search_root.glob(f"run_*{video_ext}"))
+        for video_path in video_paths:
+            csv_path = video_path.with_suffix(csv_ext)
+            if csv_path.exists():
+                pairs.append((video_path, csv_path))
+                if max_videos is not None and len(pairs) >= max_videos:
+                    break
+        if max_videos is not None and len(pairs) >= max_videos:
+            break
 
     if not pairs:
         raise FileNotFoundError(f"No run_*{video_ext} with matching {csv_ext} found under {str(data_root)!r}.")
@@ -115,7 +123,7 @@ def sync_dataset(
 
     for video_path, csv_path in pairs:
         for source_path in (video_path, csv_path):
-            target_path = target_root / source_path.name
+            target_path = target_root / source_path.relative_to(source_root)
             files_to_sync.append((source_path, target_path))
             expected_targets.add(target_path)
 
@@ -198,7 +206,7 @@ def stale_cached_paths(target_root: Path, video_ext: str, csv_ext: str, expected
         patterns.append(f"run_*{csv_ext}")
 
     for pattern in patterns:
-        for path in target_root.glob(pattern):
+        for path in target_root.rglob(pattern):
             if path.is_file() and path.resolve() not in expected:
                 stale.append(path)
 

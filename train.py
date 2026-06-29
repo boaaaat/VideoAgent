@@ -238,6 +238,36 @@ def find_runs(data_root: str, video_ext: str, csv_ext: str) -> List[Tuple[str, s
     return pairs
 
 
+def find_train_val_runs(
+    data_root: str,
+    video_ext: str,
+    csv_ext: str,
+    train_split: float,
+    seed: int,
+) -> Tuple[List[Tuple[str, str]], List[Tuple[str, str]], str]:
+    train_root = os.path.join(data_root, "train")
+    val_root = os.path.join(data_root, "val")
+    has_split_dirs = os.path.isdir(train_root) or os.path.isdir(val_root)
+
+    if has_split_dirs:
+        if not os.path.isdir(train_root):
+            raise RuntimeError(f"Expected train split folder under {data_root!r}: {train_root!r}.")
+        if not os.path.isdir(val_root):
+            raise RuntimeError(f"Expected val split folder under {data_root!r}: {val_root!r}.")
+
+        train_pairs = find_runs(train_root, video_ext, csv_ext)
+        val_pairs = find_runs(val_root, video_ext, csv_ext)
+        if not train_pairs:
+            raise RuntimeError(f"No training runs found under {train_root!r}.")
+        return train_pairs, val_pairs, "folders"
+
+    pairs = find_runs(data_root, video_ext, csv_ext)
+    if not pairs:
+        raise RuntimeError(f"No runs found under {data_root!r}.")
+    train_pairs, val_pairs = split_runs(pairs, train_split, seed)
+    return train_pairs, val_pairs, "random"
+
+
 def split_runs(
     pairs: Sequence[Tuple[str, str]],
     train_split: float,
@@ -1126,11 +1156,20 @@ def train() -> None:
             hash_same_size=bool(cfg.dataset_sync_hash_same_size),
         )
 
-    pairs = find_runs(cfg.data_root, cfg.video_ext, cfg.csv_ext)
-    if not pairs:
-        raise RuntimeError(f"No runs found under {cfg.data_root!r}.")
-    train_pairs, val_pairs = split_runs(pairs, cfg.train_split, cfg.split_seed)
-    print(f"Runs: total={len(pairs)} train={len(train_pairs)} val={len(val_pairs)}")
+    train_pairs, val_pairs, split_source = find_train_val_runs(
+        cfg.data_root,
+        cfg.video_ext,
+        cfg.csv_ext,
+        cfg.train_split,
+        cfg.split_seed,
+    )
+    print(
+        "Runs:",
+        f"source={split_source}",
+        f"total={len(train_pairs) + len(val_pairs)}",
+        f"train={len(train_pairs)}",
+        f"val={len(val_pairs)}",
+    )
     if cfg.skipped_key_names:
         print(f"Skipping action keys for this training run: {', '.join(cfg.skipped_key_names)}")
     print(f"Training action keys: {', '.join(cfg.key_names + cfg.mouse_button_names)}")
