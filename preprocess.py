@@ -6,9 +6,10 @@ from pathlib import Path
 # Path to your dataset.
 DATA_ROOT = str(Path(__file__).resolve().parent / "data" / "greenville" / 'low_res')
 
-# Output resolution (no aspect ratio preserved)
-TARGET_W = 256
-TARGET_H = 256
+# Output resolution. Keep Greenville clips at 512x512 so lane markings and
+# small road cues survive into the V5 vision model.
+TARGET_W = 512
+TARGET_H = 512
 
 # FFmpeg / NVENC settings. H.264 with short GOPs is easier for DALI random
 # window reads than long-GOP HEVC.

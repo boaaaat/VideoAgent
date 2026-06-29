@@ -1,9 +1,10 @@
-"""DALI trainer for the dense-supervision CNN latent transformer policy.
+"""DALI trainer for the dense-supervision CNN grid-token transformer policy.
 
 The DALI pipeline owns GPU video decode and resize. CSV labels are parsed once
 on the host, then joined to decoded fixed-length windows through the DALI sample
 label written into the file list. Each window is an independent causal
-transformer context with shifted previous-action tokens.
+transformer context with observed previous actions used only for late residual
+conditioning.
 """
 
 from __future__ import annotations
@@ -36,6 +37,7 @@ from models import (
     ARCHITECTURE_VERSION,
     DEFAULT_SEQUENCE_LENGTH,
     FUSED_CHANNELS,
+    FUSED_SPATIAL_SIZE,
     NUM_VISUAL_TOKENS,
     READOUT_CHANNELS,
     TEMPORAL_HEADS,
@@ -87,7 +89,7 @@ class TrainConfig(ModelConfig):
 
     train_seq_stride: int = DEFAULT_SEQUENCE_LENGTH
     val_seq_stride: int = DEFAULT_SEQUENCE_LENGTH
-    action_offset: int = 1
+    action_offset: int = 4
     dense_temporal_supervision: bool = True
 
     batch_size: int = 1
@@ -113,16 +115,16 @@ class TrainConfig(ModelConfig):
     # unstable and encouraged the low-precision predictions seen in validation.
     pos_weight_power: float = 0.5
     pos_weight_clamp: float = 8.0
-    main_policy_loss_weight: float = 1.0
+    main_policy_loss_weight: float = 0.5
     conflict_penalty_weight: float = 0.20
-    vision_aux_loss_weight: float = 0.5
-    # Drop full previous-action tokens during teacher forcing so the causal
-    # transformer cannot solve the task by copying action persistence alone.
+    vision_aux_loss_weight: float = 1.0
+    # Drop previous-action residual inputs during teacher forcing so the policy
+    # cannot solve the task by copying action persistence alone.
     action_token_dropout_prob: float = 0.2
     # Optional closed-loop scheduled sampling over independent fixed-length windows.
-    # It is expensive and can trigger a separate torch.compile graph, so keep it
-    # opt-in while action-token dropout provides the default regularization.
-    autoregressive_feedback_prob: float = 0.5
+    # Keep it off by default for V5 so early training optimizes the vision path;
+    # closed-loop validation still runs as a secondary signal.
+    autoregressive_feedback_prob: float = 0.0
     autoregressive_validation: bool = True
     autoregressive_feedback_threshold: float = 0.5
     autoregressive_feedback_thresholds: Optional[Sequence[float]] = None
@@ -145,8 +147,8 @@ class TrainConfig(ModelConfig):
     aug_cutout_count: int = 1
 
     dali_num_threads: int = 6
-    dali_prefetch_queue_depth: int = 4
-    dali_reader_prefetch_queue_depth: int = 4
+    dali_prefetch_queue_depth: int = 1
+    dali_reader_prefetch_queue_depth: int = 1
     dali_read_ahead: bool = False
     dali_dont_use_mmap: bool = False
     dali_train_random_shuffle: bool = True
@@ -530,10 +532,9 @@ def build_window_targets(
             target_end = target_start + int(cfg.seq_len)
             label_windows.append(labels[target_start:target_end])
             # The target at timestep t is labels[start + t + action_offset].
-            # Teacher-forced previous action is the immediately preceding
-            # target, labels[start + t + action_offset - 1], matching the
-            # transformer's shifted-right action-token contract.
-            previous_start = start + action_offset - 1
+            # Previous action must stay causal, so it is the observed input-time
+            # action labels[start + t], not the frame before the future target.
+            previous_start = start
             previous = labels[previous_start : previous_start + int(cfg.seq_len)]
             previous_action_windows.append(previous)
             meta.append(WindowMeta(video_path, start, start + int(cfg.seq_len)))
@@ -737,13 +738,13 @@ def print_metric_rows(prefix: str, rows: Iterable[Dict[str, float | str | int]])
         )
 
 
-def apply_action_token_dropout(
+def apply_action_residual_dropout(
     previous_actions: torch.Tensor,
     cfg: TrainConfig,
     *,
     training: bool,
 ) -> Tuple[torch.Tensor, float]:
-    """Randomly zero complete previous-action tokens during teacher forcing."""
+    """Randomly zero complete previous-action residual inputs during teacher forcing."""
 
     probability = float(cfg.action_token_dropout_prob)
     if not training or probability <= 0.0:
@@ -756,8 +757,8 @@ def apply_action_token_dropout(
         1,
         device=previous_actions.device,
     ) >= probability
-    # Preserve the first action token so each independent window still has a
-    # truthful initial controller state.
+    # Preserve the first previous-action input so each independent window still
+    # has a truthful initial controller state.
     keep[:, 0] = True
     dropped = 1.0 - float(keep.float().mean().item())
     return previous_actions * keep.to(dtype=previous_actions.dtype), dropped
@@ -852,7 +853,7 @@ def run_epoch(
                         autoregressive_feedback=True,
                     )
                 else:
-                    model_prev_actions, action_dropout = apply_action_token_dropout(
+                    model_prev_actions, action_dropout = apply_action_residual_dropout(
                         previous_actions,
                         cfg,
                         training=training,
@@ -929,7 +930,7 @@ def run_epoch(
                 conflict=f"{conflict_loss_sum / float(batch_index + 1):.4f}",
                 f1=f"{stats.macro_f1():.3f}",
                 vision_f1=f"{vision_stats.macro_f1():.3f}",
-                action_drop=f"{action_dropout_sum / float(batch_index + 1):.3f}",
+                residual_drop=f"{action_dropout_sum / float(batch_index + 1):.3f}",
                 closed_loop=f"{autoregressive_batches}/{batch_index + 1}",
             )
     iterator.reset()
@@ -1046,9 +1047,7 @@ def maybe_resume(
     print(f"Resumed from {path} at epoch {state.get('epoch', 0)}.")
     if initialized_vision_head:
         print("Initialized missing vision_head weights from the checkpoint main policy head.")
-    # Older checkpoints selected by macro F1 have no comparable best BCE.  On
-    # resume, treat the next validation pass as the first candidate instead of
-    # comparing a loss to an old F1 value.
+    # V5 checkpoints use vision BCE as the model-selection score.
     best_validation_bce = float(state.get("best_validation_bce", math.inf))
 
     def checkpoint_int(name: str, fallback: int) -> int:
@@ -1067,7 +1066,7 @@ def maybe_resume(
     )
     if checkpoint_validation_contract != current_validation_contract:
         print(
-            "Validation contract changed since checkpoint; resetting best validation BCE "
+            "Validation contract changed since checkpoint; resetting best validation vision BCE "
             f"from {best_validation_bce:.4f}."
         )
         best_validation_bce = math.inf
@@ -1108,7 +1107,7 @@ def print_startup_stats(
         f"architecture={ARCHITECTURE_VERSION}",
         f"parameters={parameter_count / 1_000_000:.4f}M",
         f"input=[B,{cfg.seq_len},3,{cfg.model_size},{cfg.model_size}]",
-        f"frame_fusion={FUSED_CHANNELS}x64x64",
+        f"frame_fusion={FUSED_CHANNELS}x{FUSED_SPATIAL_SIZE}x{FUSED_SPATIAL_SIZE}",
         f"tokens={cfg.seq_len}x{TOKENS_PER_STEP}={cfg.seq_len * TOKENS_PER_STEP}",
         f"visual_tokens_per_frame={NUM_VISUAL_TOKENS}",
         f"transformer={TEMPORAL_LAYERS}x{READOUT_CHANNELS}/heads={TEMPORAL_HEADS}",
@@ -1152,6 +1151,7 @@ def print_startup_stats(
         f"grad_clip={cfg.grad_clip:.6g}",
         f"amp={cfg.amp_dtype}",
         f"compile={cfg.compile_model}",
+        f"activation_checkpointing={cfg.use_activation_checkpointing}",
     )
     print(
         "  DALI:",
@@ -1180,10 +1180,11 @@ def print_startup_stats(
     )
     print(
         "  Previous action:",
-        f"conditioning={cfg.last_action_conditioning}",
+        f"late_residual={cfg.last_action_conditioning}",
+        f"residual_cap={cfg.last_action_residual_cap:.3f}",
         f"teacher_forcing={1.0 - float(cfg.autoregressive_feedback_prob):.2f}",
         f"closed_loop_train={float(cfg.autoregressive_feedback_prob):.2f}",
-        f"token_dropout={float(cfg.action_token_dropout_prob):.3f}",
+        f"residual_dropout={float(cfg.action_token_dropout_prob):.3f}",
         f"validation={'teacher_forced+closed_loop' if cfg.autoregressive_validation else 'teacher_forced'}",
     )
     print(
@@ -1336,9 +1337,10 @@ def train(cfg: Optional[TrainConfig] = None) -> None:
                 )
         score = float(val_metrics["macro_f1"])
         validation_bce = float(val_metrics["bce_loss"])
-        is_best = validation_bce < best_validation_bce
+        validation_vision_bce = float(val_metrics["vision_bce_loss"])
+        is_best = validation_vision_bce < best_validation_bce
         if is_best:
-            best_validation_bce = validation_bce
+            best_validation_bce = validation_vision_bce
         closed_loop_summary = ""
         if closed_loop_val_metrics is not None:
             closed_loop_summary = (
@@ -1351,17 +1353,19 @@ def train(cfg: Optional[TrainConfig] = None) -> None:
             f"train_conflict={float(train_metrics['conflict_penalty']):.4f} "
             f"train_f1={float(train_metrics['macro_f1']):.4f} "
             f"train_vision_f1={float(train_metrics['vision_macro_f1']):.4f} "
-            f"train_action_drop={float(train_metrics['action_token_dropout_rate']):.3f} "
+            f"train_residual_drop={float(train_metrics['action_token_dropout_rate']):.3f} "
             f"train_closed_loop={int(train_metrics['autoregressive_batches'])} "
             f"val_loss={float(val_metrics['loss']):.4f} "
             f"val_conflict={float(val_metrics['conflict_penalty']):.4f} "
             f"val_f1={score:.4f} "
+            f"val_bce={validation_bce:.4f} "
+            f"val_vision_bce={validation_vision_bce:.4f} "
             f"val_vision_f1={float(val_metrics['vision_macro_f1']):.4f}"
             f"{closed_loop_summary}"
         )
         print(
-            f"Validation best_bce={best_validation_bce:.4f} "
-            f"current_bce={validation_bce:.4f} "
+            f"Validation best_vision_bce={best_validation_bce:.4f} "
+            f"current_vision_bce={validation_vision_bce:.4f} "
             f"calibrated_macro_f1={score:.4f} "
             f"new_best={is_best}"
         )
@@ -1413,7 +1417,7 @@ def train(cfg: Optional[TrainConfig] = None) -> None:
 
 
 def parse_args() -> TrainConfig:
-    parser = argparse.ArgumentParser(description="Train the six-action CNN latent transformer driving policy with DALI.")
+    parser = argparse.ArgumentParser(description="Train the six-action CNN grid-token transformer driving policy with DALI.")
     add = parser.add_argument
     add("--data-root", default=None)
     add("--train-data-root", default=None)
@@ -1436,7 +1440,7 @@ def parse_args() -> TrainConfig:
         dest="action_offset",
         type=int,
         default=None,
-        help="Future label shift: frame[i] predicts action[i + action_offset]. Default: 1.",
+        help="Future label shift: frame[i] predicts action[i + action_offset]. Default: 4.",
     )
     add("--model-size", type=int, default=None)
     add("--lr", type=float, default=None)
@@ -1450,7 +1454,12 @@ def parse_args() -> TrainConfig:
     add("--main-policy-loss-weight", type=float, default=None)
     add("--conflict-penalty-weight", type=float, default=None)
     add("--vision-aux-loss-weight", type=float, default=None)
-    add("--action-token-dropout-prob", type=float, default=None)
+    add(
+        "--action-token-dropout-prob",
+        type=float,
+        default=None,
+        help="Drop observed previous-action residual inputs during teacher forcing. Legacy argument name.",
+    )
     add("--autoregressive-feedback-prob", type=float, default=None)
     add("--autoregressive-feedback-threshold", type=float, default=None)
     add("--autoregressive-feedback-thresholds", type=_parse_threshold_sequence, default=None)
@@ -1463,6 +1472,8 @@ def parse_args() -> TrainConfig:
     add("--amp-dtype", choices=["bf16", "fp32"], default=None)
     add("--compile", dest="compile_model", action="store_true", default=None)
     add("--no-compile", dest="compile_model", action="store_false")
+    add("--activation-checkpointing", dest="use_activation_checkpointing", action="store_true", default=None)
+    add("--no-activation-checkpointing", dest="use_activation_checkpointing", action="store_false")
     add("--dali-num-threads", type=int, default=None)
     add("--dali-prefetch-queue-depth", type=int, default=None)
     add("--dali-reader-prefetch-queue-depth", type=int, default=None)

@@ -20,7 +20,7 @@ from action_space import game_data_root, get_key_names, get_mouse_button_names, 
 
 TIMER_RESOLUTION_MS = 1
 WHEEL_DELTA = 120
-DRAW_CURSOR_OVERLAY = True
+DRAW_CURSOR_OVERLAY = False
 LOG_FFMPEG_STDERR = False
 timer_resolution_enabled = False
 

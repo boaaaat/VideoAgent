@@ -1,8 +1,8 @@
-"""CNN latent-token causal transformer driving policy.
+"""CNN grid-token causal transformer driving policy.
 
 The public classes in this file are kept compatible with the existing trainer
-and runtime entrypoints, while the learned architecture is a fresh per-frame
-CNN encoder plus a causal temporal transformer over visual/action tokens.
+and runtime entrypoints, while the learned architecture is a per-frame CNN
+encoder plus a causal temporal transformer over visual grid tokens.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ from typing import Optional, Sequence, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
 from action_space import game_data_root, get_key_names, normalize_game_name, selected_game
 
@@ -25,16 +26,17 @@ MID_CHANNELS = 96
 DEEP_CHANNELS = 192
 FUSED_CHANNELS = 128
 READOUT_CHANNELS = 256
-DEFAULT_MODEL_SIZE = 256
+DEFAULT_MODEL_SIZE = 512
 FUSED_SPATIAL_SIZE = DEFAULT_MODEL_SIZE // 4
-DEFAULT_CONTEXT_LENGTH = 60
-DEFAULT_SEQUENCE_LENGTH = 60
+DEFAULT_CONTEXT_LENGTH = 40
+DEFAULT_SEQUENCE_LENGTH = 40
 DEFAULT_ACTION_NAMES = ("w", "a", "s", "d", "z", "c")
-NUM_VISUAL_TOKENS = 32
-TOKENS_PER_STEP = NUM_VISUAL_TOKENS + 1
+TOKEN_GRID_SIZE = 8
+NUM_VISUAL_TOKENS = TOKEN_GRID_SIZE * TOKEN_GRID_SIZE
+TOKENS_PER_STEP = NUM_VISUAL_TOKENS
 TEMPORAL_HEADS = 8
-TEMPORAL_LAYERS = 8
-ARCHITECTURE_VERSION = "cnn_latent_causal_transformer_v4_ctx60_stem_fusion_spatial_pos"
+TEMPORAL_LAYERS = 6
+ARCHITECTURE_VERSION = "cnn_grid_causal_transformer_v5_ctx40_512_fusion128_late_action"
 
 
 def _as_int(name: str, value: object, minimum: int) -> int:
@@ -76,7 +78,7 @@ class ModelConfig:
     seq_len: int = DEFAULT_SEQUENCE_LENGTH
     train_seq_stride: int = DEFAULT_SEQUENCE_LENGTH
     val_seq_stride: int = DEFAULT_SEQUENCE_LENGTH
-    action_offset: int = 1
+    action_offset: int = 4
     prediction_horizon: int = 1
     prediction_horizon_offsets: Optional[Sequence[int]] = None
     sequence_output_tail_frames: int = 0
@@ -101,9 +103,10 @@ class ModelConfig:
     action_query_layers: int = 1
     last_action_conditioning: bool = True
     last_action_fusion: str = "bounded_visual_residual"
-    last_action_residual_cap: float = 0.75
+    last_action_residual_cap: float = 0.5
     last_action_prior_logit: float = 0.0
     last_action_absence_prior_logit: float = 0.0
+    use_activation_checkpointing: bool = True
 
     def __post_init__(self) -> None:
         self.selected_game = normalize_game_name(self.selected_game)
@@ -186,6 +189,7 @@ class ModelConfig:
         )
         _as_float("last_action_prior_logit", self.last_action_prior_logit, 0.0, 5.0)
         _as_float("last_action_absence_prior_logit", self.last_action_absence_prior_logit, 0.0, 5.0)
+        self.use_activation_checkpointing = bool(self.use_activation_checkpointing)
         if str(self.architecture_version) != ARCHITECTURE_VERSION:
             raise ValueError(
                 f"Expected architecture_version={ARCHITECTURE_VERSION!r}, "
@@ -285,48 +289,42 @@ class DownStage(nn.Module):
         return self.blocks(x)
 
 
-class SpatialLatentTokenizer(nn.Module):
-    """Convert each fused 64x64 feature map into learned visual latents."""
+class SpatialGridTokenizer(nn.Module):
+    """Convert each fused 128x128 feature map into deterministic 8x8 grid tokens."""
 
     def __init__(
         self,
         cin: int = FUSED_CHANNELS,
         d_model: int = READOUT_CHANNELS,
-        num_latents: int = NUM_VISUAL_TOKENS,
-        num_heads: int = TEMPORAL_HEADS,
+        num_tokens: int = NUM_VISUAL_TOKENS,
     ):
         super().__init__()
+        grid = int(round(math.sqrt(int(num_tokens))))
+        if grid * grid != int(num_tokens):
+            raise ValueError(f"num_tokens must be a square grid, got {num_tokens}.")
+        self.grid_size = grid
+        self.num_tokens = int(num_tokens)
         self.proj = nn.Conv2d(cin, d_model, kernel_size=1)
-        self.spatial_pos_y = nn.Parameter(torch.zeros(1, d_model, FUSED_SPATIAL_SIZE, 1))
-        self.spatial_pos_x = nn.Parameter(torch.zeros(1, d_model, 1, FUSED_SPATIAL_SIZE))
-        self.latents = nn.Parameter(torch.randn(1, num_latents, d_model) * 0.02)
-        self.attn = nn.MultiheadAttention(d_model, num_heads, batch_first=True)
-        self.ln = nn.LayerNorm(d_model)
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, 4 * d_model),
+        self.token_mix = nn.Sequential(
+            nn.Conv2d(d_model * 2, d_model, kernel_size=1),
             nn.GELU(),
-            nn.Linear(4 * d_model, d_model),
+            nn.Conv2d(d_model, d_model, kernel_size=1),
         )
-        nn.init.trunc_normal_(self.spatial_pos_y, std=0.02)
-        nn.init.trunc_normal_(self.spatial_pos_x, std=0.02)
-
-    def _spatial_pos(self, height: int, width: int, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        pos = self.spatial_pos_y + self.spatial_pos_x
-        if pos.size(-2) != height or pos.size(-1) != width:
-            pos = F.interpolate(pos, size=(height, width), mode="bilinear", align_corners=False)
-        return pos.to(device=device, dtype=dtype)
+        self.ln = nn.LayerNorm(d_model)
 
     def forward(self, fmap: torch.Tensor) -> torch.Tensor:
         if fmap.dim() != 4:
             raise ValueError(f"Expected feature map [B,C,H,W], got {tuple(fmap.shape)}.")
-        batch = fmap.size(0)
         x = self.proj(fmap)
-        x = x + self._spatial_pos(x.size(-2), x.size(-1), device=x.device, dtype=x.dtype)
-        x = x.flatten(2).transpose(1, 2)
-        q = self.latents.to(dtype=x.dtype).expand(batch, -1, -1)
-        y, _ = self.attn(q, x, x, need_weights=False)
-        y = y + self.ffn(self.ln(y))
-        return y
+        pooled = torch.cat(
+            [
+                F.adaptive_avg_pool2d(x, (self.grid_size, self.grid_size)),
+                F.adaptive_max_pool2d(x, (self.grid_size, self.grid_size)),
+            ],
+            dim=1,
+        )
+        tokens = self.token_mix(pooled).flatten(2).transpose(1, 2)
+        return self.ln(tokens)
 
 
 class CausalTransformerBlock(nn.Module):
@@ -357,9 +355,9 @@ class CausalTransformerBlock(nn.Module):
 
 
 class FrameEncoder(nn.Module):
-    """High-resolution per-frame CNN front-end with 64x64 multi-scale fusion."""
+    """High-resolution per-frame CNN front-end with 128x128 multi-scale fusion."""
 
-    def __init__(self, d_model: int = READOUT_CHANNELS, num_latents: int = NUM_VISUAL_TOKENS):
+    def __init__(self, d_model: int = READOUT_CHANNELS, num_tokens: int = NUM_VISUAL_TOKENS):
         super().__init__()
         self.stem = nn.Sequential(
             ConvGNAct(RGB_CHANNELS, STEM_CHANNELS, 3, 1, 1),
@@ -384,14 +382,13 @@ class FrameEncoder(nn.Module):
             ConvGNAct(64 * 4, FUSED_CHANNELS, 3, 1, 1),
             ConvNeXtBlock2D(FUSED_CHANNELS),
         )
-        self.tokenizer = SpatialLatentTokenizer(
+        self.tokenizer = SpatialGridTokenizer(
             cin=FUSED_CHANNELS,
             d_model=d_model,
-            num_latents=num_latents,
-            num_heads=TEMPORAL_HEADS,
+            num_tokens=num_tokens,
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def encode_feature_maps(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if x.dim() != 4 or x.size(1) != RGB_CHANNELS:
             raise ValueError(f"Expected RGB images [B,3,H,W], got {tuple(x.shape)}.")
         if x.size(-2) != DEFAULT_MODEL_SIZE or x.size(-1) != DEFAULT_MODEL_SIZE:
@@ -408,6 +405,10 @@ class FrameEncoder(nn.Module):
         p2 = self.p2(b2)
         p3 = F.interpolate(self.p3(b3), size=p2.shape[-2:], mode="bilinear", align_corners=False)
         fused = self.fuse(torch.cat([p0, p1, p2, p3], dim=1))
+        return x, b1, b2, b3, fused
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        _, _, _, _, fused = self.encode_feature_maps(x)
         return self.tokenizer(fused)
 
 
@@ -422,21 +423,22 @@ class GreenvilleBCFormer(nn.Module):
         n_heads: int = TEMPORAL_HEADS,
         n_layers: int = TEMPORAL_LAYERS,
         dropout: float = 0.1,
+        last_action_conditioning: bool = True,
+        last_action_residual_cap: float = 0.5,
+        use_activation_checkpointing: bool = True,
     ):
         super().__init__()
         self.context_len = int(context_len)
         self.num_visual_tokens = int(num_visual_tokens)
-        self.tokens_per_step = self.num_visual_tokens + 1
+        self.tokens_per_step = self.num_visual_tokens
         self.d_model = int(d_model)
+        self.last_action_conditioning = bool(last_action_conditioning)
+        self.last_action_residual_cap = float(last_action_residual_cap)
+        self.use_activation_checkpointing = bool(use_activation_checkpointing)
 
-        self.frame_encoder = FrameEncoder(d_model=d_model, num_latents=num_visual_tokens)
-        self.action_embed = nn.Sequential(
-            nn.Linear(len(DEFAULT_ACTION_NAMES), 64),
-            nn.GELU(),
-            nn.Linear(64, d_model),
-        )
+        self.frame_encoder = FrameEncoder(d_model=d_model, num_tokens=num_visual_tokens)
         self.temporal_pos = nn.Embedding(self.context_len, d_model)
-        self.token_type = nn.Embedding(2, d_model)
+        self.spatial_token_pos = nn.Parameter(torch.zeros(1, 1, self.num_visual_tokens, d_model))
         self.blocks = nn.ModuleList(
             [
                 CausalTransformerBlock(
@@ -448,11 +450,15 @@ class GreenvilleBCFormer(nn.Module):
                 for _ in range(n_layers)
             ]
         )
-        self.head = nn.Sequential(
-            nn.LayerNorm(d_model),
-            nn.Linear(d_model, d_model),
+        self.readout_query = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+        self.readout_token_ln = nn.LayerNorm(d_model)
+        self.readout_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+        self.readout_state_ln = nn.LayerNorm(d_model)
+        self.readout_ffn = nn.Sequential(
+            nn.Linear(d_model, 4 * d_model),
             nn.GELU(),
-            nn.Linear(d_model, len(DEFAULT_ACTION_NAMES)),
+            nn.Dropout(dropout),
+            nn.Linear(4 * d_model, d_model),
         )
         self.vision_head = nn.Sequential(
             nn.LayerNorm(d_model),
@@ -460,10 +466,20 @@ class GreenvilleBCFormer(nn.Module):
             nn.GELU(),
             nn.Linear(d_model, len(DEFAULT_ACTION_NAMES)),
         )
+        self.action_residual_mlp = nn.Sequential(
+            nn.Linear(len(DEFAULT_ACTION_NAMES), 64),
+            nn.GELU(),
+            nn.Linear(64, len(DEFAULT_ACTION_NAMES)),
+        )
+        nn.init.trunc_normal_(self.spatial_token_pos, std=0.02)
+        nn.init.zeros_(self.action_residual_mlp[-1].weight)
+        nn.init.zeros_(self.action_residual_mlp[-1].bias)
 
-    def _causal_mask(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        mask = torch.full((seq_len, seq_len), float("-inf"), device=device, dtype=dtype)
-        return torch.triu(mask, diagonal=1)
+    def _frame_causal_mask(self, steps: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        frame_ids = torch.arange(int(steps), device=device).repeat_interleave(self.tokens_per_step)
+        future = frame_ids.view(1, -1) > frame_ids.view(-1, 1)
+        mask = torch.zeros((frame_ids.numel(), frame_ids.numel()), device=device, dtype=dtype)
+        return mask.masked_fill(future, float("-inf"))
 
     def encode_visual_tokens(self, frames: torch.Tensor) -> torch.Tensor:
         if frames.dim() != 5 or frames.size(2) != RGB_CHANNELS:
@@ -479,59 +495,78 @@ class GreenvilleBCFormer(nn.Module):
         visual = self.frame_encoder(flat)
         return visual.reshape(batch, steps, self.num_visual_tokens, self.d_model)
 
-    def tokens_from_visual(self, visual_tokens: torch.Tensor, prev_actions: torch.Tensor) -> torch.Tensor:
+    def tokens_from_visual(self, visual_tokens: torch.Tensor) -> torch.Tensor:
         if visual_tokens.dim() != 4:
             raise ValueError(f"Expected visual tokens [B,T,M,D], got {tuple(visual_tokens.shape)}.")
         batch, steps, num_tokens, d_model = visual_tokens.shape
-        expected_actions = (batch, steps, len(DEFAULT_ACTION_NAMES))
-        if tuple(prev_actions.shape) != expected_actions:
-            raise ValueError(f"Expected previous actions {expected_actions}, got {tuple(prev_actions.shape)}.")
         if num_tokens != self.num_visual_tokens or d_model != self.d_model:
             raise ValueError(
                 f"Expected visual tokens [B,T,{self.num_visual_tokens},{self.d_model}], "
                 f"got {tuple(visual_tokens.shape)}."
             )
 
-        action_token = self.action_embed(prev_actions).to(dtype=visual_tokens.dtype).unsqueeze(2)
-        x = torch.cat([visual_tokens, action_token], dim=2)
-
         time_ids = torch.arange(steps, device=visual_tokens.device)
         time_emb = self.temporal_pos(time_ids).to(dtype=visual_tokens.dtype).view(1, steps, 1, self.d_model)
-        type_ids = torch.tensor(
-            [0] * self.num_visual_tokens + [1],
-            device=visual_tokens.device,
-            dtype=torch.long,
-        )
-        type_emb = self.token_type(type_ids).to(dtype=visual_tokens.dtype).view(
-            1,
-            1,
-            self.tokens_per_step,
-            self.d_model,
-        )
-        x = x + time_emb + type_emb
+        spatial_emb = self.spatial_token_pos.to(dtype=visual_tokens.dtype)
+        x = visual_tokens + time_emb + spatial_emb
         return x.reshape(batch, steps * self.tokens_per_step, self.d_model)
 
     def temporal_features_from_visual(
         self,
         visual_tokens: torch.Tensor,
-        prev_actions: torch.Tensor,
     ) -> torch.Tensor:
-        x = self.tokens_from_visual(visual_tokens, prev_actions)
-        attn_mask = self._causal_mask(x.size(1), x.device, x.dtype)
+        x = self.tokens_from_visual(visual_tokens)
+        attn_mask = self._frame_causal_mask(visual_tokens.size(1), x.device, x.dtype)
         for block in self.blocks:
-            x = block(x, attn_mask)
+            if self.use_activation_checkpointing and self.training and torch.is_grad_enabled():
+                x = activation_checkpoint(block, x, attn_mask, use_reentrant=False)
+            else:
+                x = block(x, attn_mask)
         batch, steps = visual_tokens.shape[:2]
         return x.reshape(batch, steps, self.tokens_per_step, self.d_model)
 
-    def action_states_from_visual(self, visual_tokens: torch.Tensor, prev_actions: torch.Tensor) -> torch.Tensor:
-        x = self.temporal_features_from_visual(visual_tokens, prev_actions)
-        return x[:, :, -1, :]
+    def action_states_from_visual(self, visual_tokens: torch.Tensor) -> torch.Tensor:
+        x = self.temporal_features_from_visual(visual_tokens)
+        batch, steps, num_tokens, d_model = x.shape
+        frame_tokens = x.reshape(batch * steps, num_tokens, d_model)
+        query = self.readout_query.to(dtype=x.dtype).expand(batch * steps, -1, -1)
+        readout, _ = self.readout_attn(
+            query,
+            self.readout_token_ln(frame_tokens),
+            self.readout_token_ln(frame_tokens),
+            need_weights=False,
+        )
+        state = readout.squeeze(1)
+        state = state + self.readout_ffn(self.readout_state_ln(state))
+        return state.reshape(batch, steps, d_model)
+
+    def action_residual(self, prev_actions: Optional[torch.Tensor], *, dtype: torch.dtype) -> torch.Tensor:
+        if not self.last_action_conditioning or prev_actions is None:
+            raise ValueError("Previous actions are required to compute late action residuals.")
+        residual = self.action_residual_mlp(prev_actions.to(dtype=dtype))
+        return float(self.last_action_residual_cap) * torch.tanh(residual)
 
     def logits_from_visual(self, visual_tokens: torch.Tensor, prev_actions: torch.Tensor) -> torch.Tensor:
-        return self.head(self.action_states_from_visual(visual_tokens, prev_actions))
+        logits, _ = self.logits_and_vision_from_visual(visual_tokens, prev_actions)
+        return logits
 
-    def vision_logits_from_visual(self, visual_tokens: torch.Tensor, prev_actions: torch.Tensor) -> torch.Tensor:
-        return self.vision_head(self.action_states_from_visual(visual_tokens, prev_actions))
+    def logits_and_vision_from_visual(
+        self,
+        visual_tokens: torch.Tensor,
+        prev_actions: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        vision_logits = self.vision_head(self.action_states_from_visual(visual_tokens))
+        if not self.last_action_conditioning:
+            return vision_logits, vision_logits
+        expected_actions = (visual_tokens.size(0), visual_tokens.size(1), len(DEFAULT_ACTION_NAMES))
+        if tuple(prev_actions.shape) != expected_actions:
+            raise ValueError(f"Expected previous actions {expected_actions}, got {tuple(prev_actions.shape)}.")
+        logits = vision_logits + self.action_residual(prev_actions, dtype=vision_logits.dtype)
+        return logits, vision_logits
+
+    def vision_logits_from_visual(self, visual_tokens: torch.Tensor, prev_actions: Optional[torch.Tensor] = None) -> torch.Tensor:
+        del prev_actions
+        return self.vision_head(self.action_states_from_visual(visual_tokens))
 
     def forward(self, frames: torch.Tensor, prev_actions: torch.Tensor) -> torch.Tensor:
         visual_tokens = self.encode_visual_tokens(frames)
@@ -539,23 +574,33 @@ class GreenvilleBCFormer(nn.Module):
 
 
 def apply_static_masks(frames: torch.Tensor, *, clone: bool = True) -> torch.Tensor:
-    """Mask game UI regions while retaining a three-channel RGB input."""
+    """Mean-fill game UI regions while retaining a three-channel RGB input."""
 
     if frames.dim() < 4:
         raise ValueError(f"Expected image tensor with at least four dimensions, got {tuple(frames.shape)}.")
     height, width = frames.shape[-2:]
     output = frames.clone() if clone else frames
-    output[..., int(height * 0.96) :, :] = 0.0
-    output[..., int(height * 0.78) : int(height * 0.97), int(width * 0.33) : int(width * 0.45)] = 0.0
-    output[..., int(height * 0.78) : int(height * 0.97), int(width * 0.56) : int(width * 0.67)] = 0.0
-    output[..., int(height * 0.08) : int(height * 0.14), int(width * 0.66) : int(width * 0.79)] = 0.0
-    output[..., int(height * 0.05) : int(height * 0.20), int(width * 0.75) :] = 0.0
-    output[..., : int(height * 0.10), : int(width * 0.10)] = 0.0
+    fill = output.mean(dim=(-2, -1), keepdim=True)
+
+    def fill_region(y0: int, y1: int, x0: int, x1: int) -> None:
+        y0 = max(0, min(height, int(y0)))
+        y1 = max(y0, min(height, int(y1)))
+        x0 = max(0, min(width, int(x0)))
+        x1 = max(x0, min(width, int(x1)))
+        if y1 > y0 and x1 > x0:
+            output[..., y0:y1, x0:x1] = fill
+
+    fill_region(int(height * 0.96), height, 0, width)
+    fill_region(int(height * 0.78), int(height * 0.97), int(width * 0.33), int(width * 0.45))
+    fill_region(int(height * 0.78), int(height * 0.97), int(width * 0.56), int(width * 0.67))
+    fill_region(int(height * 0.08), int(height * 0.14), int(width * 0.66), int(width * 0.79))
+    fill_region(int(height * 0.05), int(height * 0.20), int(width * 0.75), width)
+    fill_region(0, int(height * 0.10), 0, int(width * 0.10))
     return output
 
 
 class DrivingVideoPolicy(nn.Module):
-    """Compatibility wrapper around the CNN latent causal transformer."""
+    """Compatibility wrapper around the CNN grid-token causal transformer."""
 
     def __init__(self, cfg: ModelConfig) -> None:
         super().__init__()
@@ -567,6 +612,9 @@ class DrivingVideoPolicy(nn.Module):
             n_heads=TEMPORAL_HEADS,
             n_layers=TEMPORAL_LAYERS,
             dropout=float(cfg.head_dropout),
+            last_action_conditioning=bool(cfg.last_action_conditioning),
+            last_action_residual_cap=float(cfg.last_action_residual_cap),
+            use_activation_checkpointing=bool(cfg.use_activation_checkpointing),
         )
 
         # Expose the new encoder for direct inspection without legacy private APIs.
@@ -672,7 +720,8 @@ class DrivingVideoPolicy(nn.Module):
         actions = state.prev_actions.to(device=device, dtype=dtype)
         if frames.dim() != 5 or actions.dim() != 3:
             raise ValueError(
-                "TemporalState must contain frames [B,T,3,256,256] and prev_actions [B,T,6], "
+                f"TemporalState must contain frames [B,T,3,{DEFAULT_MODEL_SIZE},{DEFAULT_MODEL_SIZE}] "
+                "and prev_actions [B,T,6], "
                 f"got {tuple(frames.shape)} and {tuple(actions.shape)}."
             )
         if frames.size(0) != batch or actions.size(0) != batch:
@@ -716,7 +765,8 @@ class DrivingVideoPolicy(nn.Module):
             visual = state.visual_tokens.to(device=device, dtype=dtype)
             if visual.dim() != 4 or actions.dim() != 3:
                 raise ValueError(
-                    "TemporalState must contain visual_tokens [B,T,6,256] and prev_actions [B,T,6], "
+                    f"TemporalState must contain visual_tokens [B,T,{NUM_VISUAL_TOKENS},{READOUT_CHANNELS}] "
+                    "and prev_actions [B,T,6], "
                     f"got {tuple(visual.shape)} and {tuple(actions.shape)}."
                 )
             if visual.size(0) != batch or actions.size(0) != batch:
@@ -778,9 +828,7 @@ class DrivingVideoPolicy(nn.Module):
         *,
         current_steps: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        logits = self.policy.logits_from_visual(visual_tokens, actions)
-        zero_actions = torch.zeros_like(actions)
-        vision_logits = self.policy.vision_logits_from_visual(visual_tokens, zero_actions)
+        logits, vision_logits = self.policy.logits_and_vision_from_visual(visual_tokens, actions)
         return logits[:, -current_steps:], vision_logits[:, -current_steps:]
 
     def _autoregressive_logits(
@@ -794,21 +842,23 @@ class DrivingVideoPolicy(nn.Module):
         generated_actions = []
         previous = initial_prev_action
         prefix_len = prefix_actions.size(1)
+        vision_logits = self.policy.vision_logits_from_visual(visual_tokens)
 
         with torch.no_grad():
             for index in range(current_steps):
                 generated_actions.append(previous)
-                current_actions = torch.stack(generated_actions, dim=1)
-                actions = torch.cat([prefix_actions, current_actions], dim=1)
-                step_visual = visual_tokens[:, : prefix_len + index + 1]
-                step_logits = self.policy.logits_from_visual(step_visual, actions)[:, -1]
+                residual = self.policy.action_residual(previous.unsqueeze(1), dtype=vision_logits.dtype)[:, 0]
+                step_logits = vision_logits[:, prefix_len + index] + residual
                 previous = (torch.sigmoid(step_logits.float()) >= thresholds.view(1, -1)).to(
                     dtype=initial_prev_action.dtype
                 )
 
         current_actions = torch.stack(generated_actions, dim=1)
         actions = torch.cat([prefix_actions, current_actions], dim=1)
-        current_logits = self.policy.logits_from_visual(visual_tokens, actions)[:, -current_steps:]
+        current_logits = vision_logits[:, -current_steps:] + self.policy.action_residual(
+            current_actions,
+            dtype=vision_logits.dtype,
+        )
         return current_logits, current_actions, previous.detach()
 
     def forward_step(
@@ -842,11 +892,9 @@ class DrivingVideoPolicy(nn.Module):
         )
         visual_tokens = torch.cat([prefix_visual, current_visual], dim=1)
         actions = torch.cat([prefix_actions, action], dim=1)
-        logits = self.policy.logits_from_visual(visual_tokens, actions)[:, -1]
-        vision_logits = None
-        if return_vision_aux:
-            zero_actions = torch.zeros_like(actions)
-            vision_logits = self.policy.vision_logits_from_visual(visual_tokens, zero_actions)[:, -1]
+        logits, sequence_vision_logits = self.policy.logits_and_vision_from_visual(visual_tokens, actions)
+        logits = logits[:, -1]
+        vision_logits = sequence_vision_logits[:, -1]
         next_state = TemporalState(
             prev_actions=actions[:, -self.context_len :].detach(),
             visual_tokens=visual_tokens[:, -self.context_len :].detach(),
@@ -910,8 +958,7 @@ class DrivingVideoPolicy(nn.Module):
                 steps,
             )
             all_actions = torch.cat([prefix_actions, current_actions], dim=1)
-            zero_actions = torch.zeros_like(all_actions)
-            vision_logits = self.policy.vision_logits_from_visual(visual_tokens, zero_actions)[:, -steps:]
+            vision_logits = self.policy.vision_logits_from_visual(visual_tokens)[:, -steps:]
         else:
             current_actions = self._sequence_prev_actions(
                 prev_action,

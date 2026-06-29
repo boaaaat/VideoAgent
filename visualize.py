@@ -12,7 +12,6 @@ from typing import Dict, List, Literal, Optional, Tuple
 import cv2
 import numpy as np
 import torch
-import torch.nn.functional as F
 from tqdm.auto import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -40,6 +39,7 @@ FeatureLayer = Literal[
     "projected",
     "tokens",
 ]
+HeatReduction = Literal["max", "norm", "mean"]
 ModelKind = Literal["auto", "policy"]
 LoadedModelKind = Literal["policy"]
 VisualModel = DrivingVideoPolicy
@@ -231,14 +231,14 @@ def _canonical_layer_name(layer: FeatureLayer) -> str:
     return aliases.get(str(layer), str(layer))
 
 
-def _latent_token_maps(projected: torch.Tensor, visual_tokens: torch.Tensor) -> torch.Tensor:
-    if projected.dim() != 4:
-        raise ValueError(f"Expected projected map [B,D,H,W], got {tuple(projected.shape)}.")
+def _grid_token_maps(visual_tokens: torch.Tensor) -> torch.Tensor:
     if visual_tokens.dim() != 3:
         raise ValueError(f"Expected visual tokens [B,M,D], got {tuple(visual_tokens.shape)}.")
-    projected_norm = F.normalize(projected.float(), dim=1)
-    tokens_norm = F.normalize(visual_tokens.float(), dim=-1)
-    return torch.einsum("bmd,bdhw->bmhw", tokens_norm, projected_norm).to(dtype=projected.dtype)
+    batch, num_tokens, d_model = visual_tokens.shape
+    grid = int(round(float(num_tokens) ** 0.5))
+    if grid * grid != int(num_tokens):
+        raise ValueError(f"Expected square-grid visual tokens, got {num_tokens}.")
+    return visual_tokens.transpose(1, 2).reshape(batch, d_model, grid, grid)
 
 
 def _policy_feature_map(
@@ -249,27 +249,19 @@ def _policy_feature_map(
     name = _canonical_layer_name(layer)
     encoder = model.policy.frame_encoder
 
-    stem = encoder.stem(masked_frame)
+    stem, low, mid, deep, fused = encoder.encode_feature_maps(masked_frame)
     if name == "stem":
         return stem
 
-    low = encoder.stage1(stem)
     if name == "low":
         return low
 
-    mid = encoder.stage2(low)
     if name == "mid":
         return mid
 
-    deep = encoder.stage3(mid)
     if name == "deep":
         return deep
 
-    p0 = encoder.p0(stem)
-    p1 = encoder.p1(low)
-    p2 = encoder.p2(mid)
-    p3 = F.interpolate(encoder.p3(deep), size=p2.shape[-2:], mode="bilinear", align_corners=False)
-    fused = encoder.fuse(torch.cat([p0, p1, p2, p3], dim=1))
     if name == "fused":
         return fused
 
@@ -277,7 +269,7 @@ def _policy_feature_map(
     if name == "projected":
         return projected
     if name == "tokens":
-        return _latent_token_maps(projected, encoder.tokenizer(fused))
+        return _grid_token_maps(encoder.tokenizer(fused))
     raise ValueError(f"Unknown policy layer {layer!r}.")
 
 
@@ -302,8 +294,17 @@ def _feature_to_heat_color(
     q_low: float,
     q_high: float,
     gamma: float,
+    reduction: HeatReduction,
 ) -> np.ndarray:
-    heat = torch.linalg.vector_norm(feat.float(), ord=2, dim=1)[0]
+    values = feat.float()
+    if reduction == "max":
+        heat = values.abs().amax(dim=1)[0]
+    elif reduction == "mean":
+        heat = values.abs().mean(dim=1)[0]
+    elif reduction == "norm":
+        heat = torch.linalg.vector_norm(values, ord=2, dim=1)[0]
+    else:
+        raise ValueError(f"Unknown heat reduction {reduction!r}.")
     if robust_norm:
         lo = torch.quantile(heat.flatten(), float(q_low))
         hi = torch.quantile(heat.flatten(), float(q_high))
@@ -333,6 +334,7 @@ def _feature_heatmap_for_frame(
     q_low: float = 0.05,
     q_high: float = 0.95,
     gamma: float = 0.75,
+    heat_reduction: HeatReduction = "max",
     amp_dtype: torch.dtype = torch.bfloat16,
     use_autocast: bool = True,
     policy_state: Optional[TemporalState] = None,
@@ -365,6 +367,7 @@ def _feature_heatmap_for_frame(
         q_low=q_low,
         q_high=q_high,
         gamma=gamma,
+        reduction=heat_reduction,
     )
     return heat_color, current_frame_rgb.detach(), policy_state
 
@@ -480,6 +483,7 @@ def _policy_visuals_for_frame(
     q_low: float,
     q_high: float,
     gamma: float,
+    heat_reduction: HeatReduction,
     amp_dtype: torch.dtype,
     use_autocast: bool,
     need_trajectory: bool,
@@ -528,6 +532,7 @@ def _policy_visuals_for_frame(
         q_low=q_low,
         q_high=q_high,
         gamma=gamma,
+        reduction=heat_reduction,
     )
     return heat_color, frame_rgb.detach(), state, trajectory_probs, next_action
 
@@ -772,6 +777,7 @@ def process_video_cnn(
     q_low: float = 0.05,
     q_high: float = 0.95,
     gamma: float = 0.75,
+    heat_reduction: HeatReduction = "max",
     amp_dtype: torch.dtype = torch.bfloat16,
     use_autocast: bool = True,
     ffmpeg_path: Optional[str] = None,
@@ -862,6 +868,7 @@ def process_video_cnn(
                     q_low=q_low,
                     q_high=q_high,
                     gamma=gamma,
+                    heat_reduction=heat_reduction,
                     amp_dtype=amp_dtype,
                     use_autocast=use_autocast,
                     need_trajectory=trajectory_enabled,
@@ -947,7 +954,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--model-kind",
         choices=["auto", "policy"],
         default="auto",
-        help="Current CNN latent transformer policy checkpoint format.",
+        help="Current CNN grid-token transformer policy checkpoint format.",
     )
     parser.add_argument(
         "--ckpt-path",
@@ -976,10 +983,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "stage5",
             "spatial",
         ],
-        default="stem",
+        default="projected",
         help=(
-            "Feature map to visualize: CNN stages (stem/low/mid/deep), 256/128/64/32-to-64 fused map, "
-            "256-channel projected map, or learned latent-token similarity map. "
+            "Feature map to visualize: CNN stages (stem/low/mid/deep), 512/256/128/64-to-128 fused map, "
+            "256-channel projected map, or deterministic 8x8 grid-token map. "
             "stage1-stage5 and spatial are accepted as old CLI aliases."
         ),
     )
@@ -994,6 +1001,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--q-low", type=float, default=0.05)
     parser.add_argument("--q-high", type=float, default=0.95)
     parser.add_argument("--gamma", type=float, default=0.75)
+    parser.add_argument(
+        "--heat-reduction",
+        choices=["max", "norm", "mean"],
+        default="max",
+        help="Channel reduction before coloring features. max is recommended for thin lane markings.",
+    )
     parser.add_argument("--no-robust-norm", action="store_true", help="Use min/max normalization instead of quantiles.")
     parser.add_argument("--fp16", action="store_true", help="Use fp16 autocast on CUDA instead of bf16.")
     parser.add_argument("--no-amp", action="store_true", help="Disable autocast during encoder inference.")
@@ -1074,6 +1087,7 @@ def main() -> None:
         q_low=float(args.q_low),
         q_high=float(args.q_high),
         gamma=float(args.gamma),
+        heat_reduction=str(args.heat_reduction),
         amp_dtype=amp_dtype,
         use_autocast=use_autocast,
         ffmpeg_path=args.ffmpeg_path,

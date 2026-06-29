@@ -386,7 +386,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--list-augmentations", action="store_true", help="Print available presets and exit.")
     parser.add_argument("--frame-start", type=int, default=0)
     parser.add_argument("--num-frames", type=int, default=8)
-    parser.add_argument("--resize-size", type=int, default=256)
+    parser.add_argument("--resize-size", type=int, default=512)
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--aug-brightness", type=float, default=None)
     parser.add_argument("--aug-contrast", type=float, default=None)

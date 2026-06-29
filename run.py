@@ -65,7 +65,7 @@ class RuntimeConfig(ModelConfig):
     runtime_amp: bool = True
 
     mouse_buttons_enabled: bool = False
-    # Feed applied outputs back as the next previous-action token.
+    # Feed applied outputs back as the next previous-action residual input.
     # Soft mode is disabled because the model is trained on hard action states.
     prev_action_feedback: bool = True
     prev_action_feedback_soft: bool = False
@@ -142,7 +142,7 @@ def _is_key_down(key_name: str) -> bool:
 
 
 def merge_keyboard_feedback(action: torch.Tensor, cfg: RuntimeConfig) -> torch.Tensor:
-    """OR currently held keyboard keys into the previous-action token."""
+    """OR currently held keyboard keys into the previous-action residual input."""
 
     if not cfg.key_names:
         return action
@@ -158,7 +158,7 @@ def merge_keyboard_feedback(action: torch.Tensor, cfg: RuntimeConfig) -> torch.T
     elif merged.dim() == 2:
         merged[:, :key_count] = torch.maximum(merged[:, :key_count], key_values.view(1, key_count))
     else:
-        raise ValueError(f"Expected action token [A] or [B,A], got {tuple(merged.shape)}.")
+        raise ValueError(f"Expected action state [A] or [B,A], got {tuple(merged.shape)}.")
     return merged
 
 
@@ -416,7 +416,7 @@ def _raise_incompatible_checkpoint(ckpt_path: str, checkpoint_config: Dict) -> N
     if checkpoint_architecture != ARCHITECTURE_VERSION:
         raise RuntimeError(
             f"Checkpoint {ckpt_path!r} uses architecture={checkpoint_architecture!r}, but this runtime requires "
-            f"{ARCHITECTURE_VERSION!r}. Train a fresh CNN latent transformer checkpoint."
+            f"{ARCHITECTURE_VERSION!r}. Train a fresh CNN grid-token transformer checkpoint."
         )
 
 
@@ -597,7 +597,7 @@ def main() -> None:
         f"d_model={cfg.d_model}",
         "temporal=causal_transformer",
         f"decoder={cfg.action_decoder}",
-        "input=masked_rgb" + ("+prev_action_token" if cfg.last_action_conditioning else ""),
+        "input=masked_rgb" + ("+prev_action_residual" if cfg.last_action_conditioning else ""),
     )
     print(
         "Button thresholds:",
