@@ -3,8 +3,8 @@
 The DALI pipeline owns GPU video decode and resize. CSV labels are parsed once
 on the host, then joined to decoded fixed-length windows through the DALI sample
 label written into the file list. Each window is an independent causal
-transformer context with observed previous actions used only for late residual
-conditioning.
+transformer context with previous target-horizon actions used only for late
+residual feedback conditioning.
 """
 
 from __future__ import annotations
@@ -118,11 +118,11 @@ class TrainConfig(ModelConfig):
     main_policy_loss_weight: float = 0.5
     conflict_penalty_weight: float = 0.20
     vision_aux_loss_weight: float = 1.0
-    # Drop previous-action residual inputs during teacher forcing so the policy
-    # cannot solve the task by copying action persistence alone.
+    # Drop feedback residual inputs during teacher forcing so the policy cannot
+    # solve the task by copying action persistence alone.
     action_token_dropout_prob: float = 0.2
     # Optional closed-loop scheduled sampling over independent fixed-length windows.
-    # Keep it off by default for V5 so early training optimizes the vision path;
+    # Keep it off by default so early training optimizes the vision path;
     # closed-loop validation still runs as a secondary signal.
     autoregressive_feedback_prob: float = 0.0
     autoregressive_validation: bool = True
@@ -532,9 +532,12 @@ def build_window_targets(
             target_end = target_start + int(cfg.seq_len)
             label_windows.append(labels[target_start:target_end])
             # The target at timestep t is labels[start + t + action_offset].
-            # Previous action must stay causal, so it is the observed input-time
-            # action labels[start + t], not the frame before the future target.
-            previous_start = start
+            # At runtime the residual input is the previous model output, so
+            # teacher forcing must feed the previous target-horizon action. If
+            # action_offset=1 this is identical to the observed input-time
+            # action. For larger offsets it avoids training on labels[start+t]
+            # and then closing the loop with labels[start+t+action_offset].
+            previous_start = target_start - 1
             previous = labels[previous_start : previous_start + int(cfg.seq_len)]
             previous_action_windows.append(previous)
             meta.append(WindowMeta(video_path, start, start + int(cfg.seq_len)))
@@ -744,13 +747,13 @@ def apply_action_residual_dropout(
     *,
     training: bool,
 ) -> Tuple[torch.Tensor, float]:
-    """Randomly zero complete previous-action residual inputs during teacher forcing."""
+    """Randomly zero complete feedback residual inputs during teacher forcing."""
 
     probability = float(cfg.action_token_dropout_prob)
     if not training or probability <= 0.0:
         return previous_actions, 0.0
     if previous_actions.dim() != 3:
-        raise ValueError(f"Expected previous actions [B,T,A], got {tuple(previous_actions.shape)}.")
+        raise ValueError(f"Expected feedback actions [B,T,A], got {tuple(previous_actions.shape)}.")
     keep = torch.rand(
         previous_actions.size(0),
         previous_actions.size(1),
@@ -1047,7 +1050,7 @@ def maybe_resume(
     print(f"Resumed from {path} at epoch {state.get('epoch', 0)}.")
     if initialized_vision_head:
         print("Initialized missing vision_head weights from the checkpoint main policy head.")
-    # V5 checkpoints use vision BCE as the model-selection score.
+    # Current checkpoints use vision BCE as the model-selection score.
     best_validation_bce = float(state.get("best_validation_bce", math.inf))
 
     def checkpoint_int(name: str, fallback: int) -> int:
@@ -1179,8 +1182,8 @@ def print_startup_stats(
         f"vision_aux_weight={cfg.vision_aux_loss_weight:.3f}",
     )
     print(
-        "  Previous action:",
-        f"late_residual={cfg.last_action_conditioning}",
+        "  Feedback action:",
+        f"residual={cfg.last_action_conditioning}",
         f"residual_cap={cfg.last_action_residual_cap:.3f}",
         f"teacher_forcing={1.0 - float(cfg.autoregressive_feedback_prob):.2f}",
         f"closed_loop_train={float(cfg.autoregressive_feedback_prob):.2f}",
@@ -1458,7 +1461,7 @@ def parse_args() -> TrainConfig:
         "--action-token-dropout-prob",
         type=float,
         default=None,
-        help="Drop observed previous-action residual inputs during teacher forcing. Legacy argument name.",
+        help="Drop teacher-forced feedback residual inputs. Legacy argument name.",
     )
     add("--autoregressive-feedback-prob", type=float, default=None)
     add("--autoregressive-feedback-threshold", type=float, default=None)
