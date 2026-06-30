@@ -115,10 +115,17 @@ class TrainConfig(ModelConfig):
     # unstable and encouraged the low-precision predictions seen in validation.
     pos_weight_power: float = 0.5
     pos_weight_clamp: float = 8.0
-    transition_loss_weight: float = 48.0
+    # Transitions are only a few percent of labeled frames, so learn them as a
+    # separate change/no-change target.  The cap keeps the auxiliary BCE bounded.
+    change_loss_weight: float = 1.0
+    change_pos_weight_power: float = 1.0
+    change_pos_weight_clamp: float = 16.0
     main_policy_loss_weight: float = 1.0
     conflict_penalty_weight: float = 0.20
     vision_aux_loss_weight: float = 1.0
+    transition_oversample_extra_copies: int = 2
+    transition_oversample_max_action_rate: float = 0.015
+    transition_oversample_min_changes: int = 1
     # Drop feedback residual inputs during teacher forcing so the policy cannot
     # solve the task by copying action persistence alone when feedback is enabled.
     action_token_dropout_prob: float = 0.2
@@ -182,8 +189,12 @@ class TrainConfig(ModelConfig):
         self.train_split = _finite_float("train_split", self.train_split, 0.05, 0.95)
         self.pos_weight_power = _finite_float("pos_weight_power", self.pos_weight_power, 0.0)
         self.pos_weight_clamp = _finite_float("pos_weight_clamp", self.pos_weight_clamp, 1.0)
-        self.transition_loss_weight = _finite_float(
-            "transition_loss_weight", self.transition_loss_weight, 1.0, 64.0
+        self.change_loss_weight = _finite_float("change_loss_weight", self.change_loss_weight, 0.0, 4.0)
+        self.change_pos_weight_power = _finite_float(
+            "change_pos_weight_power", self.change_pos_weight_power, 0.0
+        )
+        self.change_pos_weight_clamp = _finite_float(
+            "change_pos_weight_clamp", self.change_pos_weight_clamp, 1.0, 16.0
         )
         self.main_policy_loss_weight = _finite_float(
             "main_policy_loss_weight", self.main_policy_loss_weight, 0.0
@@ -192,6 +203,15 @@ class TrainConfig(ModelConfig):
             "conflict_penalty_weight", self.conflict_penalty_weight, 0.0
         )
         self.vision_aux_loss_weight = _finite_float("vision_aux_loss_weight", self.vision_aux_loss_weight, 0.0)
+        self.transition_oversample_extra_copies = _positive_int(
+            "transition_oversample_extra_copies", self.transition_oversample_extra_copies, 0
+        )
+        self.transition_oversample_max_action_rate = _finite_float(
+            "transition_oversample_max_action_rate", self.transition_oversample_max_action_rate, 0.0, 1.0
+        )
+        self.transition_oversample_min_changes = _positive_int(
+            "transition_oversample_min_changes", self.transition_oversample_min_changes, 1
+        )
         self.action_token_dropout_prob = _finite_float(
             "action_token_dropout_prob", self.action_token_dropout_prob, 0.0, 1.0
         )
@@ -573,6 +593,45 @@ def write_window_file_list(
             handle.write(f"{item.video_path} {sample_id} {item.start_frame} {item.end_frame}\n")
 
 
+def transition_oversampled_indices(
+    targets: WindowTargets,
+    cfg: TrainConfig,
+) -> Tuple[List[int], Dict[str, object]]:
+    base_indices = list(range(len(targets.meta)))
+    extra_copies = int(cfg.transition_oversample_extra_copies)
+    if extra_copies <= 0:
+        return base_indices, {
+            "extra_copies": 0,
+            "selected_windows": 0,
+            "file_windows": len(base_indices),
+            "rare_actions": [],
+        }
+
+    transition_mask = (targets.labels > 0.5) != (targets.previous_actions > 0.5)
+    action_rates = transition_mask.float().mean(dim=(0, 1))
+    rare_action_mask = action_rates <= float(cfg.transition_oversample_max_action_rate)
+    if not bool(rare_action_mask.any()):
+        rare_action_mask = torch.ones_like(action_rates, dtype=torch.bool)
+    rare_counts = transition_mask[:, :, rare_action_mask].sum(dim=(1, 2))
+    selected = torch.nonzero(
+        rare_counts >= int(cfg.transition_oversample_min_changes),
+        as_tuple=False,
+    ).reshape(-1)
+    selected_indices = [int(index) for index in selected.tolist()]
+    oversampled = base_indices + selected_indices * extra_copies
+    rare_actions = [
+        str(name)
+        for name, keep in zip(cfg.key_names, rare_action_mask.tolist())
+        if bool(keep)
+    ]
+    return oversampled, {
+        "extra_copies": extra_copies,
+        "selected_windows": len(selected_indices),
+        "file_windows": len(oversampled),
+        "rare_actions": rare_actions,
+    }
+
+
 @pipeline_def
 def video_window_pipeline(
     file_list: str,
@@ -700,15 +759,27 @@ def compute_pos_weight(labels: torch.Tensor, power: float, clamp: float) -> torc
     return (negative / positive.clamp(min=1.0)).pow(float(power)).clamp(1.0, float(clamp))
 
 
-def transition_weighted_bce_with_logits(
+def action_change_targets(labels: torch.Tensor, previous_actions: torch.Tensor) -> torch.Tensor:
+    return ((labels.float() > 0.5) != (previous_actions.float() > 0.5)).to(dtype=labels.dtype)
+
+
+def compute_change_pos_weight(
+    labels: torch.Tensor,
+    previous_actions: torch.Tensor,
+    power: float,
+    clamp: float,
+) -> torch.Tensor:
+    return compute_pos_weight(action_change_targets(labels, previous_actions), power, clamp)
+
+
+def state_bce_with_transition_breakdown(
     logits: torch.Tensor,
     labels: torch.Tensor,
     previous_actions: torch.Tensor,
     *,
     pos_weight: torch.Tensor,
-    transition_weight: float,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Class-weighted BCE with extra weight on target-state changes."""
+    """Normal state BCE plus transition/steady diagnostic slices."""
 
     element_loss = F.binary_cross_entropy_with_logits(
         logits.float(),
@@ -718,10 +789,7 @@ def transition_weighted_bce_with_logits(
     )
     transition_mask = (labels.float() > 0.5) != (previous_actions.float() > 0.5)
     steady_mask = ~transition_mask
-    weights = torch.ones_like(element_loss)
-    if float(transition_weight) > 1.0:
-        weights = weights + (float(transition_weight) - 1.0) * transition_mask.to(dtype=weights.dtype)
-    weighted_loss = (element_loss * weights).sum() / weights.sum().clamp(min=1.0)
+    state_loss = element_loss.mean()
     transition_loss = (
         element_loss[transition_mask].mean()
         if bool(transition_mask.any())
@@ -733,7 +801,24 @@ def transition_weighted_bce_with_logits(
         else element_loss.new_zeros(())
     )
     transition_rate = transition_mask.float().mean()
-    return weighted_loss, transition_loss, steady_loss, transition_rate
+    return state_loss, transition_loss, steady_loss, transition_rate
+
+
+def change_bce_with_logits(
+    change_logits: torch.Tensor,
+    labels: torch.Tensor,
+    previous_actions: torch.Tensor,
+    *,
+    pos_weight: torch.Tensor,
+) -> torch.Tensor:
+    """BCE for the direct visual action-change head."""
+
+    change_targets = action_change_targets(labels, previous_actions).float()
+    return F.binary_cross_entropy_with_logits(
+        change_logits.float(),
+        change_targets,
+        pos_weight=pos_weight.float(),
+    )
 
 
 def conflicting_action_penalty(logits: torch.Tensor, cfg: TrainConfig) -> torch.Tensor:
@@ -823,6 +908,7 @@ def run_epoch(
     device: torch.device,
     amp_dtype: torch.dtype,
     pos_weight: torch.Tensor,
+    change_pos_weight: torch.Tensor,
     optimizer: Optional[torch.optim.Optimizer],
     total_steps: int,
     global_step: int,
@@ -844,14 +930,17 @@ def run_epoch(
     loss_sum = 0.0
     bce_loss_sum = 0.0
     vision_bce_loss_sum = 0.0
+    change_bce_loss_sum = 0.0
     transition_bce_loss_sum = 0.0
     steady_bce_loss_sum = 0.0
     transition_rate_sum = 0.0
     conflict_loss_sum = 0.0
     stats = BinaryStats(cfg.num_bin, device)
     vision_stats = BinaryStats(cfg.num_bin, device)
+    change_stats = BinaryStats(cfg.num_bin, device)
     fitter = ThresholdFitter() if bool(fit_thresholds) else None
     vision_fitter = ThresholdFitter() if bool(fit_thresholds) else None
+    change_fitter = ThresholdFitter() if bool(fit_thresholds) else None
     metric_threshold_values = (
         tuple(float(item) for item in cfg.button_state_thresholds)
         if metric_thresholds is None
@@ -912,33 +1001,45 @@ def run_epoch(
                     )
                 logits = output.sequence_button_logits
                 vision_logits = output.sequence_vision_button_logits
+                change_logits = output.sequence_change_logits
                 if logits is None:
                     raise RuntimeError("Dense temporal supervision requires per-timestep policy logits.")
                 if vision_logits is None:
                     raise RuntimeError("Training requires per-timestep vision-only logits.")
+                if change_logits is None:
+                    raise RuntimeError("Training requires per-timestep visual change logits.")
                 if tuple(logits.shape) != tuple(labels.shape):
                     raise RuntimeError(
                         f"Model logits shape {tuple(logits.shape)} does not match labels {tuple(labels.shape)}."
                     )
+                if tuple(change_logits.shape) != tuple(labels.shape):
+                    raise RuntimeError(
+                        f"Change logits shape {tuple(change_logits.shape)} does not match labels {tuple(labels.shape)}."
+                    )
                 bce_loss, transition_bce_loss, steady_bce_loss, transition_rate = (
-                    transition_weighted_bce_with_logits(
+                    state_bce_with_transition_breakdown(
                         logits,
                         labels,
                         previous_actions,
                         pos_weight=pos_weight,
-                        transition_weight=float(cfg.transition_loss_weight),
                     )
                 )
-                vision_bce_loss, _, _, _ = transition_weighted_bce_with_logits(
+                vision_bce_loss, _, _, _ = state_bce_with_transition_breakdown(
                     vision_logits,
                     labels,
                     previous_actions,
                     pos_weight=pos_weight,
-                    transition_weight=float(cfg.transition_loss_weight),
+                )
+                change_bce_loss = change_bce_with_logits(
+                    change_logits,
+                    labels,
+                    previous_actions,
+                    pos_weight=change_pos_weight,
                 )
                 conflict_loss = conflicting_action_penalty(logits, cfg)
                 loss = (
                     float(cfg.main_policy_loss_weight) * bce_loss
+                    + float(cfg.change_loss_weight) * change_bce_loss
                     + float(cfg.vision_aux_loss_weight) * vision_bce_loss
                     + float(cfg.conflict_penalty_weight) * conflict_loss
                 )
@@ -965,34 +1066,43 @@ def run_epoch(
         with torch.no_grad():
             flat_logits = logits.reshape(-1, cfg.num_bin)
             flat_vision_logits = vision_logits.reshape(-1, cfg.num_bin)
+            flat_change_logits = change_logits.reshape(-1, cfg.num_bin)
             flat_labels = labels.reshape(-1, cfg.num_bin)
+            flat_changes = action_change_targets(labels, previous_actions).reshape(-1, cfg.num_bin)
             prediction = torch.sigmoid(flat_logits.float()) >= thresholds.view(1, -1)
             vision_prediction = torch.sigmoid(flat_vision_logits.float()) >= thresholds.view(1, -1)
+            change_prediction = torch.sigmoid(flat_change_logits.float()) >= 0.5
             stats.update(prediction, flat_labels > 0.5)
             vision_stats.update(vision_prediction, flat_labels > 0.5)
+            change_stats.update(change_prediction, flat_changes > 0.5)
             if fitter is not None:
                 fitter.update(flat_logits, flat_labels)
             if vision_fitter is not None:
                 vision_fitter.update(flat_vision_logits, flat_labels)
+            if change_fitter is not None:
+                change_fitter.update(flat_change_logits, flat_changes)
         loss_sum += float(loss.detach().item())
         bce_loss_sum += float(bce_loss.detach().item())
         vision_bce_loss_sum += float(vision_bce_loss.detach().item())
+        change_bce_loss_sum += float(change_bce_loss.detach().item())
         transition_bce_loss_sum += float(transition_bce_loss.detach().item())
         steady_bce_loss_sum += float(steady_bce_loss.detach().item())
         transition_rate_sum += float(transition_rate.detach().item())
         conflict_loss_sum += float(conflict_loss.detach().item())
         if (batch_index + 1) % cfg.print_every == 0 or batch_index + 1 == num_batches:
             progress.set_postfix(
-                loss=f"{loss_sum / float(batch_index + 1):.4f}",
-                bce=f"{bce_loss_sum / float(batch_index + 1):.4f}",
-                vision_bce=f"{vision_bce_loss_sum / float(batch_index + 1):.4f}",
-                trans_bce=f"{transition_bce_loss_sum / float(batch_index + 1):.4f}",
-                steady_bce=f"{steady_bce_loss_sum / float(batch_index + 1):.4f}",
-                conflict=f"{conflict_loss_sum / float(batch_index + 1):.4f}",
-                f1=f"{stats.macro_f1():.3f}",
-                vision_f1=f"{vision_stats.macro_f1():.3f}",
-                residual_drop=f"{action_dropout_sum / float(batch_index + 1):.3f}",
-                closed_loop=f"{autoregressive_batches}/{batch_index + 1}",
+                L=f"{loss_sum / float(batch_index + 1):.4f}",
+                B=f"{bce_loss_sum / float(batch_index + 1):.4f}",
+                VB=f"{vision_bce_loss_sum / float(batch_index + 1):.4f}",
+                CB=f"{change_bce_loss_sum / float(batch_index + 1):.4f}",
+                TB=f"{transition_bce_loss_sum / float(batch_index + 1):.4f}",
+                SB=f"{steady_bce_loss_sum / float(batch_index + 1):.4f}",
+                C=f"{conflict_loss_sum / float(batch_index + 1):.4f}",
+                F1=f"{stats.macro_f1():.3f}",
+                VF1=f"{vision_stats.macro_f1():.3f}",
+                XF1=f"{change_stats.macro_f1():.3f}",
+                RD=f"{action_dropout_sum / float(batch_index + 1):.3f}",
+                CL=f"{autoregressive_batches}/{batch_index + 1}",
             )
     iterator.reset()
 
@@ -1000,6 +1110,7 @@ def run_epoch(
         "loss": loss_sum / max(1, num_batches),
         "bce_loss": bce_loss_sum / max(1, num_batches),
         "vision_bce_loss": vision_bce_loss_sum / max(1, num_batches),
+        "change_bce_loss": change_bce_loss_sum / max(1, num_batches),
         "transition_bce_loss": transition_bce_loss_sum / max(1, num_batches),
         "steady_bce_loss": steady_bce_loss_sum / max(1, num_batches),
         "transition_rate": transition_rate_sum / max(1, num_batches),
@@ -1008,6 +1119,8 @@ def run_epoch(
         "rows": stats.rows(cfg.key_names),
         "vision_macro_f1": vision_stats.macro_f1(),
         "vision_rows": vision_stats.rows(cfg.key_names),
+        "change_macro_f1": change_stats.macro_f1(),
+        "change_rows": change_stats.rows(cfg.key_names),
         "action_token_dropout_rate": action_dropout_sum / max(1, num_batches),
         "autoregressive_batches": autoregressive_batches,
         "metric_thresholds": metric_threshold_values,
@@ -1032,6 +1145,14 @@ def run_epoch(
         metrics["previous_threshold_vision_rows"] = metrics["vision_rows"]
         metrics["vision_macro_f1"] = calibrated_vision_stats.macro_f1()
         metrics["vision_rows"] = calibrated_vision_stats.rows(cfg.key_names)
+    if change_fitter is not None:
+        change_fitted_thresholds = change_fitter.fit(0.02, 0.80, cfg.num_bin)
+        calibrated_change_stats = change_fitter.statistics(change_fitted_thresholds, cfg.num_bin)
+        metrics["change_fitted_thresholds"] = change_fitted_thresholds
+        metrics["previous_threshold_change_macro_f1"] = metrics["change_macro_f1"]
+        metrics["previous_threshold_change_rows"] = metrics["change_rows"]
+        metrics["change_macro_f1"] = calibrated_change_stats.macro_f1()
+        metrics["change_rows"] = calibrated_change_stats.rows(cfg.key_names)
     return metrics, global_step
 
 
@@ -1111,7 +1232,7 @@ def maybe_resume(
     print(f"Resumed from {path} at epoch {state.get('epoch', 0)}.")
     if initialized_vision_head:
         print("Initialized missing vision_head weights from the checkpoint main policy head.")
-    # Current checkpoints use vision BCE as the model-selection score.
+    # v10 checkpoints use direct visual-change BCE as the model-selection score.
     best_validation_bce = float(state.get("best_validation_bce", math.inf))
 
     def checkpoint_int(name: str, fallback: int) -> int:
@@ -1151,14 +1272,117 @@ def transition_rate_by_action(targets: WindowTargets) -> torch.Tensor:
     return ((targets.labels > 0.5) != (targets.previous_actions > 0.5)).float().mean(dim=(0, 1))
 
 
-def transition_weight_summary(rate: float, weight: float) -> Tuple[float, float, float, float]:
-    rate = min(max(float(rate), 0.0), 1.0)
-    weight = max(float(weight), 1.0)
-    mean_raw_weight = 1.0 + (weight - 1.0) * rate
-    transition_mass = (weight * rate) / max(weight * rate + (1.0 - rate), 1e-12)
-    transition_multiplier = weight / max(mean_raw_weight, 1e-12)
-    steady_multiplier = 1.0 / max(mean_raw_weight, 1e-12)
-    return transition_mass, mean_raw_weight, transition_multiplier, steady_multiplier
+def print_progress_metric_legend() -> None:
+    rows = [
+        ("L", "total loss"),
+        ("B", "state BCE"),
+        ("VB", "vision state BCE"),
+        ("CB", "change-head BCE"),
+        ("TB", "state BCE on transition targets"),
+        ("SB", "state BCE on steady targets"),
+        ("C", "conflict penalty"),
+        ("F1", "state macro F1"),
+        ("VF1", "vision state macro F1"),
+        ("XF1", "visual change macro F1"),
+        ("RD", "residual dropout rate"),
+        ("CL", "closed-loop batches / seen batches"),
+    ]
+    print("Progress metric legend:")
+    print("  key   meaning")
+    print("  ----  -------------------------------")
+    for key, meaning in rows:
+        print(f"  {key:<4}  {meaning}")
+
+
+def print_action_stats_table(
+    action_names: Sequence[str],
+    train_positive_rate: torch.Tensor,
+    val_positive_rate: torch.Tensor,
+    train_transition_rate: torch.Tensor,
+    val_transition_rate: torch.Tensor,
+    pos_weight: torch.Tensor,
+    change_pos_weight: torch.Tensor,
+) -> None:
+    print("Action stats:")
+    print("  act  tr_pos  val_pos  tr_chg  val_chg  pos_w  chg_w")
+    print("  ---  ------  -------  ------  -------  -----  -----")
+    for name, tr_pos, val_pos, tr_chg, val_chg, pos_w, chg_w in zip(
+        action_names,
+        train_positive_rate,
+        val_positive_rate,
+        train_transition_rate,
+        val_transition_rate,
+        pos_weight.detach().cpu(),
+        change_pos_weight.detach().cpu(),
+    ):
+        print(
+            f"  {name:<3}  "
+            f"{float(tr_pos):>6.4f}  "
+            f"{float(val_pos):>7.4f}  "
+            f"{float(tr_chg):>6.4f}  "
+            f"{float(val_chg):>7.4f}  "
+            f"{float(pos_w):>5.2f}  "
+            f"{float(chg_w):>5.2f}"
+        )
+
+
+def weighted_constant_logits(labels: torch.Tensor, pos_weight: torch.Tensor) -> torch.Tensor:
+    labels = labels.reshape(-1, labels.size(-1)).float()
+    positive = labels.sum(dim=0)
+    negative = float(labels.size(0)) - positive
+    weight = pos_weight.detach().cpu().float().reshape(-1)
+    probability = (weight * positive / (negative + weight * positive).clamp(min=1.0)).clamp(
+        1e-4,
+        1.0 - 1e-4,
+    )
+    return torch.logit(probability)
+
+
+def constant_prior_loss_summary(
+    targets: WindowTargets,
+    cfg: TrainConfig,
+    *,
+    pos_weight: torch.Tensor,
+    change_pos_weight: torch.Tensor,
+) -> Dict[str, float]:
+    logits = weighted_constant_logits(
+        targets.labels,
+        pos_weight=pos_weight,
+    ).view(1, 1, cfg.num_bin).expand_as(targets.labels)
+    change_targets = action_change_targets(targets.labels, targets.previous_actions)
+    change_logits = weighted_constant_logits(
+        change_targets,
+        pos_weight=change_pos_weight,
+    ).view(1, 1, cfg.num_bin).expand_as(targets.labels)
+    state_loss, transition_loss, steady_loss, _ = state_bce_with_transition_breakdown(
+        logits,
+        targets.labels,
+        targets.previous_actions,
+        pos_weight=pos_weight.detach().cpu(),
+    )
+    change_loss = change_bce_with_logits(
+        change_logits,
+        targets.labels,
+        targets.previous_actions,
+        pos_weight=change_pos_weight.detach().cpu(),
+    )
+    conflict_loss = conflicting_action_penalty(logits.reshape(-1, cfg.num_bin), cfg)
+    state_loss_scale = float(cfg.vision_aux_loss_weight)
+    if not cfg.last_action_conditioning:
+        state_loss_scale += float(cfg.main_policy_loss_weight)
+    total = (
+        state_loss_scale * state_loss
+        + float(cfg.change_loss_weight) * change_loss
+        + float(cfg.conflict_penalty_weight) * conflict_loss
+    )
+    return {
+        "loss": float(total.item()),
+        "state_bce": float(state_loss.item()),
+        "change_bce": float(change_loss.item()),
+        "transition_bce": float(transition_loss.item()),
+        "steady_bce": float(steady_loss.item()),
+        "conflict": float(conflict_loss.item()),
+    }
 
 
 def print_startup_stats(
@@ -1168,10 +1392,13 @@ def print_startup_stats(
     val_pairs: Sequence[Tuple[str, str]],
     train_targets: WindowTargets,
     val_targets: WindowTargets,
+    train_file_windows: int,
+    transition_sampling: Dict[str, object],
     train_batches: int,
     val_batches: int,
     parameter_count: int,
     pos_weight: torch.Tensor,
+    change_pos_weight: torch.Tensor,
 ) -> None:
     """Print the fixed data/model contract before the first DALI batch is read."""
 
@@ -1180,9 +1407,17 @@ def print_startup_stats(
     val_positive_rate = val_targets.labels.reshape(-1, cfg.num_bin).float().mean(dim=0)
     train_transition_rate = transition_rate_by_action(train_targets)
     val_transition_rate = transition_rate_by_action(val_targets)
-    global_train_transition_rate = float(train_transition_rate.mean().item())
-    transition_mass, mean_transition_weight, transition_multiplier, steady_multiplier = (
-        transition_weight_summary(global_train_transition_rate, float(cfg.transition_loss_weight))
+    train_prior_baseline = constant_prior_loss_summary(
+        train_targets,
+        cfg,
+        pos_weight=pos_weight,
+        change_pos_weight=change_pos_weight,
+    )
+    val_prior_baseline = constant_prior_loss_summary(
+        val_targets,
+        cfg,
+        pos_weight=pos_weight,
+        change_pos_weight=change_pos_weight,
     )
     total_videos = len(train_pairs) + len(val_pairs)
     print("Startup configuration:")
@@ -1213,6 +1448,7 @@ def print_startup_stats(
         f"train_videos={len(train_pairs)}",
         f"val_videos={len(val_pairs)}",
         f"train_windows={len(train_targets.meta)}",
+        f"train_file_windows={int(train_file_windows)}",
         f"val_windows={len(val_targets.meta)}",
         f"train_stride={cfg.train_seq_stride}",
         f"val_stride={cfg.val_seq_stride}",
@@ -1258,10 +1494,20 @@ def print_startup_stats(
         "BCEWithLogits",
         f"pos_weight_power={cfg.pos_weight_power:.3f}",
         f"pos_weight_clamp={cfg.pos_weight_clamp:.3f}",
-        f"transition_weight={cfg.transition_loss_weight:.3f}",
+        f"change_weight={cfg.change_loss_weight:.3f}",
+        f"change_pos_weight_power={cfg.change_pos_weight_power:.3f}",
+        f"change_pos_weight_clamp={cfg.change_pos_weight_clamp:.3f}",
         f"main_policy_weight={cfg.main_policy_loss_weight:.3f}",
         f"conflict_weight={cfg.conflict_penalty_weight:.3f}",
         f"vision_aux_weight={cfg.vision_aux_loss_weight:.3f}",
+    )
+    print_progress_metric_legend()
+    print(
+        "  Transition sampling:",
+        f"rare_actions={transition_sampling.get('rare_actions', [])}",
+        f"selected_windows={int(transition_sampling.get('selected_windows', 0))}",
+        f"extra_copies={int(transition_sampling.get('extra_copies', 0))}",
+        f"file_multiplier={float(train_file_windows) / max(1.0, float(len(train_targets.meta))):.2f}",
     )
     print(
         "  Feedback action:",
@@ -1272,33 +1518,28 @@ def print_startup_stats(
         f"residual_dropout={float(cfg.action_token_dropout_prob):.3f}",
         f"validation={'teacher_forced+closed_loop' if cfg.autoregressive_validation else 'teacher_forced'}",
     )
-    print(
-        "  Train class stats:",
-        " ".join(
-            f"{name}:pos={float(rate):.4f},w={float(weight):.3f}"
-            for name, rate, weight in zip(action_names, train_positive_rate, pos_weight.detach().cpu())
-        ),
+    print_action_stats_table(
+        action_names,
+        train_positive_rate,
+        val_positive_rate,
+        train_transition_rate,
+        val_transition_rate,
+        pos_weight,
+        change_pos_weight,
     )
     print(
-        "  Val class stats:",
-        " ".join(f"{name}:pos={float(rate):.4f}" for name, rate in zip(action_names, val_positive_rate)),
+        "  Train constant-prior baseline:",
+        f"loss={train_prior_baseline['loss']:.4f}",
+        f"state_bce={train_prior_baseline['state_bce']:.4f}",
+        f"change_bce={train_prior_baseline['change_bce']:.4f}",
+        f"trans_bce={train_prior_baseline['transition_bce']:.4f}",
     )
     print(
-        "  Train transition stats:",
-        " ".join(f"{name}:rate={float(rate):.4f}" for name, rate in zip(action_names, train_transition_rate)),
-    )
-    print(
-        "  Val transition stats:",
-        " ".join(f"{name}:rate={float(rate):.4f}" for name, rate in zip(action_names, val_transition_rate)),
-    )
-    print(
-        "  Transition loss scaling:",
-        f"global_train_rate={global_train_transition_rate:.4f}",
-        f"weighted_transition_mass={transition_mass:.3f}",
-        f"mean_raw_weight={mean_transition_weight:.3f}",
-        f"effective_transition_multiplier={transition_multiplier:.2f}",
-        f"effective_steady_multiplier={steady_multiplier:.2f}",
-        "normalized=True",
+        "  Val constant-prior baseline:",
+        f"loss={val_prior_baseline['loss']:.4f}",
+        f"state_bce={val_prior_baseline['state_bce']:.4f}",
+        f"change_bce={val_prior_baseline['change_bce']:.4f}",
+        f"trans_bce={val_prior_baseline['transition_bce']:.4f}",
     )
 
 
@@ -1319,12 +1560,13 @@ def train(cfg: Optional[TrainConfig] = None) -> None:
     train_pairs, val_pairs = resolve_run_pairs(cfg)
     train_targets = build_window_targets(train_pairs, cfg, stride=cfg.train_seq_stride)
     val_targets = build_window_targets(val_pairs, cfg, stride=cfg.val_seq_stride)
+    train_indices, transition_sampling = transition_oversampled_indices(train_targets, cfg)
     train_file_list = os.path.join(cfg.ckpt_dir, "train_windows.txt")
     val_file_list = os.path.join(cfg.ckpt_dir, "val_windows.txt")
-    write_window_file_list(train_targets.meta, train_file_list)
+    write_window_file_list(train_targets.meta, train_file_list, indices=train_indices)
     write_window_file_list(val_targets.meta, val_file_list)
 
-    train_batches = _batch_count(train_targets, cfg.batch_size, partial=False)
+    train_batches = len(train_indices) // int(cfg.batch_size)
     val_batch_size = min(cfg.batch_size, len(val_targets.meta))
     val_batches = _batch_count(val_targets, val_batch_size, partial=True)
     if cfg.max_train_batches is not None:
@@ -1357,6 +1599,12 @@ def train(cfg: Optional[TrainConfig] = None) -> None:
     model = torch.compile(base_model) if cfg.compile_model else base_model
     amp_dtype = torch.bfloat16 if cfg.amp_dtype == "bf16" else torch.float32
     pos_weight = compute_pos_weight(train_targets.labels, cfg.pos_weight_power, cfg.pos_weight_clamp).to(device)
+    change_pos_weight = compute_change_pos_weight(
+        train_targets.labels,
+        train_targets.previous_actions,
+        cfg.change_pos_weight_power,
+        cfg.change_pos_weight_clamp,
+    ).to(device)
     parameter_count = sum(parameter.numel() for parameter in base_model.parameters())
     print_startup_stats(
         cfg,
@@ -1364,10 +1612,13 @@ def train(cfg: Optional[TrainConfig] = None) -> None:
         val_pairs=val_pairs,
         train_targets=train_targets,
         val_targets=val_targets,
+        train_file_windows=len(train_indices),
+        transition_sampling=transition_sampling,
         train_batches=train_batches,
         val_batches=val_batches,
         parameter_count=parameter_count,
         pos_weight=pos_weight,
+        change_pos_weight=change_pos_weight,
     )
     total_steps = max(1, int(math.ceil(train_batches / float(cfg.grad_accum))) * cfg.num_epochs)
 
@@ -1389,6 +1640,7 @@ def train(cfg: Optional[TrainConfig] = None) -> None:
             device=device,
             amp_dtype=amp_dtype,
             pos_weight=pos_weight,
+            change_pos_weight=change_pos_weight,
             optimizer=optimizer,
             total_steps=total_steps,
             global_step=global_step,
@@ -1405,6 +1657,7 @@ def train(cfg: Optional[TrainConfig] = None) -> None:
                 device=device,
                 amp_dtype=amp_dtype,
                 pos_weight=pos_weight,
+                change_pos_weight=change_pos_weight,
                 optimizer=None,
                 total_steps=total_steps,
                 global_step=global_step,
@@ -1428,6 +1681,7 @@ def train(cfg: Optional[TrainConfig] = None) -> None:
                     device=device,
                     amp_dtype=amp_dtype,
                     pos_weight=pos_weight,
+                    change_pos_weight=change_pos_weight,
                     optimizer=None,
                     total_steps=total_steps,
                     global_step=global_step,
@@ -1440,9 +1694,10 @@ def train(cfg: Optional[TrainConfig] = None) -> None:
         score = float(val_metrics["macro_f1"])
         validation_bce = float(val_metrics["bce_loss"])
         validation_vision_bce = float(val_metrics["vision_bce_loss"])
-        is_best = validation_vision_bce < best_validation_bce
+        validation_change_bce = float(val_metrics["change_bce_loss"])
+        is_best = validation_change_bce < best_validation_bce
         if is_best:
-            best_validation_bce = validation_vision_bce
+            best_validation_bce = validation_change_bce
         closed_loop_summary = ""
         if closed_loop_val_metrics is not None:
             closed_loop_summary = (
@@ -1452,31 +1707,37 @@ def train(cfg: Optional[TrainConfig] = None) -> None:
         print(
             f"Epoch {epoch + 1}/{cfg.num_epochs}: "
             f"train_loss={float(train_metrics['loss']):.4f} "
+            f"train_change_bce={float(train_metrics['change_bce_loss']):.4f} "
             f"train_trans_bce={float(train_metrics['transition_bce_loss']):.4f} "
             f"train_steady_bce={float(train_metrics['steady_bce_loss']):.4f} "
             f"train_conflict={float(train_metrics['conflict_penalty']):.4f} "
             f"train_f1={float(train_metrics['macro_f1']):.4f} "
             f"train_vision_f1={float(train_metrics['vision_macro_f1']):.4f} "
+            f"train_change_f1={float(train_metrics['change_macro_f1']):.4f} "
             f"train_residual_drop={float(train_metrics['action_token_dropout_rate']):.3f} "
             f"train_closed_loop={int(train_metrics['autoregressive_batches'])} "
             f"val_loss={float(val_metrics['loss']):.4f} "
+            f"val_change_bce={float(val_metrics['change_bce_loss']):.4f} "
             f"val_trans_bce={float(val_metrics['transition_bce_loss']):.4f} "
             f"val_steady_bce={float(val_metrics['steady_bce_loss']):.4f} "
             f"val_conflict={float(val_metrics['conflict_penalty']):.4f} "
             f"val_f1={score:.4f} "
             f"val_bce={validation_bce:.4f} "
             f"val_vision_bce={validation_vision_bce:.4f} "
-            f"val_vision_f1={float(val_metrics['vision_macro_f1']):.4f}"
+            f"val_vision_f1={float(val_metrics['vision_macro_f1']):.4f} "
+            f"val_change_f1={float(val_metrics['change_macro_f1']):.4f}"
             f"{closed_loop_summary}"
         )
         print(
-            f"Validation best_vision_bce={best_validation_bce:.4f} "
+            f"Validation best_change_bce={best_validation_bce:.4f} "
+            f"current_change_bce={validation_change_bce:.4f} "
             f"current_vision_bce={validation_vision_bce:.4f} "
             f"calibrated_macro_f1={score:.4f} "
             f"new_best={is_best}"
         )
         print_metric_rows("Validation controls:", val_metrics["rows"])
         print_metric_rows("Validation vision-only controls:", val_metrics["vision_rows"])
+        print_metric_rows("Validation visual changes:", val_metrics["change_rows"])
         if closed_loop_val_metrics is not None:
             print(
                 f"Closed-loop validation: "
@@ -1492,6 +1753,9 @@ def train(cfg: Optional[TrainConfig] = None) -> None:
         vision_fitted = val_metrics.get("vision_fitted_thresholds")
         if isinstance(vision_fitted, tuple) and len(vision_fitted) == cfg.num_bin:
             print("Vision validation thresholds:", dict(zip(cfg.key_names, vision_fitted)))
+        change_fitted = val_metrics.get("change_fitted_thresholds")
+        if isinstance(change_fitted, tuple) and len(change_fitted) == cfg.num_bin:
+            print("Change validation thresholds:", dict(zip(cfg.key_names, change_fitted)))
         if closed_loop_val_metrics is not None:
             print(
                 "Autoregressive feedback thresholds:",
@@ -1558,14 +1822,21 @@ def parse_args() -> TrainConfig:
     add("--pos-weight-power", type=float, default=None)
     add("--pos-weight-clamp", type=float, default=None)
     add(
+        "--change-loss-weight",
         "--transition-loss-weight",
+        dest="change_loss_weight",
         type=float,
         default=None,
-        help="Relative per-element weight for target action changes. Normalized in BCE; capped at 64.",
+        help="Scale for the separate action-change auxiliary BCE. Legacy --transition-loss-weight alias.",
     )
+    add("--change-pos-weight-power", type=float, default=None)
+    add("--change-pos-weight-clamp", type=float, default=None)
     add("--main-policy-loss-weight", type=float, default=None)
     add("--conflict-penalty-weight", type=float, default=None)
     add("--vision-aux-loss-weight", type=float, default=None)
+    add("--transition-oversample-extra-copies", type=int, default=None)
+    add("--transition-oversample-max-action-rate", type=float, default=None)
+    add("--transition-oversample-min-changes", type=int, default=None)
     add(
         "--action-token-dropout-prob",
         type=float,

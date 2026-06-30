@@ -312,6 +312,15 @@ def compute_pos_weight(
     return torch.from_numpy(weights.astype(np.float32))
 
 
+def compute_pos_weight_from_flat(values: np.ndarray, power: float, clamp: float) -> torch.Tensor:
+    values = values.reshape(-1, values.shape[-1]).astype(np.float64)
+    pos = values.sum(axis=0)
+    neg = np.maximum(float(values.shape[0]) - pos, 0.0)
+    weights = np.power(neg / np.maximum(pos, 1.0), float(power))
+    weights = np.clip(weights, 1.0, float(clamp))
+    return torch.from_numpy(weights.astype(np.float32))
+
+
 def resolve_thresholds(cfg: ModelConfig, threshold: Optional[float]) -> np.ndarray:
     if threshold is not None:
         return np.full((int(cfg.num_bin),), float(threshold), dtype=np.float32)
@@ -355,7 +364,7 @@ def infer_run(
     thresholds: np.ndarray,
     use_autocast: bool,
     inference_dtype: torch.dtype,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError(f"Failed to open video: {video_path}")
@@ -368,6 +377,7 @@ def infer_run(
     threshold_tensor = torch.tensor(thresholds, device=device, dtype=torch.float32).view(1, -1)
 
     logits: List[np.ndarray] = []
+    change_logits: List[np.ndarray] = []
     source_indices: List[int] = []
     state = TemporalState()
     prev_action = torch.zeros((1, int(cfg.num_bin)), device=device, dtype=inference_dtype)
@@ -392,9 +402,15 @@ def infer_run(
                     with torch.amp.autocast(device_type=device.type, dtype=inference_dtype, enabled=use_autocast and device.type == "cuda"):
                         output, state = model.forward_step(frame, state, prev_action=prev_action)
                     current_logits = output.button_logits.detach().float()
+                    current_change_logits = (
+                        output.change_logits.detach().float()
+                        if output.change_logits is not None
+                        else torch.zeros_like(current_logits)
+                    )
                     predicted = (torch.sigmoid(current_logits) >= threshold_tensor).to(dtype=inference_dtype)
                     prev_action = predicted.detach()
                 logits.append(current_logits[0].cpu().numpy().astype(np.float32))
+                change_logits.append(current_change_logits[0].cpu().numpy().astype(np.float32))
                 source_indices.append(source_idx)
             source_idx += 1
             pbar.update(1)
@@ -403,8 +419,13 @@ def infer_run(
         cap.release()
 
     if not logits:
-        return np.zeros((0, int(cfg.num_bin)), dtype=np.float32), np.zeros((0,), dtype=np.int64)
-    return np.stack(logits, axis=0), np.asarray(source_indices, dtype=np.int64)
+        empty_logits = np.zeros((0, int(cfg.num_bin)), dtype=np.float32)
+        return empty_logits, empty_logits, np.zeros((0,), dtype=np.int64)
+    return (
+        np.stack(logits, axis=0),
+        np.stack(change_logits, axis=0),
+        np.asarray(source_indices, dtype=np.int64),
+    )
 
 
 def infer_pairs(
@@ -423,7 +444,7 @@ def infer_pairs(
 ) -> Dict[str, Dict[str, np.ndarray]]:
     results: Dict[str, Dict[str, np.ndarray]] = {}
     for video_path, csv_path in pairs:
-        logits, source_indices = infer_run(
+        logits, change_logits, source_indices = infer_run(
             video_path,
             model,
             cfg,
@@ -439,6 +460,7 @@ def infer_pairs(
         buttons = load_buttons(csv_path, cfg)
         results[video_path] = {
             "logits": logits,
+            "change_logits": change_logits,
             "source_indices": source_indices,
             "buttons": buttons,
         }
@@ -448,20 +470,24 @@ def infer_pairs(
 def flatten_results(
     results: Dict[str, Dict[str, np.ndarray]],
     target_offset: int,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     all_logits: List[np.ndarray] = []
+    all_change_logits: List[np.ndarray] = []
     all_labels: List[np.ndarray] = []
     all_transitions: List[np.ndarray] = []
     all_valid: List[np.ndarray] = []
     for item in results.values():
         logits = item["logits"]
+        change_logits = item["change_logits"]
         labels, transitions, valid = make_targets(item["buttons"], item["source_indices"], target_offset)
         all_logits.append(logits)
+        all_change_logits.append(change_logits)
         all_labels.append(labels)
         all_transitions.append(transitions)
         all_valid.append(valid)
     return (
         np.concatenate(all_logits, axis=0),
+        np.concatenate(all_change_logits, axis=0),
         np.concatenate(all_labels, axis=0),
         np.concatenate(all_transitions, axis=0),
         np.concatenate(all_valid, axis=0),
@@ -481,7 +507,7 @@ def conflict_loss_np(logits: np.ndarray, valid: np.ndarray, names: Sequence[str]
             losses.append(probs[:, first_idx] * probs[:, second_idx])
     if not losses:
         return 0.0
-    return float(np.stack(losses, axis=-1).sum(axis=-1).mean())
+    return float(np.stack(losses, axis=-1).mean())
 
 
 def binary_metrics(
@@ -512,12 +538,15 @@ def binary_metrics(
 
 def loss_breakdown(
     logits: np.ndarray,
+    change_logits: np.ndarray,
     labels: np.ndarray,
     transitions: np.ndarray,
     valid: np.ndarray,
     pos_weight: torch.Tensor,
+    change_pos_weight: torch.Tensor,
     *,
-    transition_weight: float,
+    change_weight: float,
+    main_policy_weight: float,
     conflict_weight: float,
     names: Sequence[str],
 ) -> Tuple[Dict[str, float], List[Dict[str, float | str]]]:
@@ -525,6 +554,7 @@ def loss_breakdown(
         raise RuntimeError("No valid aligned predictions were available for loss breakdown.")
 
     logits_t = torch.from_numpy(logits[valid]).float()
+    change_logits_t = torch.from_numpy(change_logits[valid]).float()
     labels_t = torch.from_numpy(labels[valid]).float()
     transitions_t = torch.from_numpy(transitions[valid]).float()
 
@@ -535,21 +565,29 @@ def loss_breakdown(
         pos_weight=pos_weight.float().view(1, -1),
         reduction="none",
     )
-    transition_weights = 1.0 + (float(transition_weight) - 1.0) * transitions_t
-    transition_bce = weighted_bce * transition_weights
+    change_bce = F.binary_cross_entropy_with_logits(
+        change_logits_t,
+        transitions_t,
+        pos_weight=change_pos_weight.float().view(1, -1),
+        reduction="none",
+    )
 
     normal_mask = transitions_t <= 0.5
     transition_mask = transitions_t > 0.5
     conflict = conflict_loss_np(logits, valid, names)
+    state_bce = float(weighted_bce.mean().item())
+    change_bce_loss = float(change_bce.mean().item())
     summary = {
         "plain_bce": float(plain_bce.mean().item()),
-        "class_weighted_bce": float(weighted_bce.mean().item()),
-        "transition_weighted_bce": float(transition_bce.sum().item() / transition_weights.sum().clamp(min=1.0).item()),
-        "normal_frame_weighted_bce": float(weighted_bce[normal_mask].mean().item()) if bool(normal_mask.any()) else 0.0,
-        "transition_frame_weighted_bce": float(weighted_bce[transition_mask].mean().item()) if bool(transition_mask.any()) else 0.0,
+        "state_bce": state_bce,
+        "change_bce": change_bce_loss,
+        "change_weighted": float(change_weight) * change_bce_loss,
+        "steady_state_bce": float(weighted_bce[normal_mask].mean().item()) if bool(normal_mask.any()) else 0.0,
+        "transition_state_bce": float(weighted_bce[transition_mask].mean().item()) if bool(transition_mask.any()) else 0.0,
         "conflict_loss": conflict,
         "conflict_weighted": float(conflict_weight) * conflict,
-        "total_like_train": float(transition_bce.sum().item() / transition_weights.sum().clamp(min=1.0).item())
+        "policy_total_like_train": float(main_policy_weight) * state_bce
+        + float(change_weight) * change_bce_loss
         + float(conflict_weight) * conflict,
     }
 
@@ -557,22 +595,22 @@ def loss_breakdown(
     for idx, name in enumerate(names):
         key_transition = transitions_t[:, idx] > 0.5
         key_normal = ~key_transition
-        denom = transition_weights[:, idx].sum().clamp(min=1.0)
         rows.append(
             {
                 "name": str(name),
                 "plain_bce": float(plain_bce[:, idx].mean().item()),
-                "class_weighted_bce": float(weighted_bce[:, idx].mean().item()),
-                "transition_weighted_bce": float(transition_bce[:, idx].sum().item() / denom.item()),
-                "normal_frame_weighted_bce": (
+                "state_bce": float(weighted_bce[:, idx].mean().item()),
+                "change_bce": float(change_bce[:, idx].mean().item()),
+                "steady_state_bce": (
                     float(weighted_bce[key_normal, idx].mean().item()) if bool(key_normal.any()) else 0.0
                 ),
-                "transition_frame_weighted_bce": (
+                "transition_state_bce": (
                     float(weighted_bce[key_transition, idx].mean().item()) if bool(key_transition.any()) else 0.0
                 ),
                 "transition_rate": float(transitions_t[:, idx].mean().item()),
                 "active_rate": float(labels[valid, idx].mean()),
                 "pos_weight": float(pos_weight[idx].item()),
+                "change_pos_weight": float(change_pos_weight[idx].item()),
             }
         )
     return summary, rows
@@ -598,10 +636,10 @@ def plot_loss_breakdown(
     os.makedirs(out_dir, exist_ok=True)
     summary_keys = [
         "plain_bce",
-        "class_weighted_bce",
-        "transition_weighted_bce",
+        "state_bce",
+        "change_weighted",
         "conflict_weighted",
-        "total_like_train",
+        "policy_total_like_train",
     ]
     if plt is None:
         image = np.full((820, 1600, 3), 255, dtype=np.uint8)
@@ -613,8 +651,8 @@ def plot_loss_breakdown(
             "Loss Breakdown",
         )
         names = [str(row["name"]) for row in per_key]
-        normal = [float(row["normal_frame_weighted_bce"]) for row in per_key]
-        transition = [float(row["transition_frame_weighted_bce"]) for row in per_key]
+        normal = [float(row["steady_state_bce"]) for row in per_key]
+        transition = [float(row["transition_state_bce"]) for row in per_key]
         _cv_bar_chart(
             image,
             (835, 70, 350, 680),
@@ -643,10 +681,10 @@ def plot_loss_breakdown(
     names = [str(row["name"]) for row in per_key]
     x = np.arange(len(names))
     width = 0.38
-    axes[1].bar(x - width / 2, [float(row["normal_frame_weighted_bce"]) for row in per_key], width, label="normal")
-    axes[1].bar(x + width / 2, [float(row["transition_frame_weighted_bce"]) for row in per_key], width, label="transition")
+    axes[1].bar(x - width / 2, [float(row["steady_state_bce"]) for row in per_key], width, label="steady")
+    axes[1].bar(x + width / 2, [float(row["transition_state_bce"]) for row in per_key], width, label="transition")
     axes[1].set_xticks(x, names)
-    axes[1].set_title("Per-Key Weighted BCE")
+    axes[1].set_title("Per-Key State BCE")
     axes[1].legend()
     fig.tight_layout()
     fig.savefig(os.path.join(out_dir, "loss_breakdown.png"), dpi=160)
@@ -836,21 +874,31 @@ def run_loss_viewer(args, model, cfg, raw_config, pairs, device, thresholds, dty
         inference_dtype=dtype,
     )
     target_offset = int(tuple(cfg.prediction_horizon_offsets)[0]) + int(args.action_label_offset)
-    logits, labels, transitions, valid = flatten_results(results, target_offset)
+    logits, change_logits, labels, transitions, valid = flatten_results(results, target_offset)
     pos_weight = compute_pos_weight(
         [item["buttons"] for item in results.values()],
-        float(raw_config.get("pos_weight_power", 0.65)),
-        float(raw_config.get("pos_weight_clamp", 25.0)),
+        float(raw_config.get("pos_weight_power", 0.5)),
+        float(raw_config.get("pos_weight_clamp", 8.0)),
+    )
+    change_pos_weight = compute_pos_weight_from_flat(
+        transitions[valid],
+        float(raw_config.get("change_pos_weight_power", 1.0)),
+        float(raw_config.get("change_pos_weight_clamp", 16.0)),
     )
     names = list(cfg.key_names) + list(cfg.mouse_button_names)
     summary, per_key = loss_breakdown(
         logits,
+        change_logits,
         labels,
         transitions,
         valid,
         pos_weight,
-        transition_weight=float(raw_config.get("transition_loss_weight", 4.0)),
-        conflict_weight=float(raw_config.get("conflicting_button_loss_weight", 0.20)),
+        change_pos_weight,
+        change_weight=float(raw_config.get("change_loss_weight", 1.0)),
+        main_policy_weight=float(raw_config.get("main_policy_loss_weight", 1.0)),
+        conflict_weight=float(
+            raw_config.get("conflict_penalty_weight", raw_config.get("conflicting_button_loss_weight", 0.20))
+        ),
         names=names,
     )
     out_dir = os.path.join(args.out_dir, "loss_breakdown")
@@ -884,7 +932,7 @@ def run_logit_tracker(args, cfg, pairs, device, thresholds, dtype, use_autocast,
             inference_dtype=dtype,
         )
         target_offset = int(tuple(checkpoint_cfg.prediction_horizon_offsets)[0]) + int(args.action_label_offset)
-        logits, _, _, valid = flatten_results(results, target_offset)
+        logits, _change_logits, _labels, _transitions, valid = flatten_results(results, target_offset)
         logits = logits[valid]
         checkpoint_row, rows = logit_distribution_rows(label, logits, names)
         checkpoint_rows.append(checkpoint_row)
@@ -904,7 +952,7 @@ def run_state_ablation(args, model, cfg, pairs, device, thresholds, dtype, use_a
     mode_results: Dict[str, Dict[str, np.ndarray]] = {}
     target_offset = int(tuple(cfg.prediction_horizon_offsets)[0]) + int(args.action_label_offset)
     for mode in modes:
-        logits, source_indices = infer_run(
+        logits, _change_logits, source_indices = infer_run(
             video_path,
             model,
             cfg,

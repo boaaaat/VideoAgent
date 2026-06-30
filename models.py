@@ -36,7 +36,7 @@ NUM_VISUAL_TOKENS = TOKEN_GRID_SIZE * TOKEN_GRID_SIZE
 TOKENS_PER_STEP = NUM_VISUAL_TOKENS
 TEMPORAL_HEADS = 8
 TEMPORAL_LAYERS = 6
-ARCHITECTURE_VERSION = "cnn_grid_causal_transformer_v8_ctx40_256_fusion128_vision_offset1"
+ARCHITECTURE_VERSION = "cnn_grid_causal_transformer_v10_ctx40_256_fusion128_vision_change_head"
 
 
 def _as_int(name: str, value: object, minimum: int) -> int:
@@ -205,6 +205,8 @@ class PolicyOutput:
     sequence_button_logits: Optional[torch.Tensor] = None
     vision_button_logits: Optional[torch.Tensor] = None
     sequence_vision_button_logits: Optional[torch.Tensor] = None
+    change_logits: Optional[torch.Tensor] = None
+    sequence_change_logits: Optional[torch.Tensor] = None
     next_feedback_action: Optional[torch.Tensor] = None
 
 
@@ -463,6 +465,12 @@ class GreenvilleBCFormer(nn.Module):
             nn.GELU(),
             nn.Linear(d_model, len(DEFAULT_ACTION_NAMES)),
         )
+        self.change_head = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, len(DEFAULT_ACTION_NAMES)),
+        )
         self.action_residual_mlp = nn.Sequential(
             nn.Linear(len(DEFAULT_ACTION_NAMES), 64),
             nn.GELU(),
@@ -552,18 +560,31 @@ class GreenvilleBCFormer(nn.Module):
         visual_tokens: torch.Tensor,
         prev_actions: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        vision_logits = self.vision_head(self.action_states_from_visual(visual_tokens))
+        logits, vision_logits, _change_logits = self.logits_vision_change_from_visual(visual_tokens, prev_actions)
+        return logits, vision_logits
+
+    def logits_vision_change_from_visual(
+        self,
+        visual_tokens: torch.Tensor,
+        prev_actions: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        action_states = self.action_states_from_visual(visual_tokens)
+        vision_logits = self.vision_head(action_states)
+        change_logits = self.change_head(action_states)
         if not self.last_action_conditioning:
-            return vision_logits, vision_logits
+            return vision_logits, vision_logits, change_logits
         expected_actions = (visual_tokens.size(0), visual_tokens.size(1), len(DEFAULT_ACTION_NAMES))
         if tuple(prev_actions.shape) != expected_actions:
             raise ValueError(f"Expected feedback actions {expected_actions}, got {tuple(prev_actions.shape)}.")
         logits = vision_logits + self.action_residual(prev_actions, dtype=vision_logits.dtype)
-        return logits, vision_logits
+        return logits, vision_logits, change_logits
 
     def vision_logits_from_visual(self, visual_tokens: torch.Tensor, prev_actions: Optional[torch.Tensor] = None) -> torch.Tensor:
         del prev_actions
         return self.vision_head(self.action_states_from_visual(visual_tokens))
+
+    def change_logits_from_visual(self, visual_tokens: torch.Tensor) -> torch.Tensor:
+        return self.change_head(self.action_states_from_visual(visual_tokens))
 
     def forward(self, frames: torch.Tensor, prev_actions: torch.Tensor) -> torch.Tensor:
         visual_tokens = self.encode_visual_tokens(frames)
@@ -824,9 +845,9 @@ class DrivingVideoPolicy(nn.Module):
         actions: torch.Tensor,
         *,
         current_steps: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        logits, vision_logits = self.policy.logits_and_vision_from_visual(visual_tokens, actions)
-        return logits[:, -current_steps:], vision_logits[:, -current_steps:]
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        logits, vision_logits, change_logits = self.policy.logits_vision_change_from_visual(visual_tokens, actions)
+        return logits[:, -current_steps:], vision_logits[:, -current_steps:], change_logits[:, -current_steps:]
 
     def _autoregressive_logits(
         self,
@@ -889,9 +910,13 @@ class DrivingVideoPolicy(nn.Module):
         )
         visual_tokens = torch.cat([prefix_visual, current_visual], dim=1)
         actions = torch.cat([prefix_actions, action], dim=1)
-        logits, sequence_vision_logits = self.policy.logits_and_vision_from_visual(visual_tokens, actions)
+        logits, sequence_vision_logits, sequence_change_logits = self.policy.logits_vision_change_from_visual(
+            visual_tokens,
+            actions,
+        )
         logits = logits[:, -1]
         vision_logits = sequence_vision_logits[:, -1]
+        change_logits = sequence_change_logits[:, -1]
         next_state = TemporalState(
             prev_actions=actions[:, -self.context_len :].detach(),
             visual_tokens=visual_tokens[:, -self.context_len :].detach(),
@@ -899,6 +924,7 @@ class DrivingVideoPolicy(nn.Module):
         output = PolicyOutput(
             button_logits=logits,
             vision_button_logits=vision_logits,
+            change_logits=change_logits,
         )
         return output, next_state
 
@@ -956,6 +982,7 @@ class DrivingVideoPolicy(nn.Module):
             )
             all_actions = torch.cat([prefix_actions, current_actions], dim=1)
             vision_logits = self.policy.vision_logits_from_visual(visual_tokens)[:, -steps:]
+            change_logits = self.policy.change_logits_from_visual(visual_tokens)[:, -steps:]
         else:
             current_actions = self._sequence_prev_actions(
                 prev_action,
@@ -965,7 +992,7 @@ class DrivingVideoPolicy(nn.Module):
                 dtype=frames.dtype,
             )
             all_actions = torch.cat([prefix_actions, current_actions], dim=1)
-            logits, vision_logits = self._logits_with_zero_action_aux(
+            logits, vision_logits, change_logits = self._logits_with_zero_action_aux(
                 visual_tokens,
                 all_actions,
                 current_steps=steps,
@@ -981,6 +1008,8 @@ class DrivingVideoPolicy(nn.Module):
             sequence_button_logits=logits if return_sequence_logits else None,
             vision_button_logits=vision_logits[:, -1],
             sequence_vision_button_logits=vision_logits if return_sequence_logits else None,
+            change_logits=change_logits[:, -1],
+            sequence_change_logits=change_logits if return_sequence_logits else None,
             next_feedback_action=next_feedback_action,
         )
         return (output, next_state) if return_aux else output

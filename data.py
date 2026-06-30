@@ -18,10 +18,45 @@ from ctypes import wintypes
 
 from action_space import game_data_root, get_key_names, get_mouse_button_names, selected_game
 
-TIMER_RESOLUTION_MS = 1
-WHEEL_DELTA = 120
+
+# ==========================================
+# USER SETTINGS
+# ==========================================
+
+GAME_NAME = selected_game
+data_directory = game_data_root(GAME_NAME)
+
+track_rare_keys = True
+# Percent of historical frames an action can be active and still be tracked as rare.
+tracked_key_thresh = 5.0
+tracked_rare_keys = []
+rare_key_clip_seconds = 4.0
+# Keep an auto clip open this long after its current postbuffer without writing
+# extra frames. A later trigger whose prebuffer overlaps the clip can then extend
+# the same file instead of creating duplicate frames in a new file.
+rare_key_merge_overlap_seconds = rare_key_clip_seconds
+
+DATA_COLLECTION_CONTROLS = {
+    "start": "1",
+    "stop": "2",
+}
+
+COLLECT_FPS = 20
+frame_size = (512, 512)
+
 DRAW_CURSOR_OVERLAY = False
 LOG_FFMPEG_STDERR = False
+FFMPEG_PATH = None # Set this if ffmpeg isn't in system PATH
+
+DATASET_SPLIT_DIR_NAMES = ("train", "val")
+
+
+# ==========================================
+# RUNTIME CONSTANTS
+# ==========================================
+
+TIMER_RESOLUTION_MS = 1
+WHEEL_DELTA = 120
 timer_resolution_enabled = False
 
 
@@ -187,12 +222,6 @@ class RawInputReader:
             self.scroll_down = 0
         return dx, dy, scroll_up, scroll_down
 
-# ==========================================
-# MAIN SCRIPT
-# ==========================================
-
-GAME_NAME = selected_game
-
 key_states = {key_name: 0 for key_name in get_key_names(GAME_NAME)}
 KEY_TO_VK = {
     "Key.shift": win32con.VK_SHIFT,
@@ -224,10 +253,6 @@ MOUSE_BUTTON_TO_VK = {
     if button_name in ALL_MOUSE_BUTTON_TO_VK
 }
 VK_OEM_4 = getattr(win32con, "VK_OEM_4", 0xDB)
-DATA_COLLECTION_CONTROLS = {
-    "start": "1",
-    "stop": "2",
-}
 START_COLLECTION_VKS = (ord(DATA_COLLECTION_CONTROLS["start"]), getattr(win32con, "VK_NUMPAD1", 0x61))
 STOP_COLLECTION_VKS = (ord(DATA_COLLECTION_CONTROLS["stop"]), getattr(win32con, "VK_NUMPAD2", 0x62))
 HOTKEY_VKS = {
@@ -237,13 +262,6 @@ HOTKEY_VKS = {
 }
 hotkey_prev_down = {name: False for name in HOTKEY_VKS}
 
-track_rare_keys = False
-# Percent of historical frames an action can be active and still be tracked as rare.
-tracked_key_thresh = 5.0
-tracked_rare_keys = []
-rare_key_clip_seconds = 4.0
-
-data_directory = game_data_root(GAME_NAME)
 cam = None
 
 collecting_data = False
@@ -263,16 +281,15 @@ active_recording_reason = None
 clip_start_reference_time = None
 clip_last_written_source_time = None
 auto_clip_end_time = None
+auto_clip_close_time = None
 capture_history = deque()
 previous_input_state = None
 tracked_window_hwnd = None
 tracked_window_title = None
 rare_tracking_was_focused = None
-COLLECT_FPS = 20
 
 fps = COLLECT_FPS
 target_frame_time = 1 / fps
-frame_size = (512, 512)
 
 size = (1, 1)
 scale = (1.0, 1.0)
@@ -348,7 +365,6 @@ class FFmpegWriter:
                 print(f"FFmpeg failed with exit code {return_code}; leaving temp video: {self.out_file}")
 
 ffmpeg_writer = None
-FFMPEG_PATH = None # Set this if ffmpeg isn't in system PATH
 
 
 def csv_value_is_active(value):
@@ -362,14 +378,45 @@ def available_capture_key_names():
     return list(key_states.keys()) + list(configured_mouse_buttons)
 
 
-def iter_existing_data_csv_paths():
+def iter_existing_data_csv_dirs():
     if not os.path.isdir(data_directory):
         return []
-    return [
-        os.path.join(data_directory, filename)
-        for filename in sorted(os.listdir(data_directory))
-        if filename.startswith("run_") and filename.lower().endswith(".csv")
-    ]
+
+    csv_dirs = [data_directory]
+    for split_name in DATASET_SPLIT_DIR_NAMES:
+        split_dir = os.path.join(data_directory, split_name)
+        if os.path.isdir(split_dir):
+            csv_dirs.append(split_dir)
+    return csv_dirs
+
+
+def iter_existing_data_csv_paths():
+    csv_paths = []
+    seen_paths = set()
+
+    for csv_dir in iter_existing_data_csv_dirs():
+        try:
+            filenames = sorted(os.listdir(csv_dir))
+        except OSError as exc:
+            print(f"Warning: failed to list {csv_dir}: {exc}")
+            continue
+
+        for filename in filenames:
+            if not filename.startswith("run_") or not filename.lower().endswith(".csv"):
+                continue
+
+            csv_path = os.path.join(csv_dir, filename)
+            if not os.path.isfile(csv_path):
+                continue
+
+            path_key = os.path.normcase(os.path.realpath(csv_path))
+            if path_key in seen_paths:
+                continue
+
+            seen_paths.add(path_key)
+            csv_paths.append(csv_path)
+
+    return csv_paths
 
 
 def compute_tracked_rare_keys_from_history():
@@ -515,7 +562,9 @@ def initialize_capture_runtime():
         if tracked_rare_keys:
             print(
                 "Rare-key tracking enabled.",
-                f"Capturing +/- {rare_key_clip_seconds:.1f}s around transitions for: {tracked_rare_keys}",
+                f"pre/post={configured_rare_key_clip_seconds():.1f}s",
+                f"merge_overlap={configured_rare_key_merge_overlap_seconds():.1f}s",
+                f"keys={tracked_rare_keys}",
             )
         else:
             track_rare_keys = False
@@ -531,6 +580,7 @@ def stop_recording():
     global collecting_data, csv_file, csv_writer, start_time, ffmpeg_writer
     global last_frame_time, next_frame_deadline, active_recording_base, active_recording_reason
     global clip_start_reference_time, clip_last_written_source_time, auto_clip_end_time
+    global auto_clip_close_time
 
     with recording_lock:
         was_collecting = collecting_data or ffmpeg_writer is not None or csv_file is not None
@@ -550,6 +600,7 @@ def stop_recording():
         clip_start_reference_time = None
         clip_last_written_source_time = None
         auto_clip_end_time = None
+        auto_clip_close_time = None
 
     if csv_handle:
         csv_handle.close()
@@ -613,8 +664,26 @@ def tracked_rare_key_set():
     return set(tracked_rare_keys)
 
 
+def configured_rare_key_clip_seconds():
+    try:
+        return max(0.0, float(rare_key_clip_seconds))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def configured_rare_key_merge_overlap_seconds():
+    try:
+        return max(0.0, float(rare_key_merge_overlap_seconds))
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def trim_capture_history(now):
-    cutoff = now - max(float(rare_key_clip_seconds), 0.0) - target_frame_time
+    history_seconds = max(
+        configured_rare_key_clip_seconds(),
+        configured_rare_key_merge_overlap_seconds(),
+    )
+    cutoff = now - history_seconds - target_frame_time
     while capture_history and capture_history[0]["time"] < cutoff:
         capture_history.popleft()
 
@@ -675,6 +744,34 @@ def append_frame_to_active_clip(frame_entry):
         csv_writer.writerow(frame_entry_to_csv_row(frame_entry, frame_dt))
         clip_last_written_source_time = frame_time
         return True
+
+
+def active_clip_content_end_time():
+    with recording_lock:
+        return auto_clip_end_time
+
+
+def frame_is_inside_active_clip_content(frame_entry):
+    content_end_time = active_clip_content_end_time()
+    if content_end_time is None:
+        return True
+
+    frame_time = float(frame_entry["time"])
+    return frame_time <= float(content_end_time) + (target_frame_time * 0.5)
+
+
+def append_capture_history_to_active_clip():
+    content_end_time = active_clip_content_end_time()
+    if content_end_time is None:
+        entries = list(capture_history)
+    else:
+        end_time = float(content_end_time) + (target_frame_time * 0.5)
+        entries = [entry for entry in capture_history if float(entry["time"]) <= end_time]
+
+    for frame_entry in entries:
+        if not append_frame_to_active_clip(frame_entry):
+            return False
+    return True
 
 def get_cursor_info():
     """Get cursor position, visibility, and icon handle"""
@@ -755,7 +852,7 @@ def start_recording(prebuffer_entries=None, clip_reason=None, reset_mouse_accumu
     global collecting_data, fps, target_frame_time, video_writer, csv_file, csv_writer
     global start_time, ffmpeg_writer, last_frame_time, next_frame_deadline
     global active_recording_base, active_recording_reason, clip_start_reference_time
-    global clip_last_written_source_time
+    global clip_last_written_source_time, auto_clip_end_time, auto_clip_close_time
 
     buffered_entries = list(prebuffer_entries or [])
     with recording_lock:
@@ -809,6 +906,8 @@ def start_recording(prebuffer_entries=None, clip_reason=None, reset_mouse_accumu
         active_recording_reason = clip_reason
         clip_start_reference_time = buffered_entries[0]["time"] if buffered_entries else None
         clip_last_written_source_time = None
+        auto_clip_end_time = None
+        auto_clip_close_time = None
         collecting_data = True
 
     print(f"Started: {video_filename_no_ext}.mp4, fps: {fps}")
@@ -825,10 +924,13 @@ def start_recording(prebuffer_entries=None, clip_reason=None, reset_mouse_accumu
 
 
 def handle_rare_key_trigger(trigger_time, transitions):
-    global auto_clip_end_time
+    global auto_clip_end_time, auto_clip_close_time
 
     transition_desc = ", ".join(f"{key_name}:{event_name}" for key_name, event_name in transitions)
-    new_clip_end_time = float(trigger_time) + float(rare_key_clip_seconds)
+    clip_seconds = configured_rare_key_clip_seconds()
+    merge_overlap_seconds = configured_rare_key_merge_overlap_seconds()
+    new_clip_end_time = float(trigger_time) + clip_seconds
+    new_clip_close_time = new_clip_end_time + merge_overlap_seconds
     was_collecting = False
     old_end_time = None
     with recording_lock:
@@ -836,7 +938,7 @@ def handle_rare_key_trigger(trigger_time, transitions):
         old_end_time = auto_clip_end_time
 
     if not was_collecting:
-        clip_start_time = float(trigger_time) - float(rare_key_clip_seconds)
+        clip_start_time = float(trigger_time) - clip_seconds
         buffered_entries = [entry for entry in capture_history if float(entry["time"]) >= clip_start_time]
         started = start_recording(
             prebuffer_entries=buffered_entries,
@@ -846,11 +948,13 @@ def handle_rare_key_trigger(trigger_time, transitions):
         if started:
             with recording_lock:
                 auto_clip_end_time = new_clip_end_time
+                auto_clip_close_time = new_clip_close_time
             print(
                 "Auto clip started:",
                 f"trigger={transition_desc}",
                 f"buffered_frames={len(buffered_entries)}",
-                f"until=+{rare_key_clip_seconds:.1f}s",
+                f"postbuffer=+{clip_seconds:.1f}s",
+                f"merge_overlap=+{merge_overlap_seconds:.1f}s",
             )
         return
 
@@ -860,6 +964,7 @@ def handle_rare_key_trigger(trigger_time, transitions):
         else:
             auto_clip_end_time = max(float(auto_clip_end_time), new_clip_end_time)
         updated_end_time = auto_clip_end_time
+        auto_clip_close_time = float(updated_end_time) + merge_overlap_seconds
 
     if old_end_time is None or float(updated_end_time) > float(old_end_time):
         extension_seconds = float(updated_end_time) - float(trigger_time)
@@ -908,7 +1013,7 @@ def main():
 
             with recording_lock:
                 is_collecting = collecting_data
-                active_auto_clip_end = auto_clip_end_time
+                active_auto_clip_close = auto_clip_close_time
 
             should_capture = bool(rare_tracking_focused or is_collecting)
 
@@ -943,9 +1048,11 @@ def main():
                     "raw_dy": int(raw_dy),
                 }
 
-                if rare_tracking_focused:
+                if track_rare_keys and (rare_tracking_focused or is_collecting):
                     capture_history.append(frame_entry)
                     trim_capture_history(frame_now)
+
+                if rare_tracking_focused:
                     transitions = detect_rare_key_transitions(previous_input_state, input_state)
                     if transitions:
                         handle_rare_key_trigger(frame_now, transitions)
@@ -954,15 +1061,27 @@ def main():
 
                 with recording_lock:
                     is_collecting = collecting_data
-                    active_auto_clip_end = auto_clip_end_time
+                    active_auto_clip_close = auto_clip_close_time
 
                 if is_collecting:
-                    if not append_frame_to_active_clip(frame_entry):
+                    if track_rare_keys:
+                        frame_written = append_capture_history_to_active_clip()
+                    elif frame_is_inside_active_clip_content(frame_entry):
+                        frame_written = append_frame_to_active_clip(frame_entry)
+                    else:
+                        frame_written = True
+
+                    if not frame_written:
                         stop_recording()
                         print("Stopped: FFmpeg pipe closed unexpectedly.")
                         continue
 
-                if track_rare_keys and is_collecting and active_auto_clip_end is not None and frame_now >= float(active_auto_clip_end):
+                if (
+                    track_rare_keys
+                    and is_collecting
+                    and active_auto_clip_close is not None
+                    and frame_now >= float(active_auto_clip_close)
+                ):
                     stop_info = stop_recording()
                     if stop_info["was_collecting"]:
                         print(f"Auto clip saved: {stop_info['base_path']}.mp4")
