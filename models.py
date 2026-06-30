@@ -36,7 +36,7 @@ NUM_VISUAL_TOKENS = TOKEN_GRID_SIZE * TOKEN_GRID_SIZE
 TOKENS_PER_STEP = NUM_VISUAL_TOKENS
 TEMPORAL_HEADS = 8
 TEMPORAL_LAYERS = 6
-ARCHITECTURE_VERSION = "cnn_grid_causal_transformer_v10_ctx40_256_fusion128_vision_change_head"
+ARCHITECTURE_VERSION = "cnn_grid_causal_transformer_v11_ctx40_256_fusion128_onset_offset_heads"
 
 
 def _as_int(name: str, value: object, minimum: int) -> int:
@@ -94,6 +94,10 @@ class ModelConfig:
 
     button_state_threshold: float = 0.5
     button_state_thresholds: Optional[Sequence[float]] = None
+    press_threshold: float = 0.5
+    press_thresholds: Optional[Sequence[float]] = None
+    release_threshold: float = 0.5
+    release_thresholds: Optional[Sequence[float]] = None
     architecture_version: str = ARCHITECTURE_VERSION
 
     # Compatibility fields retained for existing configs and checkpoint tools.
@@ -172,6 +176,32 @@ class ModelConfig:
                 _as_float(f"button_state_thresholds[{idx}]", threshold, 0.0, 1.0)
             self.button_state_thresholds = thresholds
 
+        self.press_threshold = _as_float("press_threshold", self.press_threshold, 0.0, 1.0)
+        if self.press_thresholds is None:
+            self.press_thresholds = tuple(float(self.press_threshold) for _ in range(self.num_bin))
+        else:
+            thresholds = tuple(float(item) for item in self.press_thresholds)
+            if len(thresholds) != self.num_bin:
+                raise ValueError(
+                    f"press_thresholds must contain {self.num_bin} values, got {len(thresholds)}."
+                )
+            for idx, threshold in enumerate(thresholds):
+                _as_float(f"press_thresholds[{idx}]", threshold, 0.0, 1.0)
+            self.press_thresholds = thresholds
+
+        self.release_threshold = _as_float("release_threshold", self.release_threshold, 0.0, 1.0)
+        if self.release_thresholds is None:
+            self.release_thresholds = tuple(float(self.release_threshold) for _ in range(self.num_bin))
+        else:
+            thresholds = tuple(float(item) for item in self.release_thresholds)
+            if len(thresholds) != self.num_bin:
+                raise ValueError(
+                    f"release_thresholds must contain {self.num_bin} values, got {len(thresholds)}."
+                )
+            for idx, threshold in enumerate(thresholds):
+                _as_float(f"release_thresholds[{idx}]", threshold, 0.0, 1.0)
+            self.release_thresholds = thresholds
+
         self.d_model = _as_int("d_model", self.d_model, 1)
         if self.d_model != READOUT_CHANNELS:
             raise ValueError(f"d_model must be {READOUT_CHANNELS}, got {self.d_model}.")
@@ -205,6 +235,10 @@ class PolicyOutput:
     sequence_button_logits: Optional[torch.Tensor] = None
     vision_button_logits: Optional[torch.Tensor] = None
     sequence_vision_button_logits: Optional[torch.Tensor] = None
+    onset_logits: Optional[torch.Tensor] = None
+    sequence_onset_logits: Optional[torch.Tensor] = None
+    offset_logits: Optional[torch.Tensor] = None
+    sequence_offset_logits: Optional[torch.Tensor] = None
     change_logits: Optional[torch.Tensor] = None
     sequence_change_logits: Optional[torch.Tensor] = None
     next_feedback_action: Optional[torch.Tensor] = None
@@ -465,7 +499,13 @@ class GreenvilleBCFormer(nn.Module):
             nn.GELU(),
             nn.Linear(d_model, len(DEFAULT_ACTION_NAMES)),
         )
-        self.change_head = nn.Sequential(
+        self.onset_head = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, len(DEFAULT_ACTION_NAMES)),
+        )
+        self.offset_head = nn.Sequential(
             nn.LayerNorm(d_model),
             nn.Linear(d_model, d_model),
             nn.GELU(),
@@ -560,31 +600,51 @@ class GreenvilleBCFormer(nn.Module):
         visual_tokens: torch.Tensor,
         prev_actions: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        logits, vision_logits, _change_logits = self.logits_vision_change_from_visual(visual_tokens, prev_actions)
+        logits, vision_logits, _onset_logits, _offset_logits = self.logits_vision_events_from_visual(
+            visual_tokens,
+            prev_actions,
+        )
         return logits, vision_logits
+
+    def logits_vision_events_from_visual(
+        self,
+        visual_tokens: torch.Tensor,
+        prev_actions: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        action_states = self.action_states_from_visual(visual_tokens)
+        vision_logits = self.vision_head(action_states)
+        onset_logits = self.onset_head(action_states)
+        offset_logits = self.offset_head(action_states)
+        if not self.last_action_conditioning:
+            return vision_logits, vision_logits, onset_logits, offset_logits
+        expected_actions = (visual_tokens.size(0), visual_tokens.size(1), len(DEFAULT_ACTION_NAMES))
+        if tuple(prev_actions.shape) != expected_actions:
+            raise ValueError(f"Expected feedback actions {expected_actions}, got {tuple(prev_actions.shape)}.")
+        logits = vision_logits + self.action_residual(prev_actions, dtype=vision_logits.dtype)
+        return logits, vision_logits, onset_logits, offset_logits
 
     def logits_vision_change_from_visual(
         self,
         visual_tokens: torch.Tensor,
         prev_actions: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        action_states = self.action_states_from_visual(visual_tokens)
-        vision_logits = self.vision_head(action_states)
-        change_logits = self.change_head(action_states)
-        if not self.last_action_conditioning:
-            return vision_logits, vision_logits, change_logits
-        expected_actions = (visual_tokens.size(0), visual_tokens.size(1), len(DEFAULT_ACTION_NAMES))
-        if tuple(prev_actions.shape) != expected_actions:
-            raise ValueError(f"Expected feedback actions {expected_actions}, got {tuple(prev_actions.shape)}.")
-        logits = vision_logits + self.action_residual(prev_actions, dtype=vision_logits.dtype)
-        return logits, vision_logits, change_logits
+        logits, vision_logits, onset_logits, offset_logits = self.logits_vision_events_from_visual(
+            visual_tokens,
+            prev_actions,
+        )
+        return logits, vision_logits, torch.maximum(onset_logits, offset_logits)
 
     def vision_logits_from_visual(self, visual_tokens: torch.Tensor, prev_actions: Optional[torch.Tensor] = None) -> torch.Tensor:
         del prev_actions
         return self.vision_head(self.action_states_from_visual(visual_tokens))
 
+    def onset_offset_logits_from_visual(self, visual_tokens: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        action_states = self.action_states_from_visual(visual_tokens)
+        return self.onset_head(action_states), self.offset_head(action_states)
+
     def change_logits_from_visual(self, visual_tokens: torch.Tensor) -> torch.Tensor:
-        return self.change_head(self.action_states_from_visual(visual_tokens))
+        onset_logits, offset_logits = self.onset_offset_logits_from_visual(visual_tokens)
+        return torch.maximum(onset_logits, offset_logits)
 
     def forward(self, frames: torch.Tensor, prev_actions: torch.Tensor) -> torch.Tensor:
         visual_tokens = self.encode_visual_tokens(frames)
@@ -845,9 +905,17 @@ class DrivingVideoPolicy(nn.Module):
         actions: torch.Tensor,
         *,
         current_steps: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        logits, vision_logits, change_logits = self.policy.logits_vision_change_from_visual(visual_tokens, actions)
-        return logits[:, -current_steps:], vision_logits[:, -current_steps:], change_logits[:, -current_steps:]
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        logits, vision_logits, onset_logits, offset_logits = self.policy.logits_vision_events_from_visual(
+            visual_tokens,
+            actions,
+        )
+        return (
+            logits[:, -current_steps:],
+            vision_logits[:, -current_steps:],
+            onset_logits[:, -current_steps:],
+            offset_logits[:, -current_steps:],
+        )
 
     def _autoregressive_logits(
         self,
@@ -910,13 +978,15 @@ class DrivingVideoPolicy(nn.Module):
         )
         visual_tokens = torch.cat([prefix_visual, current_visual], dim=1)
         actions = torch.cat([prefix_actions, action], dim=1)
-        logits, sequence_vision_logits, sequence_change_logits = self.policy.logits_vision_change_from_visual(
+        logits, sequence_vision_logits, sequence_onset_logits, sequence_offset_logits = self.policy.logits_vision_events_from_visual(
             visual_tokens,
             actions,
         )
         logits = logits[:, -1]
         vision_logits = sequence_vision_logits[:, -1]
-        change_logits = sequence_change_logits[:, -1]
+        onset_logits = sequence_onset_logits[:, -1]
+        offset_logits = sequence_offset_logits[:, -1]
+        change_logits = torch.maximum(onset_logits, offset_logits)
         next_state = TemporalState(
             prev_actions=actions[:, -self.context_len :].detach(),
             visual_tokens=visual_tokens[:, -self.context_len :].detach(),
@@ -924,6 +994,8 @@ class DrivingVideoPolicy(nn.Module):
         output = PolicyOutput(
             button_logits=logits,
             vision_button_logits=vision_logits,
+            onset_logits=onset_logits,
+            offset_logits=offset_logits,
             change_logits=change_logits,
         )
         return output, next_state
@@ -982,7 +1054,9 @@ class DrivingVideoPolicy(nn.Module):
             )
             all_actions = torch.cat([prefix_actions, current_actions], dim=1)
             vision_logits = self.policy.vision_logits_from_visual(visual_tokens)[:, -steps:]
-            change_logits = self.policy.change_logits_from_visual(visual_tokens)[:, -steps:]
+            onset_logits, offset_logits = self.policy.onset_offset_logits_from_visual(visual_tokens)
+            onset_logits = onset_logits[:, -steps:]
+            offset_logits = offset_logits[:, -steps:]
         else:
             current_actions = self._sequence_prev_actions(
                 prev_action,
@@ -992,11 +1066,12 @@ class DrivingVideoPolicy(nn.Module):
                 dtype=frames.dtype,
             )
             all_actions = torch.cat([prefix_actions, current_actions], dim=1)
-            logits, vision_logits, change_logits = self._logits_with_zero_action_aux(
+            logits, vision_logits, onset_logits, offset_logits = self._logits_with_zero_action_aux(
                 visual_tokens,
                 all_actions,
                 current_steps=steps,
             )
+        change_logits = torch.maximum(onset_logits, offset_logits)
 
         next_state = self._make_state(
             all_frames,
@@ -1008,6 +1083,10 @@ class DrivingVideoPolicy(nn.Module):
             sequence_button_logits=logits if return_sequence_logits else None,
             vision_button_logits=vision_logits[:, -1],
             sequence_vision_button_logits=vision_logits if return_sequence_logits else None,
+            onset_logits=onset_logits[:, -1],
+            sequence_onset_logits=onset_logits if return_sequence_logits else None,
+            offset_logits=offset_logits[:, -1],
+            sequence_offset_logits=offset_logits if return_sequence_logits else None,
             change_logits=change_logits[:, -1],
             sequence_change_logits=change_logits if return_sequence_logits else None,
             next_feedback_action=next_feedback_action,

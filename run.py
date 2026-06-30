@@ -1,5 +1,6 @@
 import csv
 import os
+import csv
 import sys
 import time
 import ctypes  # Added for high-res clock period adjustments
@@ -336,6 +337,24 @@ def _coerce_config_types(cfg: RuntimeConfig) -> RuntimeConfig:
             thresholds = tuple(float(cfg.button_state_threshold) for _ in range(cfg.num_bin))
         # FIX 2: Removed hardcoded (0.5, 0.5, 0.5, 0.3) line to support custom decision configurations
         cfg.button_state_thresholds = thresholds
+    cfg.press_threshold = float(np.clip(float(getattr(cfg, "press_threshold", 0.5)), 0.0, 1.0))
+    press_thresholds = getattr(cfg, "press_thresholds", None)
+    if press_thresholds is None:
+        cfg.press_thresholds = tuple(float(cfg.press_threshold) for _ in range(cfg.num_bin))
+    else:
+        thresholds = tuple(float(np.clip(float(x), 0.0, 1.0)) for x in press_thresholds)
+        if len(thresholds) != cfg.num_bin:
+            thresholds = tuple(float(cfg.press_threshold) for _ in range(cfg.num_bin))
+        cfg.press_thresholds = thresholds
+    cfg.release_threshold = float(np.clip(float(getattr(cfg, "release_threshold", 0.5)), 0.0, 1.0))
+    release_thresholds = getattr(cfg, "release_thresholds", None)
+    if release_thresholds is None:
+        cfg.release_thresholds = tuple(float(cfg.release_threshold) for _ in range(cfg.num_bin))
+    else:
+        thresholds = tuple(float(np.clip(float(x), 0.0, 1.0)) for x in release_thresholds)
+        if len(thresholds) != cfg.num_bin:
+            thresholds = tuple(float(cfg.release_threshold) for _ in range(cfg.num_bin))
+        cfg.release_thresholds = thresholds
     cfg.record_frame_size = max(1, int(getattr(cfg, "record_frame_size", 512)))
     return cfg
 
@@ -391,6 +410,10 @@ def _apply_checkpoint_config(cfg: RuntimeConfig, overrides: Dict) -> RuntimeConf
     threshold_keys = {
         "button_state_threshold",
         "button_state_thresholds",
+        "press_threshold",
+        "press_thresholds",
+        "release_threshold",
+        "release_thresholds",
         "button_threshold_from_pos_weight",
         "button_threshold_min",
         "button_threshold_max",
@@ -427,7 +450,7 @@ def _checkpoint_path(cfg: RuntimeConfig) -> str:
             raise FileNotFoundError(f"Checkpoint not found: {cfg.ckpt_path}")
         return cfg.ckpt_path
 
-    best_path = os.path.join(cfg.ckpt_dir, "model_latest.pt")
+    best_path = os.path.join(cfg.ckpt_dir, "model_best.pt")
     if os.path.exists(best_path):
         return best_path
     latest_path = os.path.join(cfg.ckpt_dir, "model_latest.pt")
@@ -457,7 +480,7 @@ def load_checkpoint(
         "Checkpoint:",
         f"epoch={state.get('epoch')}",
         f"step={state.get('global_step')}",
-        f"best_bce={state.get('best_validation_bce')}",
+        f"best_score={state.get('best_validation_score')}",
     )
     return cfg, model_state
 
@@ -601,11 +624,22 @@ def main() -> None:
         "input=masked_rgb" + ("+action_feedback_residual" if cfg.last_action_conditioning else ""),
     )
     print(
-        "Button thresholds:",
+        "State thresholds:",
         f"use_checkpoint={cfg.use_checkpoint_button_thresholds}",
         " ".join(
             f"{name}={threshold:.3f}"
             for name, threshold in zip(cfg.key_names + cfg.mouse_button_names, cfg.button_state_thresholds)
+        ),
+    )
+    print(
+        "Hysteresis thresholds:",
+        "press=" + " ".join(
+            f"{name}={threshold:.3f}"
+            for name, threshold in zip(cfg.key_names + cfg.mouse_button_names, cfg.press_thresholds)
+        ),
+        "release=" + " ".join(
+            f"{name}={threshold:.3f}"
+            for name, threshold in zip(cfg.key_names + cfg.mouse_button_names, cfg.release_thresholds)
         ),
     )
     print(
@@ -628,8 +662,13 @@ def main() -> None:
     model.eval()
     controller = ActionController(cfg)
 
-    thresholds = torch.tensor(
-        list(cfg.button_state_thresholds),
+    press_thresholds = torch.tensor(
+        list(cfg.press_thresholds),
+        device=device,
+        dtype=inference_dtype,
+    )
+    release_thresholds = torch.tensor(
+        list(cfg.release_thresholds),
         device=device,
         dtype=inference_dtype,
     )
@@ -689,15 +728,28 @@ def main() -> None:
                                 return_vision_aux=False,
                             )
                         button_logits = output.button_logits.float()
+                        if output.onset_logits is None or output.offset_logits is None:
+                            raise RuntimeError("Checkpoint did not produce onset/offset logits.")
+                        onset_logits = output.onset_logits.float()
+                        offset_logits = output.offset_logits.float()
                     button_probs = torch.sigmoid(button_logits[0])
-                    predicted_buttons = (button_probs >= thresholds).to(dtype=button_logits.dtype)
+                    onset_probs = torch.sigmoid(onset_logits[0])
+                    offset_probs = torch.sigmoid(offset_logits[0])
+                    current_buttons = merge_keyboard_feedback(prev_action, cfg)[0] >= 0.5
+                    next_buttons = current_buttons.clone()
+                    turn_on = (~current_buttons) & (onset_probs > press_thresholds)
+                    turn_off = current_buttons & (offset_probs > release_thresholds)
+                    next_buttons[turn_on] = True
+                    next_buttons[turn_off] = False
+                    predicted_buttons = next_buttons.to(dtype=button_logits.dtype)
 
                     applied_buttons = controller.apply(
                         predicted_buttons,
                         button_probs=button_probs,
                     )
+                    next_feedback_state = merge_keyboard_feedback(applied_buttons, cfg)
                     if cfg.prev_action_feedback:
-                        feedback_buttons = button_probs if cfg.prev_action_feedback_soft else applied_buttons
+                        feedback_buttons = button_probs if cfg.prev_action_feedback_soft else next_feedback_state
                         feedback_buttons = merge_keyboard_feedback(feedback_buttons, cfg)
                         prev_action = feedback_buttons.detach().reshape(1, cfg.num_bin).to(
                             device=device,
@@ -706,7 +758,10 @@ def main() -> None:
                         if cfg.prev_action_feedback_soft and not cfg.mouse_buttons_enabled:
                             prev_action[:, len(cfg.key_names) :] = 0.0
                     else:
-                        prev_action.zero_()
+                        prev_action = next_feedback_state.detach().reshape(1, cfg.num_bin).to(
+                            device=device,
+                            dtype=inference_dtype,
+                        )
 
                 elapsed = time.perf_counter() - loop_start
                 remaining = float(cfg.decision_interval) - elapsed

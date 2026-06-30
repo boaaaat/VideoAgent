@@ -135,7 +135,7 @@ def load_model_checkpoint(
     if str(config_dict.get("architecture_version", "")).strip() != ARCHITECTURE_VERSION:
         raise RuntimeError(
             f"Checkpoint {checkpoint_path!r} is incompatible with {ARCHITECTURE_VERSION!r}; retrain it "
-            "with the current ConvGRU architecture."
+            "with the current causal transformer architecture."
         )
     valid_keys = {field.name for field in fields(ModelConfig)}
     cfg_kwargs = {key: value for key, value in config_dict.items() if key in valid_keys}
@@ -202,15 +202,15 @@ def _resolve_thresholds(cfg: ModelConfig, threshold: Optional[float]) -> np.ndar
     return np.asarray(list(cfg.button_state_thresholds), dtype=np.float32)
 
 
-def _resolve_change_thresholds(
+def _resolve_event_thresholds(
     cfg: ModelConfig,
-    threshold: Optional[float],
-    raw_config: Optional[Dict[str, object]] = None,
+    raw_config: Dict[str, object],
+    key: str,
+    fallback: float,
 ) -> np.ndarray:
-    if threshold is not None:
-        return np.full((cfg.num_bin,), float(threshold), dtype=np.float32)
-    raw_config = raw_config or {}
-    values = raw_config.get("change_thresholds")
+    values = getattr(cfg, key, None)
+    if values is None:
+        values = raw_config.get(key)
     if values is not None:
         try:
             thresholds = np.asarray(list(values), dtype=np.float32)
@@ -218,10 +218,7 @@ def _resolve_change_thresholds(
                 return np.clip(thresholds, 0.0, 1.0).astype(np.float32)
         except TypeError:
             pass
-    base_threshold = raw_config.get("change_threshold", 0.5)
-    if base_threshold is None:
-        base_threshold = 0.5
-    return np.full((cfg.num_bin,), float(base_threshold), dtype=np.float32)
+    return np.full((cfg.num_bin,), float(fallback), dtype=np.float32)
 
 
 def infer_video(
@@ -234,6 +231,8 @@ def infer_video(
     command_horizon: int,
     action_label_offset: int,
     thresholds: np.ndarray,
+    press_thresholds: np.ndarray,
+    release_thresholds: np.ndarray,
     max_frames: Optional[int],
     use_autocast: bool,
     inference_dtype: torch.dtype,
@@ -251,6 +250,8 @@ def infer_video(
 
     predictions = {
         "button_logits": np.zeros((total_frames, cfg.num_bin), dtype=np.float32),
+        "onset_logits": np.zeros((total_frames, cfg.num_bin), dtype=np.float32),
+        "offset_logits": np.zeros((total_frames, cfg.num_bin), dtype=np.float32),
         "button_state": np.zeros((total_frames, cfg.num_bin), dtype=np.float32),
         "source_frame": np.full((total_frames,), -1, dtype=np.int32),
         "valid_mask": np.zeros((total_frames,), dtype=bool),
@@ -260,8 +261,14 @@ def infer_video(
     prev_action = torch.zeros((1, cfg.num_bin), device=device, dtype=inference_dtype)
     del command_horizon
     target_offset = int(tuple(cfg.prediction_horizon_offsets)[0]) + int(action_label_offset)
-    threshold_tensor = torch.tensor(
-        list(thresholds),
+    del thresholds
+    press_threshold_tensor = torch.tensor(
+        list(press_thresholds),
+        device=device,
+        dtype=torch.float32,
+    )
+    release_threshold_tensor = torch.tensor(
+        list(release_thresholds),
         device=device,
         dtype=torch.float32,
     )
@@ -286,14 +293,24 @@ def infer_video(
                         prev_action=prev_action,
                     )
                     button_logits = output.button_logits
-                    predicted_action = (torch.sigmoid(button_logits.float()) >= threshold_tensor.view(1, -1)).to(
-                        dtype=inference_dtype
-                    )
+                    if output.onset_logits is None or output.offset_logits is None:
+                        raise RuntimeError("Checkpoint did not produce onset/offset logits.")
+                    onset_probs = torch.sigmoid(output.onset_logits.float())
+                    offset_probs = torch.sigmoid(output.offset_logits.float())
+                    current_action = prev_action >= 0.5
+                    next_action = current_action.clone()
+                    turn_on = (~current_action) & (onset_probs > press_threshold_tensor.view(1, -1))
+                    turn_off = current_action & (offset_probs > release_threshold_tensor.view(1, -1))
+                    next_action[turn_on] = True
+                    next_action[turn_off] = False
+                    predicted_action = next_action.to(dtype=inference_dtype)
                     prev_action = predicted_action.detach().to(dtype=inference_dtype)
 
             target_idx = source_idx + target_offset
             if 0 <= target_idx < total_frames:
                 predictions["button_logits"][target_idx] = output.button_logits[0].detach().cpu().float().numpy()
+                predictions["onset_logits"][target_idx] = output.onset_logits[0].detach().cpu().float().numpy()
+                predictions["offset_logits"][target_idx] = output.offset_logits[0].detach().cpu().float().numpy()
                 predictions["button_state"][target_idx] = predicted_action[0].detach().cpu().float().numpy()
                 predictions["source_frame"][target_idx] = source_idx
                 predictions["valid_mask"][target_idx] = True
@@ -654,7 +671,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--command-horizon", type=int, default=1, help="Ignored; single-horizon checkpoints always use their only output.")
     parser.add_argument("--action-label-offset", type=int, default=None, help="Override checkpoint action_label_offset.")
     parser.add_argument("--threshold", type=float, default=None, help="Override button threshold. Defaults to checkpoint thresholds.")
-    parser.add_argument("--change-threshold", type=float, default=None, help="Ignored for current direct-state policy checkpoints.")
+    parser.add_argument("--change-threshold", type=float, default=None, help="Ignored; onset/offset checkpoints use saved press/release thresholds.")
     parser.add_argument("--max-frames", type=int, default=None, help="Optional frame limit for quick tests.")
     parser.add_argument("--panel-width", type=int, default=720, help="Width of the side stats panel.")
     parser.add_argument("--cpu", action="store_true", help="Force CPU inference.")
@@ -693,18 +710,22 @@ def main() -> None:
 
     gt = load_ground_truth(label_path, cfg, total_frames)
     thresholds = _resolve_thresholds(cfg, args.threshold)
+    press_thresholds = _resolve_event_thresholds(cfg, raw_config, "press_thresholds", 0.5)
+    release_thresholds = _resolve_event_thresholds(cfg, raw_config, "release_thresholds", 0.5)
     print(
         "Loaded policy:",
         f"checkpoint={checkpoint_path}",
         f"video={video_path}",
         f"game={cfg.selected_game}",
-        "temporal=convgru",
+        "temporal=causal_transformer",
         f"seq={cfg.seq_len}",
         f"prediction_offset=+{int(tuple(cfg.prediction_horizon_offsets)[0])}",
         f"offset={action_label_offset}",
         f"actions={','.join(cfg.key_names + cfg.mouse_button_names)}",
         f"device={device}",
     )
+    print("Press thresholds:", dict(zip(cfg.key_names + cfg.mouse_button_names, press_thresholds)))
+    print("Release thresholds:", dict(zip(cfg.key_names + cfg.mouse_button_names, release_thresholds)))
 
     predictions = infer_video(
         video_path,
@@ -715,6 +736,8 @@ def main() -> None:
         command_horizon=int(args.command_horizon),
         action_label_offset=action_label_offset,
         thresholds=thresholds,
+        press_thresholds=press_thresholds,
+        release_thresholds=release_thresholds,
         max_frames=args.max_frames,
         use_autocast=use_autocast,
         inference_dtype=inference_dtype,

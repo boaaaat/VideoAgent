@@ -87,7 +87,7 @@ def _parse_threshold_sequence(value: str) -> Tuple[float, ...]:
 class TrainConfig(ModelConfig):
     """Training settings. The inherited model config fixes the six action names."""
 
-    train_seq_stride: int = DEFAULT_SEQUENCE_LENGTH
+    train_seq_stride: int = 80
     val_seq_stride: int = DEFAULT_SEQUENCE_LENGTH
     action_offset: int = 1
     dense_temporal_supervision: bool = True
@@ -110,22 +110,26 @@ class TrainConfig(ModelConfig):
     train_split: float = 0.9
     split_seed: int = 1337
 
-    # Keep rare controls visible without letting a handful of false positives
-    # dominate the objective.  The previous 25x cap made z/c calibration very
-    # unstable and encouraged the low-precision predictions seen in validation.
-    pos_weight_power: float = 0.5
-    pos_weight_clamp: float = 8.0
-    # Transitions are only a few percent of labeled frames, so learn them as a
-    # separate change/no-change target.  The cap keeps the auxiliary BCE bounded.
-    change_loss_weight: float = 1.0
-    change_pos_weight_power: float = 1.0
-    change_pos_weight_clamp: float = 16.0
-    main_policy_loss_weight: float = 1.0
-    conflict_penalty_weight: float = 0.20
+    # Loss weighting is intentionally mild because train windows are already
+    # event-centered below.  These weights are recomputed from the sampled
+    # train file list, not from the unsampled candidate pool.
+    pos_weight_power: float = 0.25
+    pos_weight_clamp: float = 4.0
+    state_loss_weight: float = 1.0
+    onset_loss_weight: float = 2.0
+    offset_loss_weight: float = 2.0
+    focal_gamma: float = 2.0
+    negative_clip: float = 0.05
+    conflict_penalty_weight: float = 0.10
     vision_aux_loss_weight: float = 1.0
-    transition_oversample_extra_copies: int = 2
-    transition_oversample_max_action_rate: float = 0.015
-    transition_oversample_min_changes: int = 1
+    event_onset_fraction: float = 0.35
+    event_offset_fraction: float = 0.25
+    event_rare_active_fraction: float = 0.20
+    event_random_fraction: float = 0.20
+    rare_active_stride: int = 8
+    event_action_weight_power: float = 0.25
+    event_epoch_windows: Optional[int] = None
+    rare_key_names: Sequence[str] = ("z", "c")
     # Drop feedback residual inputs during teacher forcing so the policy cannot
     # solve the task by copying action persistence alone when feedback is enabled.
     action_token_dropout_prob: float = 0.2
@@ -189,29 +193,40 @@ class TrainConfig(ModelConfig):
         self.train_split = _finite_float("train_split", self.train_split, 0.05, 0.95)
         self.pos_weight_power = _finite_float("pos_weight_power", self.pos_weight_power, 0.0)
         self.pos_weight_clamp = _finite_float("pos_weight_clamp", self.pos_weight_clamp, 1.0)
-        self.change_loss_weight = _finite_float("change_loss_weight", self.change_loss_weight, 0.0, 4.0)
-        self.change_pos_weight_power = _finite_float(
-            "change_pos_weight_power", self.change_pos_weight_power, 0.0
-        )
-        self.change_pos_weight_clamp = _finite_float(
-            "change_pos_weight_clamp", self.change_pos_weight_clamp, 1.0, 16.0
-        )
-        self.main_policy_loss_weight = _finite_float(
-            "main_policy_loss_weight", self.main_policy_loss_weight, 0.0
-        )
+        self.state_loss_weight = _finite_float("state_loss_weight", self.state_loss_weight, 0.0)
+        self.onset_loss_weight = _finite_float("onset_loss_weight", self.onset_loss_weight, 0.0)
+        self.offset_loss_weight = _finite_float("offset_loss_weight", self.offset_loss_weight, 0.0)
+        self.focal_gamma = _finite_float("focal_gamma", self.focal_gamma, 0.0)
+        self.negative_clip = _finite_float("negative_clip", self.negative_clip, 0.0, 1.0)
         self.conflict_penalty_weight = _finite_float(
             "conflict_penalty_weight", self.conflict_penalty_weight, 0.0
         )
         self.vision_aux_loss_weight = _finite_float("vision_aux_loss_weight", self.vision_aux_loss_weight, 0.0)
-        self.transition_oversample_extra_copies = _positive_int(
-            "transition_oversample_extra_copies", self.transition_oversample_extra_copies, 0
+        self.event_onset_fraction = _finite_float("event_onset_fraction", self.event_onset_fraction, 0.0, 1.0)
+        self.event_offset_fraction = _finite_float("event_offset_fraction", self.event_offset_fraction, 0.0, 1.0)
+        self.event_rare_active_fraction = _finite_float(
+            "event_rare_active_fraction", self.event_rare_active_fraction, 0.0, 1.0
         )
-        self.transition_oversample_max_action_rate = _finite_float(
-            "transition_oversample_max_action_rate", self.transition_oversample_max_action_rate, 0.0, 1.0
+        self.event_random_fraction = _finite_float("event_random_fraction", self.event_random_fraction, 0.0, 1.0)
+        fraction_total = (
+            self.event_onset_fraction
+            + self.event_offset_fraction
+            + self.event_rare_active_fraction
+            + self.event_random_fraction
         )
-        self.transition_oversample_min_changes = _positive_int(
-            "transition_oversample_min_changes", self.transition_oversample_min_changes, 1
+        if fraction_total <= 0.0:
+            raise ValueError("At least one event sampling fraction must be positive.")
+        self.event_onset_fraction /= fraction_total
+        self.event_offset_fraction /= fraction_total
+        self.event_rare_active_fraction /= fraction_total
+        self.event_random_fraction /= fraction_total
+        self.rare_active_stride = _positive_int("rare_active_stride", self.rare_active_stride)
+        self.event_action_weight_power = _finite_float(
+            "event_action_weight_power", self.event_action_weight_power, 0.0
         )
+        if self.event_epoch_windows is not None:
+            self.event_epoch_windows = _positive_int("event_epoch_windows", self.event_epoch_windows)
+        self.rare_key_names = tuple(str(name) for name in self.rare_key_names if str(name) in set(self.key_names))
         self.action_token_dropout_prob = _finite_float(
             "action_token_dropout_prob", self.action_token_dropout_prob, 0.0, 1.0
         )
@@ -317,7 +332,43 @@ class WindowMeta:
 class WindowTargets:
     labels: torch.Tensor
     previous_actions: torch.Tensor
+    onset_targets: torch.Tensor
+    offset_targets: torch.Tensor
+    soft_onset_targets: torch.Tensor
+    soft_offset_targets: torch.Tensor
     meta: List[WindowMeta]
+    sampling_buckets: Optional[Dict[str, List[int]]] = None
+
+
+@dataclass
+class TimingErrorStats:
+    device: torch.device
+
+    def __post_init__(self) -> None:
+        self.abs_error = torch.zeros((), dtype=torch.float64, device=self.device)
+        self.count = torch.zeros((), dtype=torch.float64, device=self.device)
+
+    @torch.no_grad()
+    def update(self, prediction: torch.Tensor, target: torch.Tensor) -> None:
+        pred = prediction.bool()
+        true = target.bool()
+        if pred.dim() != 3 or true.dim() != 3:
+            raise ValueError(f"Expected timing tensors [B,T,A], got {tuple(pred.shape)} and {tuple(true.shape)}.")
+        for batch_index in range(true.size(0)):
+            for action_index in range(true.size(2)):
+                true_idx = torch.nonzero(true[batch_index, :, action_index], as_tuple=False).reshape(-1)
+                pred_idx = torch.nonzero(pred[batch_index, :, action_index], as_tuple=False).reshape(-1)
+                if true_idx.numel() == 0 or pred_idx.numel() == 0:
+                    continue
+                distances = (true_idx.float().view(-1, 1) - pred_idx.float().view(1, -1)).abs()
+                nearest = distances.min(dim=1).values.double()
+                self.abs_error += nearest.sum()
+                self.count += float(nearest.numel())
+
+    def mean(self) -> float:
+        if float(self.count.item()) <= 0.0:
+            return 0.0
+        return float((self.abs_error / self.count.clamp(min=1.0)).item())
 
 
 @dataclass
@@ -329,6 +380,7 @@ class BinaryStats:
         self.tp = torch.zeros(self.num_actions, dtype=torch.float64, device=self.device)
         self.fp = torch.zeros(self.num_actions, dtype=torch.float64, device=self.device)
         self.fn = torch.zeros(self.num_actions, dtype=torch.float64, device=self.device)
+        self.samples = 0
 
     @torch.no_grad()
     def update(self, prediction: torch.Tensor, target: torch.Tensor) -> None:
@@ -337,12 +389,19 @@ class BinaryStats:
         self.tp += (pred * true).sum(dim=0)
         self.fp += (pred * (1.0 - true)).sum(dim=0)
         self.fn += ((1.0 - pred) * true).sum(dim=0)
+        self.samples += int(true.shape[0])
+
+    def f1_values(self) -> torch.Tensor:
+        precision = self.tp / (self.tp + self.fp).clamp(min=1.0)
+        recall = self.tp / (self.tp + self.fn).clamp(min=1.0)
+        return 2.0 * precision * recall / (precision + recall).clamp(min=1e-8)
 
     def rows(self, names: Sequence[str]) -> List[Dict[str, float | str | int]]:
         precision = self.tp / (self.tp + self.fp).clamp(min=1.0)
         recall = self.tp / (self.tp + self.fn).clamp(min=1.0)
-        f1 = 2.0 * precision * recall / (precision + recall).clamp(min=1e-8)
+        f1 = self.f1_values()
         support = self.tp + self.fn
+        minutes = max(float(self.samples) / 20.0 / 60.0, 1e-8)
         return [
             {
                 "name": str(name),
@@ -350,15 +409,20 @@ class BinaryStats:
                 "recall": float(recall[index].item()),
                 "f1": float(f1[index].item()),
                 "support": int(support[index].item()),
+                "false_positives_per_min": float((self.fp[index] / minutes).item()),
             }
             for index, name in enumerate(names)
         ]
 
-    def macro_f1(self) -> float:
-        precision = self.tp / (self.tp + self.fp).clamp(min=1.0)
-        recall = self.tp / (self.tp + self.fn).clamp(min=1.0)
-        f1 = 2.0 * precision * recall / (precision + recall).clamp(min=1e-8)
+    def macro_f1(self, indices: Optional[Sequence[int]] = None) -> float:
+        f1 = self.f1_values()
         observed = (self.tp + self.fp + self.fn) > 0
+        if indices is not None:
+            mask = torch.zeros_like(observed)
+            for index in indices:
+                if 0 <= int(index) < self.num_actions:
+                    mask[int(index)] = True
+            observed = observed & mask
         return float(f1[observed].mean().item()) if bool(observed.any()) else 0.0
 
 
@@ -535,6 +599,79 @@ def load_run_labels(csv_path: str, cfg: TrainConfig) -> torch.Tensor:
     return labels
 
 
+def action_onset_offset_targets(
+    labels: torch.Tensor,
+    previous_actions: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    current = labels.float() > 0.5
+    previous = previous_actions.float() > 0.5
+    onset = current & ~previous
+    offset = (~current) & previous
+    return onset.to(dtype=labels.dtype), offset.to(dtype=labels.dtype)
+
+
+def soft_transition_targets(hard_targets: torch.Tensor, cfg: TrainConfig) -> torch.Tensor:
+    if hard_targets.dim() != 3:
+        raise ValueError(f"Expected transition targets [N,T,A], got {tuple(hard_targets.shape)}.")
+    soft = torch.zeros_like(hard_targets.float())
+    short_kernel = ((-2, 0.25), (-1, 0.50), (0, 1.00), (1, 0.50), (2, 0.25))
+    wide_kernel = (
+        (-4, 0.20),
+        (-3, 0.40),
+        (-2, 0.60),
+        (-1, 0.80),
+        (0, 1.00),
+        (1, 0.80),
+        (2, 0.60),
+        (3, 0.40),
+        (4, 0.20),
+    )
+    steps = int(hard_targets.size(1))
+    for action_index, name in enumerate(cfg.key_names):
+        kernel = wide_kernel if str(name) in {"z", "c"} else short_kernel
+        hard = hard_targets[:, :, action_index].float()
+        target = soft[:, :, action_index]
+        for delta, weight in kernel:
+            src_start = max(0, -int(delta))
+            src_end = steps - max(0, int(delta))
+            dst_start = max(0, int(delta))
+            dst_end = steps - max(0, -int(delta))
+            if src_start >= src_end or dst_start >= dst_end:
+                continue
+            target[:, dst_start:dst_end] = torch.maximum(
+                target[:, dst_start:dst_end],
+                hard[:, src_start:src_end] * float(weight),
+            )
+    return soft.to(dtype=hard_targets.dtype)
+
+
+def _window_targets_from_parts(
+    label_windows: Sequence[torch.Tensor],
+    previous_action_windows: Sequence[torch.Tensor],
+    meta: Sequence[WindowMeta],
+    cfg: TrainConfig,
+    *,
+    sampling_buckets: Optional[Dict[str, List[int]]] = None,
+) -> WindowTargets:
+    if not label_windows:
+        raise RuntimeError(
+            "No valid sequence windows were created. Check CSV lengths, seq_len, and prediction_horizon."
+        )
+    labels = torch.stack(list(label_windows), dim=0)
+    previous_actions = torch.stack(list(previous_action_windows), dim=0)
+    onset_targets, offset_targets = action_onset_offset_targets(labels, previous_actions)
+    return WindowTargets(
+        labels=labels,
+        previous_actions=previous_actions,
+        onset_targets=onset_targets,
+        offset_targets=offset_targets,
+        soft_onset_targets=soft_transition_targets(onset_targets, cfg),
+        soft_offset_targets=soft_transition_targets(offset_targets, cfg),
+        meta=list(meta),
+        sampling_buckets=sampling_buckets,
+    )
+
+
 def build_window_targets(
     pairs: Sequence[Tuple[str, str]], cfg: TrainConfig, *, stride: int
 ) -> WindowTargets:
@@ -565,14 +702,82 @@ def build_window_targets(
             previous = labels[previous_start : previous_start + int(cfg.seq_len)]
             previous_action_windows.append(previous)
             meta.append(WindowMeta(video_path, start, start + int(cfg.seq_len)))
-    if not label_windows:
-        raise RuntimeError(
-            "No valid sequence windows were created. Check CSV lengths, seq_len, and prediction_horizon."
-        )
-    return WindowTargets(
-        labels=torch.stack(label_windows, dim=0),
-        previous_actions=torch.stack(previous_action_windows, dim=0),
-        meta=meta,
+    return _window_targets_from_parts(label_windows, previous_action_windows, meta, cfg)
+
+
+def build_event_window_targets(
+    pairs: Sequence[Tuple[str, str]], cfg: TrainConfig, *, stride: int
+) -> WindowTargets:
+    """Build a unique train-window pool plus repeated sampling buckets."""
+
+    stride = _positive_int("stride", stride)
+    rare_stride = _positive_int("rare_active_stride", cfg.rare_active_stride)
+    label_windows: List[torch.Tensor] = []
+    previous_action_windows: List[torch.Tensor] = []
+    meta: List[WindowMeta] = []
+    buckets: Dict[str, List[int]] = {"onset": [], "offset": [], "rare": [], "random": []}
+    for prefix in ("onset", "offset"):
+        for name in cfg.key_names:
+            buckets[f"{prefix}:{name}"] = []
+    start_to_index: Dict[Tuple[str, int], int] = {}
+    action_offset = int(cfg.action_offset)
+    seq_len = int(cfg.seq_len)
+    rare_indices = [idx for idx, name in enumerate(cfg.key_names) if name in set(cfg.rare_key_names)]
+
+    def add_window(video_path: str, labels: torch.Tensor, max_start: int, start: int, bucket: str) -> int:
+        clamped_start = max(0, min(int(max_start), int(start)))
+        key = (str(video_path), int(clamped_start))
+        index = start_to_index.get(key)
+        if index is None:
+            target_start = clamped_start + action_offset
+            target_end = target_start + seq_len
+            previous_start = target_start - 1
+            label_windows.append(labels[target_start:target_end])
+            previous_action_windows.append(labels[previous_start : previous_start + seq_len])
+            meta.append(WindowMeta(video_path, clamped_start, clamped_start + seq_len))
+            index = len(meta) - 1
+            start_to_index[key] = index
+        buckets[bucket].append(index)
+        return index
+
+    for video_path, csv_path in pairs:
+        labels = load_run_labels(csv_path, cfg)
+        max_start = int(labels.size(0)) - seq_len - action_offset
+        if max_start < 0:
+            continue
+
+        for start in range(0, max_start + 1, stride):
+            add_window(video_path, labels, max_start, start, "random")
+
+        if rare_indices:
+            rare_active = (labels[:, rare_indices] > 0.5).any(dim=1)
+            rare_active_frames = torch.nonzero(rare_active, as_tuple=False).reshape(-1).tolist()
+            for frame in rare_active_frames:
+                centered_start = int(frame) - action_offset - (seq_len // 2)
+                snapped_start = int(round(float(centered_start) / float(rare_stride))) * rare_stride
+                add_window(video_path, labels, max_start, snapped_start, "rare")
+
+        current = labels[1:]
+        previous = labels[:-1]
+        onset_events = torch.nonzero((current > 0.5) & (previous <= 0.5), as_tuple=False)
+        offset_events = torch.nonzero((current <= 0.5) & (previous > 0.5), as_tuple=False)
+        for event_row, action_index in onset_events.tolist():
+            event_frame = int(event_row) + 1
+            start = event_frame - action_offset - (seq_len // 2)
+            index = add_window(video_path, labels, max_start, start, "onset")
+            buckets[f"onset:{cfg.key_names[int(action_index)]}"].append(index)
+        for event_row, action_index in offset_events.tolist():
+            event_frame = int(event_row) + 1
+            start = event_frame - action_offset - (seq_len // 2)
+            index = add_window(video_path, labels, max_start, start, "offset")
+            buckets[f"offset:{cfg.key_names[int(action_index)]}"].append(index)
+
+    return _window_targets_from_parts(
+        label_windows,
+        previous_action_windows,
+        meta,
+        cfg,
+        sampling_buckets=buckets,
     )
 
 
@@ -593,42 +798,132 @@ def write_window_file_list(
             handle.write(f"{item.video_path} {sample_id} {item.start_frame} {item.end_frame}\n")
 
 
-def transition_oversampled_indices(
+def event_sampled_indices(
     targets: WindowTargets,
     cfg: TrainConfig,
+    *,
+    seed: int,
+    total_windows: Optional[int] = None,
 ) -> Tuple[List[int], Dict[str, object]]:
-    base_indices = list(range(len(targets.meta)))
-    extra_copies = int(cfg.transition_oversample_extra_copies)
-    if extra_copies <= 0:
-        return base_indices, {
-            "extra_copies": 0,
-            "selected_windows": 0,
-            "file_windows": len(base_indices),
-            "rare_actions": [],
-        }
+    buckets = targets.sampling_buckets or {}
+    fallback = list(buckets.get("random") or range(len(targets.meta)))
+    if not fallback:
+        raise RuntimeError("Cannot sample train windows from an empty target pool.")
+    if total_windows is not None:
+        total = int(total_windows)
+    elif cfg.event_epoch_windows is not None:
+        total = int(cfg.event_epoch_windows)
+    else:
+        total = len(fallback)
+    total = max(1, total)
+    fractions = {
+        "onset": float(cfg.event_onset_fraction),
+        "offset": float(cfg.event_offset_fraction),
+        "rare": float(cfg.event_rare_active_fraction),
+        "random": float(cfg.event_random_fraction),
+    }
+    raw_counts = {name: total * fraction for name, fraction in fractions.items()}
+    counts = {name: int(math.floor(value)) for name, value in raw_counts.items()}
+    remainder = total - sum(counts.values())
+    for name, _frac in sorted(
+        raw_counts.items(),
+        key=lambda item: (item[1] - math.floor(item[1]), fractions[item[0]]),
+        reverse=True,
+    )[:remainder]:
+        counts[name] += 1
 
-    transition_mask = (targets.labels > 0.5) != (targets.previous_actions > 0.5)
-    action_rates = transition_mask.float().mean(dim=(0, 1))
-    rare_action_mask = action_rates <= float(cfg.transition_oversample_max_action_rate)
-    if not bool(rare_action_mask.any()):
-        rare_action_mask = torch.ones_like(action_rates, dtype=torch.bool)
-    rare_counts = transition_mask[:, :, rare_action_mask].sum(dim=(1, 2))
-    selected = torch.nonzero(
-        rare_counts >= int(cfg.transition_oversample_min_changes),
-        as_tuple=False,
-    ).reshape(-1)
-    selected_indices = [int(index) for index in selected.tolist()]
-    oversampled = base_indices + selected_indices * extra_copies
-    rare_actions = [
-        str(name)
-        for name, keep in zip(cfg.key_names, rare_action_mask.tolist())
-        if bool(keep)
-    ]
-    return oversampled, {
-        "extra_copies": extra_copies,
-        "selected_windows": len(selected_indices),
-        "file_windows": len(oversampled),
-        "rare_actions": rare_actions,
+    rng = random.Random(int(seed))
+
+    def draw_uniform(name: str, count: int) -> List[int]:
+        source = list(buckets.get(name) or fallback)
+        if not source:
+            source = fallback
+        return [int(rng.choice(source)) for _ in range(max(0, int(count)))]
+
+    def event_action_distribution(prefix: str) -> Tuple[List[str], List[float], Dict[str, int], Dict[str, float]]:
+        action_sizes = {
+            str(name): len(list(buckets.get(f"{prefix}:{name}") or []))
+            for name in cfg.key_names
+        }
+        available = [name for name in cfg.key_names if action_sizes[str(name)] > 0]
+        if not available:
+            return [], [], action_sizes, {str(name): 0.0 for name in cfg.key_names}
+        raw_weights = [
+            float(action_sizes[str(name)]) ** (-float(cfg.event_action_weight_power))
+            for name in available
+        ]
+        weight_sum = sum(raw_weights)
+        if weight_sum <= 0.0 or not math.isfinite(weight_sum):
+            normalized = [1.0 / float(len(available)) for _name in available]
+        else:
+            normalized = [weight / weight_sum for weight in raw_weights]
+        by_name = {str(name): 0.0 for name in cfg.key_names}
+        for name, weight in zip(available, normalized):
+            by_name[str(name)] = float(weight)
+        return [str(name) for name in available], normalized, action_sizes, by_name
+
+    def draw_weighted_events(prefix: str, count: int) -> Tuple[List[int], Dict[str, int]]:
+        action_names, action_weights, _action_sizes, _weight_by_name = event_action_distribution(prefix)
+        action_counts = {str(name): 0 for name in cfg.key_names}
+        if not action_names:
+            return draw_uniform(prefix, count), action_counts
+        drawn: List[int] = []
+        for _ in range(max(0, int(count))):
+            action_name = str(rng.choices(action_names, weights=action_weights, k=1)[0])
+            source = list(buckets.get(f"{prefix}:{action_name}") or buckets.get(prefix) or fallback)
+            drawn.append(int(rng.choice(source)))
+            action_counts[action_name] += 1
+        return drawn, action_counts
+
+    indices: List[int] = []
+    actual_counts: Dict[str, int] = {}
+    event_action_sample_counts: Dict[str, Dict[str, int]] = {}
+    for name in ("onset", "offset", "rare", "random"):
+        if name in {"onset", "offset"}:
+            drawn, action_counts = draw_weighted_events(name, counts[name])
+            event_action_sample_counts[name] = action_counts
+        else:
+            drawn = draw_uniform(name, counts[name])
+        actual_counts[name] = len(drawn)
+        indices.extend(drawn)
+    rng.shuffle(indices)
+    if len(indices) != total:
+        raise RuntimeError(f"Sampled file list length {len(indices)} did not match requested epoch size {total}.")
+    onset_actions, onset_weights, onset_sizes, onset_weight_by_name = event_action_distribution("onset")
+    offset_actions, offset_weights, offset_sizes, offset_weight_by_name = event_action_distribution("offset")
+    return indices, {
+        "file_windows": len(indices),
+        "requested_windows": total,
+        "candidate_windows": len(targets.meta),
+        "normal_epoch_source_windows": len(fallback),
+        "bucket_sizes": {name: len(list(buckets.get(name) or [])) for name in ("onset", "offset", "rare", "random")},
+        "event_action_bucket_sizes": {
+            "onset": onset_sizes,
+            "offset": offset_sizes,
+        },
+        "event_action_sample_weights": {
+            "onset": onset_weight_by_name,
+            "offset": offset_weight_by_name,
+        },
+        "event_action_available": {
+            "onset": onset_actions,
+            "offset": offset_actions,
+        },
+        "event_action_weight_vectors": {
+            "onset": onset_weights,
+            "offset": offset_weights,
+        },
+        "event_action_sample_counts": event_action_sample_counts,
+        "target_fractions": fractions,
+        "sample_counts": actual_counts,
+        "sample_fractions": {
+            name: (float(count) / max(1.0, float(len(indices))))
+            for name, count in actual_counts.items()
+        },
+        "rare_actions": list(cfg.rare_key_names),
+        "normal_stride": int(cfg.train_seq_stride),
+        "rare_active_stride": int(cfg.rare_active_stride),
+        "event_action_weight_power": float(cfg.event_action_weight_power),
     }
 
 
@@ -730,7 +1025,16 @@ def load_batch(
     *,
     device: torch.device,
     amp_dtype: torch.dtype,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[int]]:
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    List[int],
+]:
     batch = next(iterator)[0]
     if "frames" not in batch or "sample_ids" not in batch:
         raise RuntimeError(f"Unexpected DALI outputs: {sorted(batch)}.")
@@ -749,7 +1053,20 @@ def load_batch(
         raise RuntimeError(f"DALI returned an out-of-range sample ID: {sample_ids.tolist()}.")
     labels = targets.labels[sample_ids].to(device, non_blocking=True)
     previous_actions = targets.previous_actions[sample_ids].to(device, non_blocking=True)
-    return frames, labels, previous_actions, [int(sample_id) for sample_id in sample_ids.tolist()]
+    onset_targets = targets.onset_targets[sample_ids].to(device, non_blocking=True)
+    offset_targets = targets.offset_targets[sample_ids].to(device, non_blocking=True)
+    soft_onset_targets = targets.soft_onset_targets[sample_ids].to(device, non_blocking=True)
+    soft_offset_targets = targets.soft_offset_targets[sample_ids].to(device, non_blocking=True)
+    return (
+        frames,
+        labels,
+        previous_actions,
+        onset_targets,
+        offset_targets,
+        soft_onset_targets,
+        soft_offset_targets,
+        [int(sample_id) for sample_id in sample_ids.tolist()],
+    )
 
 
 def compute_pos_weight(labels: torch.Tensor, power: float, clamp: float) -> torch.Tensor:
@@ -760,32 +1077,59 @@ def compute_pos_weight(labels: torch.Tensor, power: float, clamp: float) -> torc
 
 
 def action_change_targets(labels: torch.Tensor, previous_actions: torch.Tensor) -> torch.Tensor:
-    return ((labels.float() > 0.5) != (previous_actions.float() > 0.5)).to(dtype=labels.dtype)
+    onset, offset = action_onset_offset_targets(labels, previous_actions)
+    return torch.maximum(onset, offset)
 
 
-def compute_change_pos_weight(
-    labels: torch.Tensor,
-    previous_actions: torch.Tensor,
+def compute_pos_weight_for_indices(
+    values: torch.Tensor,
+    indices: Sequence[int],
     power: float,
     clamp: float,
 ) -> torch.Tensor:
-    return compute_pos_weight(action_change_targets(labels, previous_actions), power, clamp)
+    if not indices:
+        return compute_pos_weight(values, power, clamp)
+    index_tensor = torch.tensor([int(index) for index in indices], dtype=torch.long)
+    return compute_pos_weight(values[index_tensor], power, clamp)
 
 
-def state_bce_with_transition_breakdown(
+def asymmetric_loss_elements(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    pos_weight: torch.Tensor,
+    gamma_neg: float,
+    negative_clip: float,
+) -> torch.Tensor:
+    probabilities = torch.sigmoid(logits.float()).clamp(1e-6, 1.0 - 1e-6)
+    targets = targets.float()
+    anti_prob = 1.0 - probabilities
+    if float(negative_clip) > 0.0:
+        anti_prob = (anti_prob + float(negative_clip)).clamp(max=1.0)
+    positive_loss = targets * torch.log(probabilities)
+    negative_loss = (1.0 - targets) * torch.log(anti_prob.clamp(min=1e-6))
+    if float(gamma_neg) > 0.0:
+        negative_loss = negative_loss * probabilities.pow(float(gamma_neg))
+    positive_loss = positive_loss * pos_weight.float().view(*([1] * (targets.dim() - 1)), -1)
+    return -(positive_loss + negative_loss)
+
+
+def state_asymmetric_loss_with_transition_breakdown(
     logits: torch.Tensor,
     labels: torch.Tensor,
     previous_actions: torch.Tensor,
     *,
     pos_weight: torch.Tensor,
+    cfg: TrainConfig,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Normal state BCE plus transition/steady diagnostic slices."""
+    """Asymmetric state loss plus transition/steady diagnostic slices."""
 
-    element_loss = F.binary_cross_entropy_with_logits(
-        logits.float(),
-        labels.float(),
-        pos_weight=pos_weight.float(),
-        reduction="none",
+    element_loss = asymmetric_loss_elements(
+        logits,
+        labels,
+        pos_weight=pos_weight,
+        gamma_neg=float(cfg.focal_gamma),
+        negative_clip=float(cfg.negative_clip),
     )
     transition_mask = (labels.float() > 0.5) != (previous_actions.float() > 0.5)
     steady_mask = ~transition_mask
@@ -804,21 +1148,23 @@ def state_bce_with_transition_breakdown(
     return state_loss, transition_loss, steady_loss, transition_rate
 
 
-def change_bce_with_logits(
-    change_logits: torch.Tensor,
-    labels: torch.Tensor,
-    previous_actions: torch.Tensor,
+def focal_bce_with_logits(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
     *,
     pos_weight: torch.Tensor,
+    gamma: float,
 ) -> torch.Tensor:
-    """BCE for the direct visual action-change head."""
-
-    change_targets = action_change_targets(labels, previous_actions).float()
-    return F.binary_cross_entropy_with_logits(
-        change_logits.float(),
-        change_targets,
+    probabilities = torch.sigmoid(logits.float())
+    targets = targets.float()
+    bce = F.binary_cross_entropy_with_logits(
+        logits.float(),
+        targets,
         pos_weight=pos_weight.float(),
+        reduction="none",
     )
+    pt = probabilities * targets + (1.0 - probabilities) * (1.0 - targets)
+    return ((1.0 - pt).clamp(min=0.0).pow(float(gamma)) * bce).mean()
 
 
 def conflicting_action_penalty(logits: torch.Tensor, cfg: TrainConfig) -> torch.Tensor:
@@ -854,15 +1200,69 @@ def action_threshold_tensor(thresholds: Sequence[float], *, device: torch.device
     return torch.tensor(list(thresholds), device=device, dtype=torch.float32)
 
 
+def rare_action_indices(cfg: TrainConfig) -> Tuple[int, ...]:
+    return tuple(
+        index
+        for index, name in enumerate(cfg.key_names)
+        if str(name) in set(str(item) for item in cfg.rare_key_names)
+    )
+
+
+def hysteresis_decode_sequence(
+    onset_probs: torch.Tensor,
+    offset_probs: torch.Tensor,
+    initial_state: torch.Tensor,
+    press_thresholds: torch.Tensor,
+    release_thresholds: torch.Tensor,
+) -> torch.Tensor:
+    if onset_probs.shape != offset_probs.shape:
+        raise ValueError(
+            f"Onset/offset probability shapes differ: {tuple(onset_probs.shape)} vs {tuple(offset_probs.shape)}."
+        )
+    if onset_probs.dim() != 3:
+        raise ValueError(f"Expected event probabilities [B,T,A], got {tuple(onset_probs.shape)}.")
+    current = initial_state.bool()
+    if current.dim() != 2 or current.shape != onset_probs[:, 0].shape:
+        raise ValueError(f"Expected initial state [B,A], got {tuple(initial_state.shape)}.")
+    press = press_thresholds.float().view(1, -1)
+    release = release_thresholds.float().view(1, -1)
+    decoded: List[torch.Tensor] = []
+    for step in range(onset_probs.size(1)):
+        was_on = current
+        turn_on = (~was_on) & (onset_probs[:, step].float() > press)
+        turn_off = was_on & (offset_probs[:, step].float() > release)
+        current = (was_on | turn_on) & ~turn_off
+        decoded.append(current)
+    return torch.stack(decoded, dim=1)
+
+
+def checkpoint_score(val_metrics: Dict[str, object], closed_loop_metrics: Optional[Dict[str, object]]) -> float:
+    closed_loop_f1 = (
+        float(closed_loop_metrics["closed_loop_macro_f1"])
+        if closed_loop_metrics is not None and "closed_loop_macro_f1" in closed_loop_metrics
+        else float(val_metrics.get("closed_loop_macro_f1", 0.0))
+    )
+    return (
+        0.35 * float(val_metrics.get("rare_state_macro_f1", 0.0))
+        + 0.35 * float(val_metrics.get("onset_macro_f1", 0.0))
+        + 0.20 * float(val_metrics.get("offset_macro_f1", 0.0))
+        + 0.10 * closed_loop_f1
+    )
+
+
 def print_metric_rows(prefix: str, rows: Iterable[Dict[str, float | str | int]]) -> None:
     print(prefix)
     for row in rows:
+        fp_text = ""
+        if "false_positives_per_min" in row:
+            fp_text = f" fp/min={float(row['false_positives_per_min']):.2f}"
         print(
             f"  {str(row['name']):>2}: "
             f"f1={float(row['f1']):.3f} "
             f"precision={float(row['precision']):.3f} "
             f"recall={float(row['recall']):.3f} "
             f"support={int(row['support'])}"
+            f"{fp_text}"
         )
 
 
@@ -908,7 +1308,8 @@ def run_epoch(
     device: torch.device,
     amp_dtype: torch.dtype,
     pos_weight: torch.Tensor,
-    change_pos_weight: torch.Tensor,
+    onset_pos_weight: torch.Tensor,
+    offset_pos_weight: torch.Tensor,
     optimizer: Optional[torch.optim.Optimizer],
     total_steps: int,
     global_step: int,
@@ -928,19 +1329,26 @@ def run_epoch(
         fit_thresholds = (not training and cfg.fit_thresholds_from_val)
 
     loss_sum = 0.0
-    bce_loss_sum = 0.0
-    vision_bce_loss_sum = 0.0
-    change_bce_loss_sum = 0.0
-    transition_bce_loss_sum = 0.0
-    steady_bce_loss_sum = 0.0
+    state_loss_sum = 0.0
+    vision_state_loss_sum = 0.0
+    onset_loss_sum = 0.0
+    offset_loss_sum = 0.0
+    transition_state_loss_sum = 0.0
+    steady_state_loss_sum = 0.0
     transition_rate_sum = 0.0
     conflict_loss_sum = 0.0
+    rare_indices = rare_action_indices(cfg)
     stats = BinaryStats(cfg.num_bin, device)
     vision_stats = BinaryStats(cfg.num_bin, device)
-    change_stats = BinaryStats(cfg.num_bin, device)
+    onset_stats = BinaryStats(cfg.num_bin, device)
+    offset_stats = BinaryStats(cfg.num_bin, device)
+    closed_loop_stats = BinaryStats(cfg.num_bin, device)
+    onset_timing = TimingErrorStats(device)
+    offset_timing = TimingErrorStats(device)
     fitter = ThresholdFitter() if bool(fit_thresholds) else None
     vision_fitter = ThresholdFitter() if bool(fit_thresholds) else None
-    change_fitter = ThresholdFitter() if bool(fit_thresholds) else None
+    onset_fitter = ThresholdFitter() if bool(fit_thresholds) else None
+    offset_fitter = ThresholdFitter() if bool(fit_thresholds) else None
     metric_threshold_values = (
         tuple(float(item) for item in cfg.button_state_thresholds)
         if metric_thresholds is None
@@ -957,13 +1365,30 @@ def run_epoch(
         raise ValueError(f"Expected {cfg.num_bin} feedback thresholds, got {len(feedback_threshold_values)}.")
     thresholds = action_threshold_tensor(metric_threshold_values, device=device)
     feedback_thresholds_tensor = action_threshold_tensor(feedback_threshold_values, device=device)
+    press_threshold_values = tuple(float(item) for item in cfg.press_thresholds)
+    release_threshold_values = tuple(float(item) for item in cfg.release_thresholds)
+    if len(press_threshold_values) != cfg.num_bin:
+        raise ValueError(f"Expected {cfg.num_bin} press thresholds, got {len(press_threshold_values)}.")
+    if len(release_threshold_values) != cfg.num_bin:
+        raise ValueError(f"Expected {cfg.num_bin} release thresholds, got {len(release_threshold_values)}.")
+    press_thresholds = action_threshold_tensor(press_threshold_values, device=device)
+    release_thresholds = action_threshold_tensor(release_threshold_values, device=device)
     progress = tqdm(range(num_batches), desc=description, dynamic_ncols=True)
     iterator_it = iter(iterator)
     autoregressive_batches = 0
     action_dropout_sum = 0.0
 
     for batch_index in progress:
-        frames, labels, previous_actions, _sample_ids = load_batch(
+        (
+            frames,
+            labels,
+            previous_actions,
+            onset_targets,
+            offset_targets,
+            soft_onset_targets,
+            soft_offset_targets,
+            _sample_ids,
+        ) = load_batch(
             iterator_it,
             targets,
             device=device,
@@ -1001,46 +1426,60 @@ def run_epoch(
                     )
                 logits = output.sequence_button_logits
                 vision_logits = output.sequence_vision_button_logits
-                change_logits = output.sequence_change_logits
+                onset_logits = output.sequence_onset_logits
+                offset_logits = output.sequence_offset_logits
                 if logits is None:
                     raise RuntimeError("Dense temporal supervision requires per-timestep policy logits.")
                 if vision_logits is None:
                     raise RuntimeError("Training requires per-timestep vision-only logits.")
-                if change_logits is None:
-                    raise RuntimeError("Training requires per-timestep visual change logits.")
+                if onset_logits is None or offset_logits is None:
+                    raise RuntimeError("Training requires per-timestep onset and offset logits.")
                 if tuple(logits.shape) != tuple(labels.shape):
                     raise RuntimeError(
                         f"Model logits shape {tuple(logits.shape)} does not match labels {tuple(labels.shape)}."
                     )
-                if tuple(change_logits.shape) != tuple(labels.shape):
+                if tuple(onset_logits.shape) != tuple(labels.shape):
                     raise RuntimeError(
-                        f"Change logits shape {tuple(change_logits.shape)} does not match labels {tuple(labels.shape)}."
+                        f"Onset logits shape {tuple(onset_logits.shape)} does not match labels {tuple(labels.shape)}."
                     )
-                bce_loss, transition_bce_loss, steady_bce_loss, transition_rate = (
-                    state_bce_with_transition_breakdown(
+                if tuple(offset_logits.shape) != tuple(labels.shape):
+                    raise RuntimeError(
+                        f"Offset logits shape {tuple(offset_logits.shape)} does not match labels {tuple(labels.shape)}."
+                    )
+                state_loss, transition_state_loss, steady_state_loss, transition_rate = (
+                    state_asymmetric_loss_with_transition_breakdown(
                         logits,
                         labels,
                         previous_actions,
                         pos_weight=pos_weight,
+                        cfg=cfg,
                     )
                 )
-                vision_bce_loss, _, _, _ = state_bce_with_transition_breakdown(
+                vision_state_loss, _, _, _ = state_asymmetric_loss_with_transition_breakdown(
                     vision_logits,
                     labels,
                     previous_actions,
                     pos_weight=pos_weight,
+                    cfg=cfg,
                 )
-                change_bce_loss = change_bce_with_logits(
-                    change_logits,
-                    labels,
-                    previous_actions,
-                    pos_weight=change_pos_weight,
+                onset_loss = focal_bce_with_logits(
+                    onset_logits,
+                    soft_onset_targets,
+                    pos_weight=onset_pos_weight,
+                    gamma=float(cfg.focal_gamma),
+                )
+                offset_loss = focal_bce_with_logits(
+                    offset_logits,
+                    soft_offset_targets,
+                    pos_weight=offset_pos_weight,
+                    gamma=float(cfg.focal_gamma),
                 )
                 conflict_loss = conflicting_action_penalty(logits, cfg)
                 loss = (
-                    float(cfg.main_policy_loss_weight) * bce_loss
-                    + float(cfg.change_loss_weight) * change_bce_loss
-                    + float(cfg.vision_aux_loss_weight) * vision_bce_loss
+                    float(cfg.state_loss_weight) * state_loss
+                    + float(cfg.onset_loss_weight) * onset_loss
+                    + float(cfg.offset_loss_weight) * offset_loss
+                    + float(cfg.vision_aux_loss_weight) * vision_state_loss
                     + float(cfg.conflict_penalty_weight) * conflict_loss
                 )
                 scaled_loss = loss / int(cfg.grad_accum)
@@ -1066,41 +1505,63 @@ def run_epoch(
         with torch.no_grad():
             flat_logits = logits.reshape(-1, cfg.num_bin)
             flat_vision_logits = vision_logits.reshape(-1, cfg.num_bin)
-            flat_change_logits = change_logits.reshape(-1, cfg.num_bin)
+            flat_onset_logits = onset_logits.reshape(-1, cfg.num_bin)
+            flat_offset_logits = offset_logits.reshape(-1, cfg.num_bin)
             flat_labels = labels.reshape(-1, cfg.num_bin)
-            flat_changes = action_change_targets(labels, previous_actions).reshape(-1, cfg.num_bin)
+            flat_onsets = onset_targets.reshape(-1, cfg.num_bin)
+            flat_offsets = offset_targets.reshape(-1, cfg.num_bin)
             prediction = torch.sigmoid(flat_logits.float()) >= thresholds.view(1, -1)
             vision_prediction = torch.sigmoid(flat_vision_logits.float()) >= thresholds.view(1, -1)
-            change_prediction = torch.sigmoid(flat_change_logits.float()) >= 0.5
+            onset_prob = torch.sigmoid(onset_logits.float())
+            offset_prob = torch.sigmoid(offset_logits.float())
+            onset_prediction = onset_prob >= press_thresholds.view(1, 1, -1)
+            offset_prediction = offset_prob >= release_thresholds.view(1, 1, -1)
+            closed_loop_prediction = hysteresis_decode_sequence(
+                onset_prob,
+                offset_prob,
+                previous_actions[:, 0] > 0.5,
+                press_thresholds,
+                release_thresholds,
+            )
             stats.update(prediction, flat_labels > 0.5)
             vision_stats.update(vision_prediction, flat_labels > 0.5)
-            change_stats.update(change_prediction, flat_changes > 0.5)
+            onset_stats.update(onset_prediction.reshape(-1, cfg.num_bin), flat_onsets > 0.5)
+            offset_stats.update(offset_prediction.reshape(-1, cfg.num_bin), flat_offsets > 0.5)
+            closed_loop_stats.update(closed_loop_prediction.reshape(-1, cfg.num_bin), flat_labels > 0.5)
+            onset_timing.update(onset_prediction, onset_targets > 0.5)
+            offset_timing.update(offset_prediction, offset_targets > 0.5)
             if fitter is not None:
                 fitter.update(flat_logits, flat_labels)
             if vision_fitter is not None:
                 vision_fitter.update(flat_vision_logits, flat_labels)
-            if change_fitter is not None:
-                change_fitter.update(flat_change_logits, flat_changes)
+            if onset_fitter is not None:
+                onset_fitter.update(flat_onset_logits, flat_onsets)
+            if offset_fitter is not None:
+                offset_fitter.update(flat_offset_logits, flat_offsets)
         loss_sum += float(loss.detach().item())
-        bce_loss_sum += float(bce_loss.detach().item())
-        vision_bce_loss_sum += float(vision_bce_loss.detach().item())
-        change_bce_loss_sum += float(change_bce_loss.detach().item())
-        transition_bce_loss_sum += float(transition_bce_loss.detach().item())
-        steady_bce_loss_sum += float(steady_bce_loss.detach().item())
+        state_loss_sum += float(state_loss.detach().item())
+        vision_state_loss_sum += float(vision_state_loss.detach().item())
+        onset_loss_sum += float(onset_loss.detach().item())
+        offset_loss_sum += float(offset_loss.detach().item())
+        transition_state_loss_sum += float(transition_state_loss.detach().item())
+        steady_state_loss_sum += float(steady_state_loss.detach().item())
         transition_rate_sum += float(transition_rate.detach().item())
         conflict_loss_sum += float(conflict_loss.detach().item())
         if (batch_index + 1) % cfg.print_every == 0 or batch_index + 1 == num_batches:
             progress.set_postfix(
                 L=f"{loss_sum / float(batch_index + 1):.4f}",
-                B=f"{bce_loss_sum / float(batch_index + 1):.4f}",
-                VB=f"{vision_bce_loss_sum / float(batch_index + 1):.4f}",
-                CB=f"{change_bce_loss_sum / float(batch_index + 1):.4f}",
-                TB=f"{transition_bce_loss_sum / float(batch_index + 1):.4f}",
-                SB=f"{steady_bce_loss_sum / float(batch_index + 1):.4f}",
+                S=f"{state_loss_sum / float(batch_index + 1):.4f}",
+                VS=f"{vision_state_loss_sum / float(batch_index + 1):.4f}",
+                ON=f"{onset_loss_sum / float(batch_index + 1):.4f}",
+                OFF=f"{offset_loss_sum / float(batch_index + 1):.4f}",
+                TS=f"{transition_state_loss_sum / float(batch_index + 1):.4f}",
+                SS=f"{steady_state_loss_sum / float(batch_index + 1):.4f}",
                 C=f"{conflict_loss_sum / float(batch_index + 1):.4f}",
                 F1=f"{stats.macro_f1():.3f}",
                 VF1=f"{vision_stats.macro_f1():.3f}",
-                XF1=f"{change_stats.macro_f1():.3f}",
+                OnF1=f"{onset_stats.macro_f1():.3f}",
+                OffF1=f"{offset_stats.macro_f1():.3f}",
+                CLF1=f"{closed_loop_stats.macro_f1():.3f}",
                 RD=f"{action_dropout_sum / float(batch_index + 1):.3f}",
                 CL=f"{autoregressive_batches}/{batch_index + 1}",
             )
@@ -1108,23 +1569,38 @@ def run_epoch(
 
     metrics: Dict[str, object] = {
         "loss": loss_sum / max(1, num_batches),
-        "bce_loss": bce_loss_sum / max(1, num_batches),
-        "vision_bce_loss": vision_bce_loss_sum / max(1, num_batches),
-        "change_bce_loss": change_bce_loss_sum / max(1, num_batches),
-        "transition_bce_loss": transition_bce_loss_sum / max(1, num_batches),
-        "steady_bce_loss": steady_bce_loss_sum / max(1, num_batches),
+        "state_loss": state_loss_sum / max(1, num_batches),
+        "bce_loss": state_loss_sum / max(1, num_batches),
+        "vision_state_loss": vision_state_loss_sum / max(1, num_batches),
+        "vision_bce_loss": vision_state_loss_sum / max(1, num_batches),
+        "onset_loss": onset_loss_sum / max(1, num_batches),
+        "offset_loss": offset_loss_sum / max(1, num_batches),
+        "transition_state_loss": transition_state_loss_sum / max(1, num_batches),
+        "transition_bce_loss": transition_state_loss_sum / max(1, num_batches),
+        "steady_state_loss": steady_state_loss_sum / max(1, num_batches),
+        "steady_bce_loss": steady_state_loss_sum / max(1, num_batches),
         "transition_rate": transition_rate_sum / max(1, num_batches),
         "conflict_penalty": conflict_loss_sum / max(1, num_batches),
         "macro_f1": stats.macro_f1(),
+        "rare_state_macro_f1": stats.macro_f1(rare_indices),
         "rows": stats.rows(cfg.key_names),
         "vision_macro_f1": vision_stats.macro_f1(),
         "vision_rows": vision_stats.rows(cfg.key_names),
-        "change_macro_f1": change_stats.macro_f1(),
-        "change_rows": change_stats.rows(cfg.key_names),
+        "onset_macro_f1": onset_stats.macro_f1(),
+        "onset_rows": onset_stats.rows(cfg.key_names),
+        "offset_macro_f1": offset_stats.macro_f1(),
+        "offset_rows": offset_stats.rows(cfg.key_names),
+        "transition_macro_f1": 0.5 * (onset_stats.macro_f1() + offset_stats.macro_f1()),
+        "closed_loop_macro_f1": closed_loop_stats.macro_f1(),
+        "closed_loop_rows": closed_loop_stats.rows(cfg.key_names),
+        "mean_onset_timing_error": onset_timing.mean(),
+        "mean_offset_timing_error": offset_timing.mean(),
         "action_token_dropout_rate": action_dropout_sum / max(1, num_batches),
         "autoregressive_batches": autoregressive_batches,
         "metric_thresholds": metric_threshold_values,
         "feedback_thresholds": feedback_threshold_values,
+        "press_thresholds": press_threshold_values,
+        "release_thresholds": release_threshold_values,
     }
     if fitter is not None:
         fitted_thresholds = fitter.fit(cfg.threshold_min, cfg.threshold_max, cfg.num_bin)
@@ -1136,6 +1612,7 @@ def run_epoch(
         metrics["previous_threshold_macro_f1"] = metrics["macro_f1"]
         metrics["previous_threshold_rows"] = metrics["rows"]
         metrics["macro_f1"] = calibrated_stats.macro_f1()
+        metrics["rare_state_macro_f1"] = calibrated_stats.macro_f1(rare_indices)
         metrics["rows"] = calibrated_stats.rows(cfg.key_names)
     if vision_fitter is not None:
         vision_fitted_thresholds = vision_fitter.fit(cfg.threshold_min, cfg.threshold_max, cfg.num_bin)
@@ -1145,14 +1622,25 @@ def run_epoch(
         metrics["previous_threshold_vision_rows"] = metrics["vision_rows"]
         metrics["vision_macro_f1"] = calibrated_vision_stats.macro_f1()
         metrics["vision_rows"] = calibrated_vision_stats.rows(cfg.key_names)
-    if change_fitter is not None:
-        change_fitted_thresholds = change_fitter.fit(0.02, 0.80, cfg.num_bin)
-        calibrated_change_stats = change_fitter.statistics(change_fitted_thresholds, cfg.num_bin)
-        metrics["change_fitted_thresholds"] = change_fitted_thresholds
-        metrics["previous_threshold_change_macro_f1"] = metrics["change_macro_f1"]
-        metrics["previous_threshold_change_rows"] = metrics["change_rows"]
-        metrics["change_macro_f1"] = calibrated_change_stats.macro_f1()
-        metrics["change_rows"] = calibrated_change_stats.rows(cfg.key_names)
+    if onset_fitter is not None:
+        fitted_press_thresholds = onset_fitter.fit(0.02, 0.80, cfg.num_bin)
+        calibrated_onset_stats = onset_fitter.statistics(fitted_press_thresholds, cfg.num_bin)
+        metrics["fitted_press_thresholds"] = fitted_press_thresholds
+        metrics["previous_threshold_onset_macro_f1"] = metrics["onset_macro_f1"]
+        metrics["previous_threshold_onset_rows"] = metrics["onset_rows"]
+        metrics["onset_macro_f1"] = calibrated_onset_stats.macro_f1()
+        metrics["onset_rows"] = calibrated_onset_stats.rows(cfg.key_names)
+    if offset_fitter is not None:
+        fitted_release_thresholds = offset_fitter.fit(0.02, 0.80, cfg.num_bin)
+        calibrated_offset_stats = offset_fitter.statistics(fitted_release_thresholds, cfg.num_bin)
+        metrics["fitted_release_thresholds"] = fitted_release_thresholds
+        metrics["previous_threshold_offset_macro_f1"] = metrics["offset_macro_f1"]
+        metrics["previous_threshold_offset_rows"] = metrics["offset_rows"]
+        metrics["offset_macro_f1"] = calibrated_offset_stats.macro_f1()
+        metrics["offset_rows"] = calibrated_offset_stats.rows(cfg.key_names)
+    metrics["transition_macro_f1"] = 0.5 * (
+        float(metrics["onset_macro_f1"]) + float(metrics["offset_macro_f1"])
+    )
     return metrics, global_step
 
 
@@ -1163,7 +1651,7 @@ def checkpoint_payload(
     *,
     epoch: int,
     global_step: int,
-    best_validation_bce: float,
+    best_validation_score: float,
 ) -> Dict[str, object]:
     return {
         "architecture_version": ARCHITECTURE_VERSION,
@@ -1172,7 +1660,8 @@ def checkpoint_payload(
         "config": asdict(cfg),
         "epoch": int(epoch),
         "global_step": int(global_step),
-        "best_validation_bce": float(best_validation_bce),
+        "best_validation_score": float(best_validation_score),
+        "best_validation_bce": float("nan"),
     }
 
 
@@ -1199,16 +1688,16 @@ def maybe_resume(
     model: torch.nn.Module, optimizer: torch.optim.Optimizer, cfg: TrainConfig, device: torch.device
 ) -> Tuple[int, int, float]:
     if not cfg.resume:
-        return 0, 0, math.inf
+        return 0, 0, -math.inf
     path = cfg.resume_path or os.path.join(cfg.ckpt_dir, "model_latest.pt")
     if not os.path.isfile(path):
-        return 0, 0, math.inf
+        return 0, 0, -math.inf
     state = torch.load(path, map_location=device)
     if not isinstance(state, dict) or state.get("architecture_version") != ARCHITECTURE_VERSION:
         if cfg.resume_path is not None:
             raise RuntimeError(f"Checkpoint {path!r} does not use {ARCHITECTURE_VERSION}.")
         print(f"Skipping incompatible checkpoint: {path}")
-        return 0, 0, math.inf
+        return 0, 0, -math.inf
     config = state.get("config")
     if not isinstance(config, dict) or list(config.get("key_names", [])) != list(cfg.key_names):
         raise RuntimeError(f"Checkpoint {path!r} has a different action schema.")
@@ -1219,7 +1708,7 @@ def maybe_resume(
                 "for dense temporal supervision. Start from scratch instead."
             )
         print(f"Skipping final-frame-only checkpoint: {path}")
-        return 0, 0, math.inf
+        return 0, 0, -math.inf
     model_state = state["model_state"]
     initialized_vision_head = fill_missing_vision_head_state(model, model_state)
     model.load_state_dict(model_state, strict=True)
@@ -1232,8 +1721,7 @@ def maybe_resume(
     print(f"Resumed from {path} at epoch {state.get('epoch', 0)}.")
     if initialized_vision_head:
         print("Initialized missing vision_head weights from the checkpoint main policy head.")
-    # v10 checkpoints use direct visual-change BCE as the model-selection score.
-    best_validation_bce = float(state.get("best_validation_bce", math.inf))
+    best_validation_score = float(state.get("best_validation_score", -math.inf))
 
     def checkpoint_int(name: str, fallback: int) -> int:
         value = config.get(name, fallback)
@@ -1251,14 +1739,14 @@ def maybe_resume(
     )
     if checkpoint_validation_contract != current_validation_contract:
         print(
-            "Validation contract changed since checkpoint; resetting best validation vision BCE "
-            f"from {best_validation_bce:.4f}."
+            "Validation contract changed since checkpoint; resetting best validation score "
+            f"from {best_validation_score:.4f}."
         )
-        best_validation_bce = math.inf
+        best_validation_score = -math.inf
     return (
         int(state.get("epoch", 0)),
         int(state.get("global_step", 0)),
-        best_validation_bce,
+        best_validation_score,
     )
 
 
@@ -1275,15 +1763,18 @@ def transition_rate_by_action(targets: WindowTargets) -> torch.Tensor:
 def print_progress_metric_legend() -> None:
     rows = [
         ("L", "total loss"),
-        ("B", "state BCE"),
-        ("VB", "vision state BCE"),
-        ("CB", "change-head BCE"),
-        ("TB", "state BCE on transition targets"),
-        ("SB", "state BCE on steady targets"),
+        ("S", "state asymmetric loss"),
+        ("VS", "vision state asymmetric loss"),
+        ("ON", "onset focal BCE"),
+        ("OFF", "offset focal BCE"),
+        ("TS", "state loss on transition targets"),
+        ("SS", "state loss on steady targets"),
         ("C", "conflict penalty"),
         ("F1", "state macro F1"),
         ("VF1", "vision state macro F1"),
-        ("XF1", "visual change macro F1"),
+        ("OnF1", "onset macro F1"),
+        ("OffF1", "offset macro F1"),
+        ("CLF1", "hysteresis closed-loop state F1"),
         ("RD", "residual dropout rate"),
         ("CL", "closed-loop batches / seen batches"),
     ]
@@ -1301,19 +1792,21 @@ def print_action_stats_table(
     train_transition_rate: torch.Tensor,
     val_transition_rate: torch.Tensor,
     pos_weight: torch.Tensor,
-    change_pos_weight: torch.Tensor,
+    onset_pos_weight: torch.Tensor,
+    offset_pos_weight: torch.Tensor,
 ) -> None:
     print("Action stats:")
-    print("  act  tr_pos  val_pos  tr_chg  val_chg  pos_w  chg_w")
-    print("  ---  ------  -------  ------  -------  -----  -----")
-    for name, tr_pos, val_pos, tr_chg, val_chg, pos_w, chg_w in zip(
+    print("  act  tr_pos  val_pos  tr_chg  val_chg  pos_w  on_w  off_w")
+    print("  ---  ------  -------  ------  -------  -----  ----  -----")
+    for name, tr_pos, val_pos, tr_chg, val_chg, pos_w, on_w, off_w in zip(
         action_names,
         train_positive_rate,
         val_positive_rate,
         train_transition_rate,
         val_transition_rate,
         pos_weight.detach().cpu(),
-        change_pos_weight.detach().cpu(),
+        onset_pos_weight.detach().cpu(),
+        offset_pos_weight.detach().cpu(),
     ):
         print(
             f"  {name:<3}  "
@@ -1322,7 +1815,8 @@ def print_action_stats_table(
             f"{float(tr_chg):>6.4f}  "
             f"{float(val_chg):>7.4f}  "
             f"{float(pos_w):>5.2f}  "
-            f"{float(chg_w):>5.2f}"
+            f"{float(on_w):>4.2f}  "
+            f"{float(off_w):>5.2f}"
         )
 
 
@@ -1343,44 +1837,66 @@ def constant_prior_loss_summary(
     cfg: TrainConfig,
     *,
     pos_weight: torch.Tensor,
-    change_pos_weight: torch.Tensor,
+    onset_pos_weight: torch.Tensor,
+    offset_pos_weight: torch.Tensor,
+    indices: Optional[Sequence[int]] = None,
 ) -> Dict[str, float]:
+    if indices:
+        index_tensor = torch.tensor([int(index) for index in indices], dtype=torch.long)
+        labels = targets.labels[index_tensor]
+        previous_actions = targets.previous_actions[index_tensor]
+        soft_onsets = targets.soft_onset_targets[index_tensor]
+        soft_offsets = targets.soft_offset_targets[index_tensor]
+    else:
+        labels = targets.labels
+        previous_actions = targets.previous_actions
+        soft_onsets = targets.soft_onset_targets
+        soft_offsets = targets.soft_offset_targets
     logits = weighted_constant_logits(
-        targets.labels,
+        labels,
         pos_weight=pos_weight,
-    ).view(1, 1, cfg.num_bin).expand_as(targets.labels)
-    change_targets = action_change_targets(targets.labels, targets.previous_actions)
-    change_logits = weighted_constant_logits(
-        change_targets,
-        pos_weight=change_pos_weight,
-    ).view(1, 1, cfg.num_bin).expand_as(targets.labels)
-    state_loss, transition_loss, steady_loss, _ = state_bce_with_transition_breakdown(
+    ).view(1, 1, cfg.num_bin).expand_as(labels)
+    onset_logits = weighted_constant_logits(
+        soft_onsets,
+        pos_weight=onset_pos_weight,
+    ).view(1, 1, cfg.num_bin).expand_as(labels)
+    offset_logits = weighted_constant_logits(
+        soft_offsets,
+        pos_weight=offset_pos_weight,
+    ).view(1, 1, cfg.num_bin).expand_as(labels)
+    state_loss, transition_loss, steady_loss, _ = state_asymmetric_loss_with_transition_breakdown(
         logits,
-        targets.labels,
-        targets.previous_actions,
+        labels,
+        previous_actions,
         pos_weight=pos_weight.detach().cpu(),
+        cfg=cfg,
     )
-    change_loss = change_bce_with_logits(
-        change_logits,
-        targets.labels,
-        targets.previous_actions,
-        pos_weight=change_pos_weight.detach().cpu(),
+    onset_loss = focal_bce_with_logits(
+        onset_logits,
+        soft_onsets,
+        pos_weight=onset_pos_weight.detach().cpu(),
+        gamma=float(cfg.focal_gamma),
+    )
+    offset_loss = focal_bce_with_logits(
+        offset_logits,
+        soft_offsets,
+        pos_weight=offset_pos_weight.detach().cpu(),
+        gamma=float(cfg.focal_gamma),
     )
     conflict_loss = conflicting_action_penalty(logits.reshape(-1, cfg.num_bin), cfg)
-    state_loss_scale = float(cfg.vision_aux_loss_weight)
-    if not cfg.last_action_conditioning:
-        state_loss_scale += float(cfg.main_policy_loss_weight)
     total = (
-        state_loss_scale * state_loss
-        + float(cfg.change_loss_weight) * change_loss
+        float(cfg.state_loss_weight) * state_loss
+        + float(cfg.onset_loss_weight) * onset_loss
+        + float(cfg.offset_loss_weight) * offset_loss
         + float(cfg.conflict_penalty_weight) * conflict_loss
     )
     return {
         "loss": float(total.item()),
-        "state_bce": float(state_loss.item()),
-        "change_bce": float(change_loss.item()),
-        "transition_bce": float(transition_loss.item()),
-        "steady_bce": float(steady_loss.item()),
+        "state_loss": float(state_loss.item()),
+        "onset_loss": float(onset_loss.item()),
+        "offset_loss": float(offset_loss.item()),
+        "transition_state_loss": float(transition_loss.item()),
+        "steady_state_loss": float(steady_loss.item()),
         "conflict": float(conflict_loss.item()),
     }
 
@@ -1392,32 +1908,42 @@ def print_startup_stats(
     val_pairs: Sequence[Tuple[str, str]],
     train_targets: WindowTargets,
     val_targets: WindowTargets,
+    train_indices: Sequence[int],
     train_file_windows: int,
     transition_sampling: Dict[str, object],
     train_batches: int,
     val_batches: int,
     parameter_count: int,
     pos_weight: torch.Tensor,
-    change_pos_weight: torch.Tensor,
+    onset_pos_weight: torch.Tensor,
+    offset_pos_weight: torch.Tensor,
 ) -> None:
     """Print the fixed data/model contract before the first DALI batch is read."""
 
     action_names = list(cfg.key_names)
-    train_positive_rate = train_targets.labels.reshape(-1, cfg.num_bin).float().mean(dim=0)
+    index_tensor = torch.tensor([int(index) for index in train_indices], dtype=torch.long)
+    sampled_train_labels = train_targets.labels[index_tensor]
+    sampled_train_previous = train_targets.previous_actions[index_tensor]
+    train_positive_rate = sampled_train_labels.reshape(-1, cfg.num_bin).float().mean(dim=0)
     val_positive_rate = val_targets.labels.reshape(-1, cfg.num_bin).float().mean(dim=0)
-    train_transition_rate = transition_rate_by_action(train_targets)
+    train_transition_rate = (
+        (sampled_train_labels > 0.5) != (sampled_train_previous > 0.5)
+    ).float().mean(dim=(0, 1))
     val_transition_rate = transition_rate_by_action(val_targets)
     train_prior_baseline = constant_prior_loss_summary(
         train_targets,
         cfg,
         pos_weight=pos_weight,
-        change_pos_weight=change_pos_weight,
+        onset_pos_weight=onset_pos_weight,
+        offset_pos_weight=offset_pos_weight,
+        indices=train_indices,
     )
     val_prior_baseline = constant_prior_loss_summary(
         val_targets,
         cfg,
         pos_weight=pos_weight,
-        change_pos_weight=change_pos_weight,
+        onset_pos_weight=onset_pos_weight,
+        offset_pos_weight=offset_pos_weight,
     )
     total_videos = len(train_pairs) + len(val_pairs)
     print("Startup configuration:")
@@ -1436,6 +1962,8 @@ def print_startup_stats(
         f"order={action_names}",
         f"action_offset=+{int(cfg.action_offset)}",
         f"thresholds={list(cfg.button_state_thresholds)}",
+        f"press_thresholds={list(cfg.press_thresholds)}",
+        f"release_thresholds={list(cfg.release_thresholds)}",
         f"feedback_thresholds={list(cfg.autoregressive_feedback_thresholds)}",
     )
     print(
@@ -1447,11 +1975,13 @@ def print_startup_stats(
         f"videos_total={total_videos}",
         f"train_videos={len(train_pairs)}",
         f"val_videos={len(val_pairs)}",
-        f"train_windows={len(train_targets.meta)}",
+        f"train_candidate_windows={len(train_targets.meta)}",
         f"train_file_windows={int(train_file_windows)}",
         f"val_windows={len(val_targets.meta)}",
-        f"train_stride={cfg.train_seq_stride}",
+        f"normal_train_stride={cfg.train_seq_stride}",
+        f"rare_active_stride={cfg.rare_active_stride}",
         f"val_stride={cfg.val_seq_stride}",
+        f"event_epoch_windows={cfg.event_epoch_windows}",
     )
     print(
         "  Batches:",
@@ -1491,22 +2021,31 @@ def print_startup_stats(
     )
     print(
         "  Loss:",
-        "BCEWithLogits",
+        "asymmetric_state+focal_events",
         f"pos_weight_power={cfg.pos_weight_power:.3f}",
         f"pos_weight_clamp={cfg.pos_weight_clamp:.3f}",
-        f"change_weight={cfg.change_loss_weight:.3f}",
-        f"change_pos_weight_power={cfg.change_pos_weight_power:.3f}",
-        f"change_pos_weight_clamp={cfg.change_pos_weight_clamp:.3f}",
-        f"main_policy_weight={cfg.main_policy_loss_weight:.3f}",
+        f"state_weight={cfg.state_loss_weight:.3f}",
+        f"onset_weight={cfg.onset_loss_weight:.3f}",
+        f"offset_weight={cfg.offset_loss_weight:.3f}",
+        f"focal_gamma={cfg.focal_gamma:.3f}",
+        f"negative_clip={cfg.negative_clip:.3f}",
         f"conflict_weight={cfg.conflict_penalty_weight:.3f}",
         f"vision_aux_weight={cfg.vision_aux_loss_weight:.3f}",
     )
     print_progress_metric_legend()
     print(
-        "  Transition sampling:",
+        "  Event sampling:",
         f"rare_actions={transition_sampling.get('rare_actions', [])}",
-        f"selected_windows={int(transition_sampling.get('selected_windows', 0))}",
-        f"extra_copies={int(transition_sampling.get('extra_copies', 0))}",
+        f"requested_windows={transition_sampling.get('requested_windows')}",
+        f"normal_epoch_source_windows={transition_sampling.get('normal_epoch_source_windows')}",
+        f"target_fractions={transition_sampling.get('target_fractions', {})}",
+        f"bucket_sizes={transition_sampling.get('bucket_sizes', {})}",
+        f"event_action_bucket_sizes={transition_sampling.get('event_action_bucket_sizes', {})}",
+        f"event_action_sample_weights={transition_sampling.get('event_action_sample_weights', {})}",
+        f"sample_counts={transition_sampling.get('sample_counts', {})}",
+        f"event_action_sample_counts={transition_sampling.get('event_action_sample_counts', {})}",
+        f"sample_fractions={transition_sampling.get('sample_fractions', {})}",
+        f"event_action_weight_power={transition_sampling.get('event_action_weight_power')}",
         f"file_multiplier={float(train_file_windows) / max(1.0, float(len(train_targets.meta))):.2f}",
     )
     print(
@@ -1525,21 +2064,24 @@ def print_startup_stats(
         train_transition_rate,
         val_transition_rate,
         pos_weight,
-        change_pos_weight,
+        onset_pos_weight,
+        offset_pos_weight,
     )
     print(
         "  Train constant-prior baseline:",
         f"loss={train_prior_baseline['loss']:.4f}",
-        f"state_bce={train_prior_baseline['state_bce']:.4f}",
-        f"change_bce={train_prior_baseline['change_bce']:.4f}",
-        f"trans_bce={train_prior_baseline['transition_bce']:.4f}",
+        f"state={train_prior_baseline['state_loss']:.4f}",
+        f"onset={train_prior_baseline['onset_loss']:.4f}",
+        f"offset={train_prior_baseline['offset_loss']:.4f}",
+        f"trans_state={train_prior_baseline['transition_state_loss']:.4f}",
     )
     print(
         "  Val constant-prior baseline:",
         f"loss={val_prior_baseline['loss']:.4f}",
-        f"state_bce={val_prior_baseline['state_bce']:.4f}",
-        f"change_bce={val_prior_baseline['change_bce']:.4f}",
-        f"trans_bce={val_prior_baseline['transition_bce']:.4f}",
+        f"state={val_prior_baseline['state_loss']:.4f}",
+        f"onset={val_prior_baseline['onset_loss']:.4f}",
+        f"offset={val_prior_baseline['offset_loss']:.4f}",
+        f"trans_state={val_prior_baseline['transition_state_loss']:.4f}",
     )
 
 
@@ -1558,9 +2100,13 @@ def train(cfg: Optional[TrainConfig] = None) -> None:
 
     sync_dataset_roots_for_training(cfg)
     train_pairs, val_pairs = resolve_run_pairs(cfg)
-    train_targets = build_window_targets(train_pairs, cfg, stride=cfg.train_seq_stride)
+    train_targets = build_event_window_targets(train_pairs, cfg, stride=cfg.train_seq_stride)
     val_targets = build_window_targets(val_pairs, cfg, stride=cfg.val_seq_stride)
-    train_indices, transition_sampling = transition_oversampled_indices(train_targets, cfg)
+    train_indices, transition_sampling = event_sampled_indices(
+        train_targets,
+        cfg,
+        seed=cfg.dali_shuffle_seed,
+    )
     train_file_list = os.path.join(cfg.ckpt_dir, "train_windows.txt")
     val_file_list = os.path.join(cfg.ckpt_dir, "val_windows.txt")
     write_window_file_list(train_targets.meta, train_file_list, indices=train_indices)
@@ -1595,15 +2141,33 @@ def train(cfg: Optional[TrainConfig] = None) -> None:
         )
     except (RuntimeError, TypeError):
         optimizer = torch.optim.AdamW(base_model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-    start_epoch, global_step, best_validation_bce = maybe_resume(base_model, optimizer, cfg, device)
+    start_epoch, global_step, best_validation_score = maybe_resume(base_model, optimizer, cfg, device)
+    if start_epoch > 0:
+        train_indices, transition_sampling = event_sampled_indices(
+            train_targets,
+            cfg,
+            seed=cfg.dali_shuffle_seed + start_epoch,
+        )
+        write_window_file_list(train_targets.meta, train_file_list, indices=train_indices)
     model = torch.compile(base_model) if cfg.compile_model else base_model
     amp_dtype = torch.bfloat16 if cfg.amp_dtype == "bf16" else torch.float32
-    pos_weight = compute_pos_weight(train_targets.labels, cfg.pos_weight_power, cfg.pos_weight_clamp).to(device)
-    change_pos_weight = compute_change_pos_weight(
+    pos_weight = compute_pos_weight_for_indices(
         train_targets.labels,
-        train_targets.previous_actions,
-        cfg.change_pos_weight_power,
-        cfg.change_pos_weight_clamp,
+        train_indices,
+        cfg.pos_weight_power,
+        cfg.pos_weight_clamp,
+    ).to(device)
+    onset_pos_weight = compute_pos_weight_for_indices(
+        train_targets.soft_onset_targets,
+        train_indices,
+        cfg.pos_weight_power,
+        cfg.pos_weight_clamp,
+    ).to(device)
+    offset_pos_weight = compute_pos_weight_for_indices(
+        train_targets.soft_offset_targets,
+        train_indices,
+        cfg.pos_weight_power,
+        cfg.pos_weight_clamp,
     ).to(device)
     parameter_count = sum(parameter.numel() for parameter in base_model.parameters())
     print_startup_stats(
@@ -1612,17 +2176,43 @@ def train(cfg: Optional[TrainConfig] = None) -> None:
         val_pairs=val_pairs,
         train_targets=train_targets,
         val_targets=val_targets,
+        train_indices=train_indices,
         train_file_windows=len(train_indices),
         transition_sampling=transition_sampling,
         train_batches=train_batches,
         val_batches=val_batches,
         parameter_count=parameter_count,
         pos_weight=pos_weight,
-        change_pos_weight=change_pos_weight,
+        onset_pos_weight=onset_pos_weight,
+        offset_pos_weight=offset_pos_weight,
     )
     total_steps = max(1, int(math.ceil(train_batches / float(cfg.grad_accum))) * cfg.num_epochs)
 
     for epoch in range(start_epoch, cfg.num_epochs):
+        train_indices, transition_sampling = event_sampled_indices(
+            train_targets,
+            cfg,
+            seed=cfg.dali_shuffle_seed + epoch,
+        )
+        write_window_file_list(train_targets.meta, train_file_list, indices=train_indices)
+        pos_weight = compute_pos_weight_for_indices(
+            train_targets.labels,
+            train_indices,
+            cfg.pos_weight_power,
+            cfg.pos_weight_clamp,
+        ).to(device)
+        onset_pos_weight = compute_pos_weight_for_indices(
+            train_targets.soft_onset_targets,
+            train_indices,
+            cfg.pos_weight_power,
+            cfg.pos_weight_clamp,
+        ).to(device)
+        offset_pos_weight = compute_pos_weight_for_indices(
+            train_targets.soft_offset_targets,
+            train_indices,
+            cfg.pos_weight_power,
+            cfg.pos_weight_clamp,
+        ).to(device)
         train_iterator = make_dali_iterator(
             train_file_list,
             cfg,
@@ -1640,7 +2230,8 @@ def train(cfg: Optional[TrainConfig] = None) -> None:
             device=device,
             amp_dtype=amp_dtype,
             pos_weight=pos_weight,
-            change_pos_weight=change_pos_weight,
+            onset_pos_weight=onset_pos_weight,
+            offset_pos_weight=offset_pos_weight,
             optimizer=optimizer,
             total_steps=total_steps,
             global_step=global_step,
@@ -1657,7 +2248,8 @@ def train(cfg: Optional[TrainConfig] = None) -> None:
                 device=device,
                 amp_dtype=amp_dtype,
                 pos_weight=pos_weight,
-                change_pos_weight=change_pos_weight,
+                onset_pos_weight=onset_pos_weight,
+                offset_pos_weight=offset_pos_weight,
                 optimizer=None,
                 total_steps=total_steps,
                 global_step=global_step,
@@ -1667,6 +2259,12 @@ def train(cfg: Optional[TrainConfig] = None) -> None:
         fitted = val_metrics.get("fitted_thresholds")
         if isinstance(fitted, tuple) and len(fitted) == cfg.num_bin:
             cfg.button_state_thresholds = tuple(float(item) for item in fitted)
+        fitted_press = val_metrics.get("fitted_press_thresholds")
+        if isinstance(fitted_press, tuple) and len(fitted_press) == cfg.num_bin:
+            cfg.press_thresholds = tuple(float(item) for item in fitted_press)
+        fitted_release = val_metrics.get("fitted_release_thresholds")
+        if isinstance(fitted_release, tuple) and len(fitted_release) == cfg.num_bin:
+            cfg.release_thresholds = tuple(float(item) for item in fitted_release)
         closed_loop_val_metrics: Optional[Dict[str, object]] = None
         if cfg.autoregressive_validation:
             with torch.inference_mode():
@@ -1681,7 +2279,8 @@ def train(cfg: Optional[TrainConfig] = None) -> None:
                     device=device,
                     amp_dtype=amp_dtype,
                     pos_weight=pos_weight,
-                    change_pos_weight=change_pos_weight,
+                    onset_pos_weight=onset_pos_weight,
+                    offset_pos_weight=offset_pos_weight,
                     optimizer=None,
                     total_steps=total_steps,
                     global_step=global_step,
@@ -1691,60 +2290,78 @@ def train(cfg: Optional[TrainConfig] = None) -> None:
                     metric_thresholds=cfg.autoregressive_feedback_thresholds,
                     feedback_thresholds=cfg.autoregressive_feedback_thresholds,
                 )
-        score = float(val_metrics["macro_f1"])
-        validation_bce = float(val_metrics["bce_loss"])
-        validation_vision_bce = float(val_metrics["vision_bce_loss"])
-        validation_change_bce = float(val_metrics["change_bce_loss"])
-        is_best = validation_change_bce < best_validation_bce
+        score = checkpoint_score(val_metrics, closed_loop_val_metrics)
+        validation_state_loss = float(val_metrics["state_loss"])
+        validation_vision_state_loss = float(val_metrics["vision_state_loss"])
+        validation_onset_loss = float(val_metrics["onset_loss"])
+        validation_offset_loss = float(val_metrics["offset_loss"])
+        is_best = score > best_validation_score
         if is_best:
-            best_validation_bce = validation_change_bce
+            best_validation_score = score
         closed_loop_summary = ""
         if closed_loop_val_metrics is not None:
             closed_loop_summary = (
-                f" val_closed_loop_bce={float(closed_loop_val_metrics['bce_loss']):.4f} "
-                f"val_closed_loop_f1={float(closed_loop_val_metrics['macro_f1']):.4f}"
+                f" val_closed_loop_loss={float(closed_loop_val_metrics['state_loss']):.4f} "
+                f"val_closed_loop_f1={float(closed_loop_val_metrics['closed_loop_macro_f1']):.4f}"
             )
         print(
             f"Epoch {epoch + 1}/{cfg.num_epochs}: "
             f"train_loss={float(train_metrics['loss']):.4f} "
-            f"train_change_bce={float(train_metrics['change_bce_loss']):.4f} "
-            f"train_trans_bce={float(train_metrics['transition_bce_loss']):.4f} "
-            f"train_steady_bce={float(train_metrics['steady_bce_loss']):.4f} "
+            f"train_state={float(train_metrics['state_loss']):.4f} "
+            f"train_onset={float(train_metrics['onset_loss']):.4f} "
+            f"train_offset={float(train_metrics['offset_loss']):.4f} "
+            f"train_trans_state={float(train_metrics['transition_state_loss']):.4f} "
+            f"train_steady_state={float(train_metrics['steady_state_loss']):.4f} "
             f"train_conflict={float(train_metrics['conflict_penalty']):.4f} "
             f"train_f1={float(train_metrics['macro_f1']):.4f} "
+            f"train_rare_f1={float(train_metrics['rare_state_macro_f1']):.4f} "
             f"train_vision_f1={float(train_metrics['vision_macro_f1']):.4f} "
-            f"train_change_f1={float(train_metrics['change_macro_f1']):.4f} "
+            f"train_onset_f1={float(train_metrics['onset_macro_f1']):.4f} "
+            f"train_offset_f1={float(train_metrics['offset_macro_f1']):.4f} "
+            f"train_closed_loop_f1={float(train_metrics['closed_loop_macro_f1']):.4f} "
             f"train_residual_drop={float(train_metrics['action_token_dropout_rate']):.3f} "
             f"train_closed_loop={int(train_metrics['autoregressive_batches'])} "
             f"val_loss={float(val_metrics['loss']):.4f} "
-            f"val_change_bce={float(val_metrics['change_bce_loss']):.4f} "
-            f"val_trans_bce={float(val_metrics['transition_bce_loss']):.4f} "
-            f"val_steady_bce={float(val_metrics['steady_bce_loss']):.4f} "
+            f"val_state={validation_state_loss:.4f} "
+            f"val_onset={validation_onset_loss:.4f} "
+            f"val_offset={validation_offset_loss:.4f} "
+            f"val_trans_state={float(val_metrics['transition_state_loss']):.4f} "
+            f"val_steady_state={float(val_metrics['steady_state_loss']):.4f} "
             f"val_conflict={float(val_metrics['conflict_penalty']):.4f} "
-            f"val_f1={score:.4f} "
-            f"val_bce={validation_bce:.4f} "
-            f"val_vision_bce={validation_vision_bce:.4f} "
+            f"val_score={score:.4f} "
+            f"val_f1={float(val_metrics['macro_f1']):.4f} "
+            f"val_rare_f1={float(val_metrics['rare_state_macro_f1']):.4f} "
+            f"val_vision_state={validation_vision_state_loss:.4f} "
             f"val_vision_f1={float(val_metrics['vision_macro_f1']):.4f} "
-            f"val_change_f1={float(val_metrics['change_macro_f1']):.4f}"
+            f"val_onset_f1={float(val_metrics['onset_macro_f1']):.4f} "
+            f"val_offset_f1={float(val_metrics['offset_macro_f1']):.4f} "
+            f"val_transition_f1={float(val_metrics['transition_macro_f1']):.4f} "
+            f"val_closed_loop_f1={float(val_metrics['closed_loop_macro_f1']):.4f} "
+            f"val_onset_err={float(val_metrics['mean_onset_timing_error']):.2f} "
+            f"val_offset_err={float(val_metrics['mean_offset_timing_error']):.2f}"
             f"{closed_loop_summary}"
         )
         print(
-            f"Validation best_change_bce={best_validation_bce:.4f} "
-            f"current_change_bce={validation_change_bce:.4f} "
-            f"current_vision_bce={validation_vision_bce:.4f} "
-            f"calibrated_macro_f1={score:.4f} "
+            f"Validation best_score={best_validation_score:.4f} "
+            f"current_score={score:.4f} "
+            f"rare_state_f1={float(val_metrics['rare_state_macro_f1']):.4f} "
+            f"onset_f1={float(val_metrics['onset_macro_f1']):.4f} "
+            f"offset_f1={float(val_metrics['offset_macro_f1']):.4f} "
+            f"closed_loop_f1={float(val_metrics['closed_loop_macro_f1']):.4f} "
             f"new_best={is_best}"
         )
         print_metric_rows("Validation controls:", val_metrics["rows"])
         print_metric_rows("Validation vision-only controls:", val_metrics["vision_rows"])
-        print_metric_rows("Validation visual changes:", val_metrics["change_rows"])
+        print_metric_rows("Validation onsets:", val_metrics["onset_rows"])
+        print_metric_rows("Validation offsets:", val_metrics["offset_rows"])
+        print_metric_rows("Validation hysteresis closed-loop controls:", val_metrics["closed_loop_rows"])
         if closed_loop_val_metrics is not None:
             print(
                 f"Closed-loop validation: "
                 f"loss={float(closed_loop_val_metrics['loss']):.4f} "
-                f"bce={float(closed_loop_val_metrics['bce_loss']):.4f} "
+                f"state={float(closed_loop_val_metrics['state_loss']):.4f} "
                 f"conflict={float(closed_loop_val_metrics['conflict_penalty']):.4f} "
-                f"f1={float(closed_loop_val_metrics['macro_f1']):.4f} "
+                f"f1={float(closed_loop_val_metrics['closed_loop_macro_f1']):.4f} "
                 f"closed_loop={int(closed_loop_val_metrics['autoregressive_batches'])}/{val_batches}"
             )
             print_metric_rows("Closed-loop validation controls:", closed_loop_val_metrics["rows"])
@@ -1753,9 +2370,10 @@ def train(cfg: Optional[TrainConfig] = None) -> None:
         vision_fitted = val_metrics.get("vision_fitted_thresholds")
         if isinstance(vision_fitted, tuple) and len(vision_fitted) == cfg.num_bin:
             print("Vision validation thresholds:", dict(zip(cfg.key_names, vision_fitted)))
-        change_fitted = val_metrics.get("change_fitted_thresholds")
-        if isinstance(change_fitted, tuple) and len(change_fitted) == cfg.num_bin:
-            print("Change validation thresholds:", dict(zip(cfg.key_names, change_fitted)))
+        if isinstance(fitted_press, tuple) and len(fitted_press) == cfg.num_bin:
+            print("Validation press thresholds:", dict(zip(cfg.key_names, cfg.press_thresholds)))
+        if isinstance(fitted_release, tuple) and len(fitted_release) == cfg.num_bin:
+            print("Validation release thresholds:", dict(zip(cfg.key_names, cfg.release_thresholds)))
         if closed_loop_val_metrics is not None:
             print(
                 "Autoregressive feedback thresholds:",
@@ -1777,7 +2395,7 @@ def train(cfg: Optional[TrainConfig] = None) -> None:
             cfg,
             epoch=epoch + 1,
             global_step=global_step,
-            best_validation_bce=best_validation_bce,
+            best_validation_score=best_validation_score,
         )
         torch.save(payload, os.path.join(cfg.ckpt_dir, "model_latest.pt"))
         if is_best:
@@ -1821,22 +2439,28 @@ def parse_args() -> TrainConfig:
     add("--train-split", type=float, default=None)
     add("--pos-weight-power", type=float, default=None)
     add("--pos-weight-clamp", type=float, default=None)
+    add("--state-loss-weight", type=float, default=None)
+    add("--onset-loss-weight", type=float, default=None)
+    add("--offset-loss-weight", type=float, default=None)
+    add("--focal-gamma", type=float, default=None)
+    add("--negative-clip", type=float, default=None)
     add(
         "--change-loss-weight",
         "--transition-loss-weight",
-        dest="change_loss_weight",
+        dest="legacy_change_loss_weight",
         type=float,
         default=None,
-        help="Scale for the separate action-change auxiliary BCE. Legacy --transition-loss-weight alias.",
+        help="Legacy alias: set both onset_loss_weight and offset_loss_weight.",
     )
-    add("--change-pos-weight-power", type=float, default=None)
-    add("--change-pos-weight-clamp", type=float, default=None)
-    add("--main-policy-loss-weight", type=float, default=None)
     add("--conflict-penalty-weight", type=float, default=None)
     add("--vision-aux-loss-weight", type=float, default=None)
-    add("--transition-oversample-extra-copies", type=int, default=None)
-    add("--transition-oversample-max-action-rate", type=float, default=None)
-    add("--transition-oversample-min-changes", type=int, default=None)
+    add("--event-onset-fraction", type=float, default=None)
+    add("--event-offset-fraction", type=float, default=None)
+    add("--event-rare-active-fraction", type=float, default=None)
+    add("--event-random-fraction", type=float, default=None)
+    add("--rare-active-stride", type=int, default=None)
+    add("--event-action-weight-power", type=float, default=None)
+    add("--event-epoch-windows", type=int, default=None)
     add(
         "--action-token-dropout-prob",
         type=float,
@@ -1850,6 +2474,10 @@ def parse_args() -> TrainConfig:
     add("--no-autoregressive-validation", dest="autoregressive_validation", action="store_false")
     add("--threshold-min", type=float, default=None)
     add("--threshold-max", type=float, default=None)
+    add("--press-threshold", type=float, default=None)
+    add("--press-thresholds", type=_parse_threshold_sequence, default=None)
+    add("--release-threshold", type=float, default=None)
+    add("--release-thresholds", type=_parse_threshold_sequence, default=None)
     add("--fit-thresholds-from-val", dest="fit_thresholds_from_val", action="store_true", default=None)
     add("--no-fit-thresholds-from-val", dest="fit_thresholds_from_val", action="store_false")
     add("--amp-dtype", choices=["bf16", "fp32"], default=None)
@@ -1867,6 +2495,12 @@ def parse_args() -> TrainConfig:
     add("--max-train-batches", type=int, default=None)
     add("--max-val-batches", type=int, default=None)
     args = vars(parser.parse_args())
+    legacy_change_loss_weight = args.pop("legacy_change_loss_weight")
+    if legacy_change_loss_weight is not None:
+        if args.get("onset_loss_weight") is None:
+            args["onset_loss_weight"] = legacy_change_loss_weight
+        if args.get("offset_loss_weight") is None:
+            args["offset_loss_weight"] = legacy_change_loss_weight
     return TrainConfig(**{name: value for name, value in args.items() if value is not None})
 
 
