@@ -983,7 +983,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "stage5",
             "spatial",
         ],
-        default="projected",
+        default="stem",
         help=(
             "Feature map to visualize: CNN stages (stem/low/mid/deep), 512/256/128/64-to-128 fused map, "
             "256-channel projected map, or deterministic 8x8 grid-token map. "
