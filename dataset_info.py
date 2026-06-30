@@ -30,6 +30,10 @@ class ClipInfo:
     started_at: Optional[datetime]
     schema: Tuple[str, ...]
     action_frames: Counter
+    action_transition_frames: Counter
+    action_on_transitions: Counter
+    action_off_transitions: Counter
+    action_comparison_frames: Counter
     mouse_move_frames: int
     abs_delta_x: float
     abs_delta_y: float
@@ -198,11 +202,16 @@ def scan_csv(clip_id: str, split: str, csv_path: Path, video_path: Optional[Path
     positive_dts: List[float] = []
     schema: Tuple[str, ...] = ()
     action_frames: Counter = Counter()
+    action_transition_frames: Counter = Counter()
+    action_on_transitions: Counter = Counter()
+    action_off_transitions: Counter = Counter()
+    action_comparison_frames: Counter = Counter()
     mouse_move_frames = 0
     abs_delta_x = 0.0
     abs_delta_y = 0.0
     max_abs_delta_x = 0.0
     max_abs_delta_y = 0.0
+    previous_action_states: Dict[str, bool] = {}
 
     with csv_path.open("r", newline="") as handle:
         reader = csv.DictReader(handle)
@@ -232,8 +241,19 @@ def scan_csv(clip_id: str, split: str, csv_path: Path, video_path: Optional[Path
                 mouse_move_frames += 1
 
             for column in action_columns:
-                if truthy(row.get(column)):
+                active = truthy(row.get(column))
+                if active:
                     action_frames[column] += 1
+                if column in previous_action_states:
+                    action_comparison_frames[column] += 1
+                    previous_active = previous_action_states[column]
+                    if active != previous_active:
+                        action_transition_frames[column] += 1
+                        if active:
+                            action_on_transitions[column] += 1
+                        else:
+                            action_off_transitions[column] += 1
+                previous_action_states[column] = active
 
     duration_seconds = 0.0
     if max_timestamp is not None:
@@ -263,6 +283,10 @@ def scan_csv(clip_id: str, split: str, csv_path: Path, video_path: Optional[Path
         started_at=parse_started_at(csv_path),
         schema=schema,
         action_frames=action_frames,
+        action_transition_frames=action_transition_frames,
+        action_on_transitions=action_on_transitions,
+        action_off_transitions=action_off_transitions,
+        action_comparison_frames=action_comparison_frames,
         mouse_move_frames=mouse_move_frames,
         abs_delta_x=abs_delta_x,
         abs_delta_y=abs_delta_y,
@@ -329,19 +353,40 @@ def action_summary_for_clips(clip_infos: Sequence[ClipInfo]) -> Dict[str, Dict[s
     total_rows = sum(clip.rows for clip in clip_infos)
     action_frame_totals: Counter = Counter()
     action_clip_totals: Counter = Counter()
+    action_transition_totals: Counter = Counter()
+    action_transition_clip_totals: Counter = Counter()
+    action_on_transition_totals: Counter = Counter()
+    action_off_transition_totals: Counter = Counter()
+    action_comparison_totals: Counter = Counter()
     for clip in clip_infos:
         action_frame_totals.update(clip.action_frames)
         for action in clip.action_frames:
             action_clip_totals[action] += 1
+        action_transition_totals.update(clip.action_transition_frames)
+        action_on_transition_totals.update(clip.action_on_transitions)
+        action_off_transition_totals.update(clip.action_off_transitions)
+        action_comparison_totals.update(clip.action_comparison_frames)
+        for action, transitions in clip.action_transition_frames.items():
+            if transitions > 0:
+                action_transition_clip_totals[action] += 1
 
-    return {
-        action: {
+    summary: Dict[str, Dict[str, float | int]] = {}
+    for action in sorted(set(action_frame_totals) | set(action_comparison_totals)):
+        active_frames = action_frame_totals[action]
+        transition_frames = action_transition_totals[action]
+        comparison_frames = action_comparison_totals[action]
+        summary[action] = {
             "active_frames": active_frames,
             "active_frame_pct": (active_frames / total_rows * 100.0) if total_rows else 0.0,
             "clips_with_action": action_clip_totals[action],
+            "transition_frames": transition_frames,
+            "transition_frame_pct": (transition_frames / comparison_frames * 100.0) if comparison_frames else 0.0,
+            "on_transition_frames": action_on_transition_totals[action],
+            "off_transition_frames": action_off_transition_totals[action],
+            "comparison_frames": comparison_frames,
+            "clips_with_transition": action_transition_clip_totals[action],
         }
-        for action, active_frames in sorted(action_frame_totals.items())
-    }
+    return summary
 
 
 def build_summary(root: Path, recursive: bool, top_n: int) -> Dict[str, object]:
@@ -590,7 +635,10 @@ def print_text_summary(summary: Dict[str, object]) -> None:
         for action, stats in sorted_actions:
             print(
                 f"  {action:<15} {stats['active_frames']:>7} frames  "
-                f"{stats['active_frame_pct']:>6.2f}%  {stats['clips_with_action']:>3} clips"
+                f"{stats['active_frame_pct']:>6.2f}%  {stats['clips_with_action']:>3} clips  "
+                f"{stats['transition_frames']:>6} transitions  "
+                f"{stats['transition_frame_pct']:>5.2f}%  "
+                f"on={stats['on_transition_frames']:>5} off={stats['off_transition_frames']:>5}"
             )
     print()
 

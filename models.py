@@ -36,7 +36,7 @@ NUM_VISUAL_TOKENS = TOKEN_GRID_SIZE * TOKEN_GRID_SIZE
 TOKENS_PER_STEP = NUM_VISUAL_TOKENS
 TEMPORAL_HEADS = 8
 TEMPORAL_LAYERS = 6
-ARCHITECTURE_VERSION = "cnn_grid_causal_transformer_v6_ctx40_256_fusion128_feedback_action"
+ARCHITECTURE_VERSION = "cnn_grid_causal_transformer_v8_ctx40_256_fusion128_vision_offset1"
 
 
 def _as_int(name: str, value: object, minimum: int) -> int:
@@ -78,7 +78,7 @@ class ModelConfig:
     seq_len: int = DEFAULT_SEQUENCE_LENGTH
     train_seq_stride: int = DEFAULT_SEQUENCE_LENGTH
     val_seq_stride: int = DEFAULT_SEQUENCE_LENGTH
-    action_offset: int = 4
+    action_offset: int = 1
     prediction_horizon: int = 1
     prediction_horizon_offsets: Optional[Sequence[int]] = None
     sequence_output_tail_frames: int = 0
@@ -101,7 +101,7 @@ class ModelConfig:
     action_decoder: str = "causal_transformer"
     action_query_heads: int = TEMPORAL_HEADS
     action_query_layers: int = 1
-    last_action_conditioning: bool = True
+    last_action_conditioning: bool = False
     last_action_fusion: str = "bounded_visual_residual"
     last_action_residual_cap: float = 0.5
     last_action_prior_logit: float = 0.0
@@ -420,7 +420,7 @@ class GreenvilleBCFormer(nn.Module):
         n_heads: int = TEMPORAL_HEADS,
         n_layers: int = TEMPORAL_LAYERS,
         dropout: float = 0.1,
-        last_action_conditioning: bool = True,
+        last_action_conditioning: bool = False,
         last_action_residual_cap: float = 0.5,
         use_activation_checkpointing: bool = True,
     ):
@@ -919,7 +919,7 @@ class DrivingVideoPolicy(nn.Module):
 
         del feedback_mask
         if soft_feedback:
-            raise ValueError("Soft previous-action feedback is disabled for this architecture.")
+            raise ValueError("Soft action feedback is disabled for this architecture.")
         if frames.dim() != 5 or frames.size(2) != RGB_CHANNELS:
             raise ValueError(f"Expected frames [B,T,3,H,W], got {tuple(frames.shape)}.")
         if frames.size(1) <= 0:

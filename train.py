@@ -3,8 +3,8 @@
 The DALI pipeline owns GPU video decode and resize. CSV labels are parsed once
 on the host, then joined to decoded fixed-length windows through the DALI sample
 label written into the file list. Each window is an independent causal
-transformer context with previous target-horizon actions used only for late
-residual feedback conditioning.
+transformer context with previous target-horizon actions retained for transition
+weighting and optional feedback conditioning.
 """
 
 from __future__ import annotations
@@ -89,7 +89,7 @@ class TrainConfig(ModelConfig):
 
     train_seq_stride: int = DEFAULT_SEQUENCE_LENGTH
     val_seq_stride: int = DEFAULT_SEQUENCE_LENGTH
-    action_offset: int = 4
+    action_offset: int = 1
     dense_temporal_supervision: bool = True
 
     batch_size: int = 1
@@ -115,11 +115,12 @@ class TrainConfig(ModelConfig):
     # unstable and encouraged the low-precision predictions seen in validation.
     pos_weight_power: float = 0.5
     pos_weight_clamp: float = 8.0
-    main_policy_loss_weight: float = 0.5
+    transition_loss_weight: float = 48.0
+    main_policy_loss_weight: float = 1.0
     conflict_penalty_weight: float = 0.20
     vision_aux_loss_weight: float = 1.0
     # Drop feedback residual inputs during teacher forcing so the policy cannot
-    # solve the task by copying action persistence alone.
+    # solve the task by copying action persistence alone when feedback is enabled.
     action_token_dropout_prob: float = 0.2
     # Optional closed-loop scheduled sampling over independent fixed-length windows.
     # Keep it off by default so early training optimizes the vision path;
@@ -181,6 +182,9 @@ class TrainConfig(ModelConfig):
         self.train_split = _finite_float("train_split", self.train_split, 0.05, 0.95)
         self.pos_weight_power = _finite_float("pos_weight_power", self.pos_weight_power, 0.0)
         self.pos_weight_clamp = _finite_float("pos_weight_clamp", self.pos_weight_clamp, 1.0)
+        self.transition_loss_weight = _finite_float(
+            "transition_loss_weight", self.transition_loss_weight, 1.0, 64.0
+        )
         self.main_policy_loss_weight = _finite_float(
             "main_policy_loss_weight", self.main_policy_loss_weight, 0.0
         )
@@ -696,6 +700,42 @@ def compute_pos_weight(labels: torch.Tensor, power: float, clamp: float) -> torc
     return (negative / positive.clamp(min=1.0)).pow(float(power)).clamp(1.0, float(clamp))
 
 
+def transition_weighted_bce_with_logits(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    previous_actions: torch.Tensor,
+    *,
+    pos_weight: torch.Tensor,
+    transition_weight: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Class-weighted BCE with extra weight on target-state changes."""
+
+    element_loss = F.binary_cross_entropy_with_logits(
+        logits.float(),
+        labels.float(),
+        pos_weight=pos_weight.float(),
+        reduction="none",
+    )
+    transition_mask = (labels.float() > 0.5) != (previous_actions.float() > 0.5)
+    steady_mask = ~transition_mask
+    weights = torch.ones_like(element_loss)
+    if float(transition_weight) > 1.0:
+        weights = weights + (float(transition_weight) - 1.0) * transition_mask.to(dtype=weights.dtype)
+    weighted_loss = (element_loss * weights).sum() / weights.sum().clamp(min=1.0)
+    transition_loss = (
+        element_loss[transition_mask].mean()
+        if bool(transition_mask.any())
+        else element_loss.new_zeros(())
+    )
+    steady_loss = (
+        element_loss[steady_mask].mean()
+        if bool(steady_mask.any())
+        else element_loss.new_zeros(())
+    )
+    transition_rate = transition_mask.float().mean()
+    return weighted_loss, transition_loss, steady_loss, transition_rate
+
+
 def conflicting_action_penalty(logits: torch.Tensor, cfg: TrainConfig) -> torch.Tensor:
     """Penalize probability mass assigned to mutually exclusive driving chords."""
 
@@ -760,8 +800,8 @@ def apply_action_residual_dropout(
         1,
         device=previous_actions.device,
     ) >= probability
-    # Preserve the first previous-action input so each independent window still
-    # has a truthful initial controller state.
+    # Preserve the first feedback input so each independent window still has a
+    # truthful initial controller state when feedback is enabled.
     keep[:, 0] = True
     dropped = 1.0 - float(keep.float().mean().item())
     return previous_actions * keep.to(dtype=previous_actions.dtype), dropped
@@ -804,6 +844,9 @@ def run_epoch(
     loss_sum = 0.0
     bce_loss_sum = 0.0
     vision_bce_loss_sum = 0.0
+    transition_bce_loss_sum = 0.0
+    steady_bce_loss_sum = 0.0
+    transition_rate_sum = 0.0
     conflict_loss_sum = 0.0
     stats = BinaryStats(cfg.num_bin, device)
     vision_stats = BinaryStats(cfg.num_bin, device)
@@ -872,16 +915,26 @@ def run_epoch(
                 if logits is None:
                     raise RuntimeError("Dense temporal supervision requires per-timestep policy logits.")
                 if vision_logits is None:
-                    raise RuntimeError("Previous-action training requires per-timestep vision-only logits.")
+                    raise RuntimeError("Training requires per-timestep vision-only logits.")
                 if tuple(logits.shape) != tuple(labels.shape):
                     raise RuntimeError(
                         f"Model logits shape {tuple(logits.shape)} does not match labels {tuple(labels.shape)}."
                     )
-                bce_loss = F.binary_cross_entropy_with_logits(
-                    logits.float(), labels.float(), pos_weight=pos_weight.float()
+                bce_loss, transition_bce_loss, steady_bce_loss, transition_rate = (
+                    transition_weighted_bce_with_logits(
+                        logits,
+                        labels,
+                        previous_actions,
+                        pos_weight=pos_weight,
+                        transition_weight=float(cfg.transition_loss_weight),
+                    )
                 )
-                vision_bce_loss = F.binary_cross_entropy_with_logits(
-                    vision_logits.float(), labels.float(), pos_weight=pos_weight.float()
+                vision_bce_loss, _, _, _ = transition_weighted_bce_with_logits(
+                    vision_logits,
+                    labels,
+                    previous_actions,
+                    pos_weight=pos_weight,
+                    transition_weight=float(cfg.transition_loss_weight),
                 )
                 conflict_loss = conflicting_action_penalty(logits, cfg)
                 loss = (
@@ -924,12 +977,17 @@ def run_epoch(
         loss_sum += float(loss.detach().item())
         bce_loss_sum += float(bce_loss.detach().item())
         vision_bce_loss_sum += float(vision_bce_loss.detach().item())
+        transition_bce_loss_sum += float(transition_bce_loss.detach().item())
+        steady_bce_loss_sum += float(steady_bce_loss.detach().item())
+        transition_rate_sum += float(transition_rate.detach().item())
         conflict_loss_sum += float(conflict_loss.detach().item())
         if (batch_index + 1) % cfg.print_every == 0 or batch_index + 1 == num_batches:
             progress.set_postfix(
                 loss=f"{loss_sum / float(batch_index + 1):.4f}",
                 bce=f"{bce_loss_sum / float(batch_index + 1):.4f}",
                 vision_bce=f"{vision_bce_loss_sum / float(batch_index + 1):.4f}",
+                trans_bce=f"{transition_bce_loss_sum / float(batch_index + 1):.4f}",
+                steady_bce=f"{steady_bce_loss_sum / float(batch_index + 1):.4f}",
                 conflict=f"{conflict_loss_sum / float(batch_index + 1):.4f}",
                 f1=f"{stats.macro_f1():.3f}",
                 vision_f1=f"{vision_stats.macro_f1():.3f}",
@@ -942,6 +1000,9 @@ def run_epoch(
         "loss": loss_sum / max(1, num_batches),
         "bce_loss": bce_loss_sum / max(1, num_batches),
         "vision_bce_loss": vision_bce_loss_sum / max(1, num_batches),
+        "transition_bce_loss": transition_bce_loss_sum / max(1, num_batches),
+        "steady_bce_loss": steady_bce_loss_sum / max(1, num_batches),
+        "transition_rate": transition_rate_sum / max(1, num_batches),
         "conflict_penalty": conflict_loss_sum / max(1, num_batches),
         "macro_f1": stats.macro_f1(),
         "rows": stats.rows(cfg.key_names),
@@ -1086,6 +1147,20 @@ def _batch_count(targets: WindowTargets, batch_size: int, *, partial: bool) -> i
     return len(targets.meta) // int(batch_size)
 
 
+def transition_rate_by_action(targets: WindowTargets) -> torch.Tensor:
+    return ((targets.labels > 0.5) != (targets.previous_actions > 0.5)).float().mean(dim=(0, 1))
+
+
+def transition_weight_summary(rate: float, weight: float) -> Tuple[float, float, float, float]:
+    rate = min(max(float(rate), 0.0), 1.0)
+    weight = max(float(weight), 1.0)
+    mean_raw_weight = 1.0 + (weight - 1.0) * rate
+    transition_mass = (weight * rate) / max(weight * rate + (1.0 - rate), 1e-12)
+    transition_multiplier = weight / max(mean_raw_weight, 1e-12)
+    steady_multiplier = 1.0 / max(mean_raw_weight, 1e-12)
+    return transition_mass, mean_raw_weight, transition_multiplier, steady_multiplier
+
+
 def print_startup_stats(
     cfg: TrainConfig,
     *,
@@ -1103,6 +1178,12 @@ def print_startup_stats(
     action_names = list(cfg.key_names)
     train_positive_rate = train_targets.labels.reshape(-1, cfg.num_bin).float().mean(dim=0)
     val_positive_rate = val_targets.labels.reshape(-1, cfg.num_bin).float().mean(dim=0)
+    train_transition_rate = transition_rate_by_action(train_targets)
+    val_transition_rate = transition_rate_by_action(val_targets)
+    global_train_transition_rate = float(train_transition_rate.mean().item())
+    transition_mass, mean_transition_weight, transition_multiplier, steady_multiplier = (
+        transition_weight_summary(global_train_transition_rate, float(cfg.transition_loss_weight))
+    )
     total_videos = len(train_pairs) + len(val_pairs)
     print("Startup configuration:")
     print(
@@ -1177,6 +1258,7 @@ def print_startup_stats(
         "BCEWithLogits",
         f"pos_weight_power={cfg.pos_weight_power:.3f}",
         f"pos_weight_clamp={cfg.pos_weight_clamp:.3f}",
+        f"transition_weight={cfg.transition_loss_weight:.3f}",
         f"main_policy_weight={cfg.main_policy_loss_weight:.3f}",
         f"conflict_weight={cfg.conflict_penalty_weight:.3f}",
         f"vision_aux_weight={cfg.vision_aux_loss_weight:.3f}",
@@ -1200,6 +1282,23 @@ def print_startup_stats(
     print(
         "  Val class stats:",
         " ".join(f"{name}:pos={float(rate):.4f}" for name, rate in zip(action_names, val_positive_rate)),
+    )
+    print(
+        "  Train transition stats:",
+        " ".join(f"{name}:rate={float(rate):.4f}" for name, rate in zip(action_names, train_transition_rate)),
+    )
+    print(
+        "  Val transition stats:",
+        " ".join(f"{name}:rate={float(rate):.4f}" for name, rate in zip(action_names, val_transition_rate)),
+    )
+    print(
+        "  Transition loss scaling:",
+        f"global_train_rate={global_train_transition_rate:.4f}",
+        f"weighted_transition_mass={transition_mass:.3f}",
+        f"mean_raw_weight={mean_transition_weight:.3f}",
+        f"effective_transition_multiplier={transition_multiplier:.2f}",
+        f"effective_steady_multiplier={steady_multiplier:.2f}",
+        "normalized=True",
     )
 
 
@@ -1353,12 +1452,16 @@ def train(cfg: Optional[TrainConfig] = None) -> None:
         print(
             f"Epoch {epoch + 1}/{cfg.num_epochs}: "
             f"train_loss={float(train_metrics['loss']):.4f} "
+            f"train_trans_bce={float(train_metrics['transition_bce_loss']):.4f} "
+            f"train_steady_bce={float(train_metrics['steady_bce_loss']):.4f} "
             f"train_conflict={float(train_metrics['conflict_penalty']):.4f} "
             f"train_f1={float(train_metrics['macro_f1']):.4f} "
             f"train_vision_f1={float(train_metrics['vision_macro_f1']):.4f} "
             f"train_residual_drop={float(train_metrics['action_token_dropout_rate']):.3f} "
             f"train_closed_loop={int(train_metrics['autoregressive_batches'])} "
             f"val_loss={float(val_metrics['loss']):.4f} "
+            f"val_trans_bce={float(val_metrics['transition_bce_loss']):.4f} "
+            f"val_steady_bce={float(val_metrics['steady_bce_loss']):.4f} "
             f"val_conflict={float(val_metrics['conflict_penalty']):.4f} "
             f"val_f1={score:.4f} "
             f"val_bce={validation_bce:.4f} "
@@ -1443,7 +1546,7 @@ def parse_args() -> TrainConfig:
         dest="action_offset",
         type=int,
         default=None,
-        help="Future label shift: frame[i] predicts action[i + action_offset]. Default: 4.",
+        help="Future label shift: frame[i] predicts action[i + action_offset]. Default: 1.",
     )
     add("--model-size", type=int, default=None)
     add("--lr", type=float, default=None)
@@ -1454,6 +1557,12 @@ def parse_args() -> TrainConfig:
     add("--train-split", type=float, default=None)
     add("--pos-weight-power", type=float, default=None)
     add("--pos-weight-clamp", type=float, default=None)
+    add(
+        "--transition-loss-weight",
+        type=float,
+        default=None,
+        help="Relative per-element weight for target action changes. Normalized in BCE; capped at 64.",
+    )
     add("--main-policy-loss-weight", type=float, default=None)
     add("--conflict-penalty-weight", type=float, default=None)
     add("--vision-aux-loss-weight", type=float, default=None)

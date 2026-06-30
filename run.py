@@ -90,7 +90,7 @@ class RuntimeConfig(ModelConfig):
         if self.last_action_conditioning:
             self.prev_action_feedback = True
         if self.last_action_conditioning and self.prev_action_feedback_soft:
-            raise ValueError("Soft previous-action feedback is disabled for this architecture.")
+            raise ValueError("Soft action feedback is disabled for this architecture.")
         self.record_frame_size = max(1, int(self.record_frame_size))
 
 
@@ -323,7 +323,7 @@ def _coerce_config_types(cfg: RuntimeConfig) -> RuntimeConfig:
         cfg.prev_action_feedback = True
     cfg.prev_action_feedback_soft = bool(getattr(cfg, "prev_action_feedback_soft", False))
     if cfg.last_action_conditioning and cfg.prev_action_feedback_soft:
-        raise ValueError("Soft previous-action feedback is disabled for this architecture.")
+        raise ValueError("Soft action feedback is disabled for this architecture.")
     cfg.num_bin = len(cfg.key_names) + len(cfg.mouse_button_names)
     cfg.button_state_threshold = float(np.clip(float(cfg.button_state_threshold), 0.0, 1.0))
     cfg.use_checkpoint_button_thresholds = bool(getattr(cfg, "use_checkpoint_button_thresholds", False))
@@ -598,7 +598,7 @@ def main() -> None:
         f"d_model={cfg.d_model}",
         "temporal=causal_transformer",
         f"decoder={cfg.action_decoder}",
-        "input=masked_rgb" + ("+prev_action_residual" if cfg.last_action_conditioning else ""),
+        "input=masked_rgb" + ("+action_feedback_residual" if cfg.last_action_conditioning else ""),
     )
     print(
         "Button thresholds:",
@@ -613,7 +613,7 @@ def main() -> None:
         f"buttons_enabled={cfg.mouse_buttons_enabled}",
     )
     print(
-        "Runtime previous-action feedback:",
+        "Runtime action feedback:",
         f"enabled={cfg.prev_action_feedback}",
         "mode=hard-applied+keyboard",
         f"context_len={int(model.context_len)}",
